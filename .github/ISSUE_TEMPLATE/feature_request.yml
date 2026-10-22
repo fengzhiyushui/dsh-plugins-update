@@ -1,0 +1,24 @@
+name: 💡 功能建议 (Feature Request)
+description: 为 dsh-plugins-update 提出新功能或改进建议
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢您提出新想法！请描述您希望增加的功能或体验改进。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 您的需求或当前痛点
+      description: 这个功能解决了什么问题？
+      placeholder: 例如：希望能够支持批量更新所有插件...
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望的解决方案
+      description: 清晰简洁地描述您希望该功能如何工作。
+    validations:
+      required: false

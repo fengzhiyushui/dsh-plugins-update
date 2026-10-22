@@ -1,0 +1,48 @@
+name: 🐛 Bug 反馈 (Bug Report)
+description: 提交关于 dsh-plugins-update 的缺陷或问题报告
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢您提交问题反馈！请尽可能提供详细信息以便我们快速定位问题。
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述 (Problem Description)
+      description: 请清晰简洁地描述遇到的问题。
+      placeholder: 在点击更新按钮后，页面提示...
+    validations:
+      required: true
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DeepSeek Harness 版本
+      placeholder: 例如 v0.2.1-rc.2 (在关于或控制台中查看)
+    validations:
+      required: false
+  - type: input
+    id: plugin-name
+    attributes:
+      label: 发生问题的插件名称与版本
+      placeholder: 例如 dsh-context v0.73.3
+    validations:
+      required: false
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤 (Steps to Reproduce)
+      description: 发生问题的具体操作流程。
+      placeholder: |
+        1. 打开 DSH 桌面端
+        2. 进入插件列表并点击...
+        3. 点击更新按钮
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误日志或控制台输出 (Logs)
+      description: 如果有控制台报错信息，请粘贴在这里。
+      render: shell
