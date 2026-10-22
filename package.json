@@ -22,11 +22,15 @@
   },
   "files": [
     "lib/client.js",
+    "lib/client.d.ts",
     "lib/index.js",
     "lib/index.d.ts",
+    "lib/types.d.ts",
     "cordis.patch.yml",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "README_zh.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "node build.mjs",
