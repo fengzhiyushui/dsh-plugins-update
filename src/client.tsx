@@ -9,6 +9,7 @@ export const UpdaterActionButton: React.FC<SlotActionProps> = ({ subject }) => {
   const pkg = subject?.pkg;
   const packageName = pkg?.name;
   const currentVersion = pkg?.version || '0.0.0';
+  const source = pkg?.source;
 
   const [status, setStatus] = useState<'idle' | 'checking' | 'has_update' | 'up_to_date' | 'updating' | 'success' | 'error'>('idle');
   const [latestVersion, setLatestVersion] = useState<string>('');
@@ -45,7 +46,7 @@ export const UpdaterActionButton: React.FC<SlotActionProps> = ({ subject }) => {
       const res = await fetch('/api/dsh-plugins-update/check', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ packageName, currentVersion })
+        body: JSON.stringify({ packageName, currentVersion, source })
       });
 
       if (!res.ok) {
@@ -73,7 +74,7 @@ export const UpdaterActionButton: React.FC<SlotActionProps> = ({ subject }) => {
     } finally {
       checkingRef.current = false;
     }
-  }, [packageName, currentVersion]);
+  }, [packageName, currentVersion, source]);
 
   // Trigger check when plugin detail opens
   useEffect(() => {
@@ -94,7 +95,7 @@ export const UpdaterActionButton: React.FC<SlotActionProps> = ({ subject }) => {
       const res = await fetch('/api/dsh-plugins-update/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ packageName, targetVersion: latestVersion })
+        body: JSON.stringify({ packageName, targetVersion: latestVersion, source })
       });
 
       const data = (await res.json()) as DoUpdateResult;

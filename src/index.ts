@@ -23,6 +23,26 @@ function compareSemver(v1: string, v2: string): number {
   return 0;
 }
 
+// Parse GitHub owner & repo from source string
+function parseGithubSource(source?: string): { owner: string; repo: string } | null {
+  if (!source) return null;
+
+  // Patterns: github:owner/repo, https://github.com/owner/repo, owner/repo
+  const cleaned = source.trim().replace(/\.git$/, '');
+  const match = cleaned.match(/(?:github:|^https?:\/\/github\.com\/|^git@github\.com:)([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)/);
+  if (match) {
+    return { owner: match[1], repo: match[2] };
+  }
+
+  // Bare owner/repo
+  if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(cleaned)) {
+    const parts = cleaned.split('/');
+    return { owner: parts[0], repo: parts[1] };
+  }
+
+  return null;
+}
+
 // Locate the profile directory where plugins are installed
 function resolveProfileDir(): { dir: string; profileName: string } {
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh');
@@ -44,8 +64,55 @@ function resolveProfileDir(): { dir: string; profileName: string } {
   return { dir: desktopDir, profileName: 'desktop' };
 }
 
+// Fetch package metadata from GitHub repository
+async function fetchGithubPackageInfo(owner: string, repo: string): Promise<{ version: string; description?: string }> {
+  const urls = [
+    `https://cdn.jsdelivr.net/gh/${owner}/${repo}@main/package.json`,
+    `https://fastly.jsdelivr.net/gh/${owner}/${repo}@main/package.json`,
+    `https://raw.githubusercontent.com/${owner}/${repo}/main/package.json`,
+    `https://api.github.com/repos/${owner}/${repo}/contents/package.json`
+  ];
+
+  let lastError: any = null;
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'dsh-plugins-update'
+        },
+        signal: AbortSignal.timeout(6000)
+      });
+
+      if (res.ok) {
+        let pkgJson: any;
+        if (url.includes('api.github.com')) {
+          const data = await res.json() as any;
+          if (data.content && data.encoding === 'base64') {
+            const raw = Buffer.from(data.content, 'base64').toString('utf8');
+            pkgJson = JSON.parse(raw);
+          }
+        } else {
+          pkgJson = await res.json();
+        }
+
+        if (pkgJson && typeof pkgJson.version === 'string') {
+          return {
+            version: pkgJson.version,
+            description: pkgJson.description
+          };
+        }
+      }
+    } catch (e) {
+      lastError = e;
+    }
+  }
+
+  throw lastError || new Error(`Failed to fetch package.json from GitHub (${owner}/${repo})`);
+}
+
 // Fetch package metadata from npm registry
-async function fetchPackageInfo(packageName: string): Promise<{ version: string; releaseDate?: string; description?: string }> {
+async function fetchNpmPackageInfo(packageName: string): Promise<{ version: string; releaseDate?: string; description?: string }> {
   const registries = [
     'https://registry.npmjs.org/',
     'https://registry.npmmirror.com/'
@@ -71,15 +138,30 @@ async function fetchPackageInfo(packageName: string): Promise<{ version: string;
       lastError = err;
     }
   }
-  throw lastError || new Error(`Failed to fetch metadata for ${packageName}`);
+  throw lastError || new Error(`Package ${packageName} not found on npm`);
 }
 
 // Run update command using the best available tool
-async function runUpdateCommand(profileDir: string, profileName: string, packageName: string, targetVersion?: string): Promise<{ ok: boolean; output: string; error?: string }> {
-  const spec = targetVersion ? `${packageName}@${targetVersion}` : `${packageName}@latest`;
+async function runUpdateCommand(
+  profileDir: string,
+  profileName: string,
+  packageName: string,
+  targetVersion?: string,
+  source?: string
+): Promise<{ ok: boolean; output: string; error?: string }> {
+  let spec: string;
+  const gh = parseGithubSource(source);
+
+  if (gh) {
+    // If installed via GitHub, update using github spec
+    spec = `github:${gh.owner}/${gh.repo}`;
+  } else if (targetVersion) {
+    spec = `${packageName}@${targetVersion}`;
+  } else {
+    spec = `${packageName}@latest`;
+  }
 
   // Candidate commands
-  // 1. dsh.cmd if available in standard installation paths or dynamically derived from host process
   const execDir = process.execPath ? join(process.execPath, '..') : '';
   const dshCmdPaths = [
     join(execDir, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd'),
@@ -174,11 +256,10 @@ export function apply(ctx: any) {
   const registerFetch = conn?.fetch?.register?.bind(conn.fetch);
 
   if (typeof registerFetch !== 'function') {
-    // If connection service is not yet ready or mock
     return;
   }
 
-  // 1. API: Check update for a package
+  // 1. API: Check update for a package (Supports npm & GitHub)
   ctx.effect(() => registerFetch({
     path: '/api/dsh-plugins-update/check',
     methods: ['POST'],
@@ -190,24 +271,65 @@ export function apply(ctx: any) {
           return Response.json({ ok: false, error: 'packageName is required' } as CheckUpdateResult, { status: 400 });
         }
 
-        const info = await fetchPackageInfo(body.packageName);
         const current = body.currentVersion || '0.0.0';
-        const hasUpdate = compareSemver(info.version, current) > 0;
+        const gh = parseGithubSource(body.source) || parseGithubSource(body.packageName);
+
+        let latestVersion = current;
+        let releaseDate: string | undefined;
+        let description: string | undefined;
+        let isGithub = false;
+
+        if (gh) {
+          // Check GitHub repo
+          isGithub = true;
+          try {
+            const ghInfo = await fetchGithubPackageInfo(gh.owner, gh.repo);
+            latestVersion = ghInfo.version;
+            description = ghInfo.description;
+          } catch (ghErr: any) {
+            // If GitHub fails, fallback to npm
+            try {
+              const npmInfo = await fetchNpmPackageInfo(body.packageName);
+              latestVersion = npmInfo.version;
+              releaseDate = npmInfo.releaseDate;
+              description = npmInfo.description;
+              isGithub = false;
+            } catch {
+              throw ghErr;
+            }
+          }
+        } else {
+          // Normal npm package
+          try {
+            const npmInfo = await fetchNpmPackageInfo(body.packageName);
+            latestVersion = npmInfo.version;
+            releaseDate = npmInfo.releaseDate;
+            description = npmInfo.description;
+          } catch (npmErr: any) {
+            // Check if it might be a GitHub repo from manifest or name
+            throw npmErr;
+          }
+        }
+
+        const hasUpdate = compareSemver(latestVersion, current) > 0;
 
         const result: CheckUpdateResult = {
           ok: true,
           packageName: body.packageName,
           currentVersion: current,
-          latestVersion: info.version,
+          latestVersion,
           hasUpdate,
-          releaseDate: info.releaseDate,
-          description: info.description
+          releaseDate,
+          description,
+          source: body.source,
+          isGithub
         };
 
         return Response.json(result, {
           headers: { 'cache-control': 'no-store' }
         });
       } catch (err: any) {
+        // Return friendly message instead of crash
         return Response.json({
           ok: false,
           packageName: '',
@@ -231,12 +353,13 @@ export function apply(ctx: any) {
         }
 
         const { dir, profileName } = resolveProfileDir();
-        const runRes = await runUpdateCommand(dir, profileName, body.packageName, body.targetVersion);
+        const runRes = await runUpdateCommand(dir, profileName, body.packageName, body.targetVersion, body.source);
 
         const result: DoUpdateResult = {
           ok: runRes.ok,
           packageName: body.packageName,
           targetVersion: body.targetVersion,
+          source: body.source,
           output: runRes.output,
           error: runRes.error
         };

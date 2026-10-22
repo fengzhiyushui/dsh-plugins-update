@@ -1,6 +1,7 @@
 export interface CheckUpdateParams {
   packageName: string;
   currentVersion?: string;
+  source?: string;
 }
 
 export interface CheckUpdateResult {
@@ -11,18 +12,23 @@ export interface CheckUpdateResult {
   hasUpdate: boolean;
   releaseDate?: string;
   description?: string;
+  source?: string;
+  isGithub?: boolean;
+  unreleased?: boolean;
   error?: string;
 }
 
 export interface DoUpdateParams {
   packageName: string;
   targetVersion?: string;
+  source?: string;
 }
 
 export interface DoUpdateResult {
   ok: boolean;
   packageName: string;
   targetVersion?: string;
+  source?: string;
   output?: string;
   error?: string;
 }
