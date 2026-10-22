@@ -23,18 +23,17 @@ function compareSemver(v1: string, v2: string): number {
   return 0;
 }
 
-// Parse GitHub owner & repo from source string
-function parseGithubSource(source?: string): { owner: string; repo: string } | null {
-  if (!source) return null;
+// Parse GitHub owner & repo from any string (spec, url, repository field)
+function parseGithubSource(str?: string): { owner: string; repo: string } | null {
+  if (!str) return null;
 
-  // Patterns: github:owner/repo, https://github.com/owner/repo, owner/repo
-  const cleaned = source.trim().replace(/\.git$/, '');
-  const match = cleaned.match(/(?:github:|^https?:\/\/github\.com\/|^git@github\.com:)([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)/);
+  const cleaned = str.trim().replace(/\.git$/, '');
+  const match = cleaned.match(/(?:github:|^https?:\/\/github\.com\/|^git@github\.com:|^git\+https:\/\/github\.com\/)([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)/i);
   if (match) {
     return { owner: match[1], repo: match[2] };
   }
 
-  // Bare owner/repo
+  // Bare owner/repo (e.g. fengzhiyushui/dsh-plugins-update)
   if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(cleaned)) {
     const parts = cleaned.split('/');
     return { owner: parts[0], repo: parts[1] };
@@ -64,81 +63,131 @@ function resolveProfileDir(): { dir: string; profileName: string } {
   return { dir: desktopDir, profileName: 'desktop' };
 }
 
-// Fetch package metadata from GitHub repository
-async function fetchGithubPackageInfo(owner: string, repo: string): Promise<{ version: string; description?: string }> {
-  const urls = [
-    `https://cdn.jsdelivr.net/gh/${owner}/${repo}@main/package.json`,
-    `https://fastly.jsdelivr.net/gh/${owner}/${repo}@main/package.json`,
-    `https://raw.githubusercontent.com/${owner}/${repo}/main/package.json`,
-    `https://api.github.com/repos/${owner}/${repo}/contents/package.json`
-  ];
+// Resolve package origin from profile manifest and installed node_modules
+function resolvePackageOrigin(
+  profileDir: string,
+  packageName: string,
+  explicitSource?: string
+): { isGithub: boolean; github?: { owner: string; repo: string }; declaredSpec?: string } {
+  // 1. Check explicit source passed from client
+  let gh = parseGithubSource(explicitSource);
+  if (gh) return { isGithub: true, github: gh, declaredSpec: explicitSource };
 
-  let lastError: any = null;
-  for (const url of urls) {
+  // 2. Check profile's package.json dependencies
+  const manifestPath = join(profileDir, 'package.json');
+  if (existsSync(manifestPath)) {
     try {
-      const res = await fetch(url, {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'dsh-plugins-update'
-        },
-        signal: AbortSignal.timeout(6000)
-      });
-
-      if (res.ok) {
-        let pkgJson: any;
-        if (url.includes('api.github.com')) {
-          const data = await res.json() as any;
-          if (data.content && data.encoding === 'base64') {
-            const raw = Buffer.from(data.content, 'base64').toString('utf8');
-            pkgJson = JSON.parse(raw);
-          }
-        } else {
-          pkgJson = await res.json();
-        }
-
-        if (pkgJson && typeof pkgJson.version === 'string') {
-          return {
-            version: pkgJson.version,
-            description: pkgJson.description
-          };
-        }
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+      const spec = manifest?.dependencies?.[packageName] || manifest?.devDependencies?.[packageName];
+      if (typeof spec === 'string') {
+        gh = parseGithubSource(spec);
+        if (gh) return { isGithub: true, github: gh, declaredSpec: spec };
       }
-    } catch (e) {
-      lastError = e;
-    }
+    } catch {}
   }
 
-  throw lastError || new Error(`Failed to fetch package.json from GitHub (${owner}/${repo})`);
+  // 3. Check installed node_modules/<packageName>/package.json repository field
+  const installedPkgJsonPath = join(profileDir, 'node_modules', packageName, 'package.json');
+  if (existsSync(installedPkgJsonPath)) {
+    try {
+      const pkgJson = JSON.parse(readFileSync(installedPkgJsonPath, 'utf8'));
+      const repoUrl = typeof pkgJson.repository === 'string' ? pkgJson.repository : pkgJson.repository?.url;
+      gh = parseGithubSource(repoUrl);
+      if (gh) return { isGithub: true, github: gh };
+    } catch {}
+  }
+
+  return { isGithub: false };
 }
 
-// Fetch package metadata from npm registry
-async function fetchNpmPackageInfo(packageName: string): Promise<{ version: string; releaseDate?: string; description?: string }> {
-  const registries = [
-    'https://registry.npmjs.org/',
-    'https://registry.npmmirror.com/'
+// Fetch package metadata from GitHub repository (fast multi-source race)
+async function fetchGithubPackageInfo(owner: string, repo: string): Promise<{ version: string; description?: string }> {
+  const fetchEndpoints = [
+    async () => {
+      const res = await fetch(`https://cdn.jsdelivr.net/gh/${owner}/${repo}@main/package.json`, {
+        signal: AbortSignal.timeout(4000)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    },
+    async () => {
+      const res = await fetch(`https://fastly.jsdelivr.net/gh/${owner}/${repo}@main/package.json`, {
+        signal: AbortSignal.timeout(4000)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    },
+    async () => {
+      const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/main/package.json`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    },
+    async () => {
+      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/package.json`, {
+        headers: { 'User-Agent': 'dsh-plugins-update', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json() as any;
+      if (data.content && data.encoding === 'base64') {
+        return JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+      }
+      throw new Error('Invalid format');
+    }
   ];
 
-  let lastError: any = null;
-  for (const registry of registries) {
-    try {
-      const url = new URL(encodeURIComponent(packageName).replace(/^%40/, '@') + '/latest', registry).toString();
-      const res = await fetch(url, {
-        headers: { 'accept': 'application/json' },
-        signal: AbortSignal.timeout(6000)
-      });
-      if (res.ok) {
-        const data = await res.json() as any;
-        return {
-          version: data.version,
-          releaseDate: data.time?.[data.version],
-          description: data.description
-        };
-      }
-    } catch (err) {
-      lastError = err;
+  try {
+    const pkgJson = await Promise.any(fetchEndpoints.map(fn => fn()));
+    if (pkgJson && typeof pkgJson.version === 'string') {
+      return {
+        version: pkgJson.version,
+        description: pkgJson.description
+      };
     }
-  }
-  throw lastError || new Error(`Package ${packageName} not found on npm`);
+  } catch {}
+
+  throw new Error(`Failed to read package.json from GitHub (${owner}/${repo})`);
+}
+
+// Fetch package metadata from npm registry (prioritize fast domestic mirrors)
+async function fetchNpmPackageInfo(packageName: string): Promise<{ version: string; releaseDate?: string; description?: string }> {
+  const encodedName = encodeURIComponent(packageName).replace(/^%40/, '@');
+
+  const fetchEndpoints = [
+    // 1. npmmirror (China domestic high speed, primary)
+    async () => {
+      const res = await fetch(`https://registry.npmmirror.com/${encodedName}/latest`, {
+        headers: { 'accept': 'application/json' },
+        signal: AbortSignal.timeout(4000)
+      });
+      if (!res.ok) throw new Error(`npmmirror HTTP ${res.status}`);
+      return await res.json();
+    },
+    // 2. npmjs.org official
+    async () => {
+      const res = await fetch(`https://registry.npmjs.org/${encodedName}/latest`, {
+        headers: { 'accept': 'application/json' },
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!res.ok) throw new Error(`npmjs HTTP ${res.status}`);
+      return await res.json();
+    }
+  ];
+
+  try {
+    const data = await Promise.any(fetchEndpoints.map(fn => fn()));
+    if (data && typeof data.version === 'string') {
+      return {
+        version: data.version,
+        releaseDate: data.time?.[data.version],
+        description: data.description
+      };
+    }
+  } catch {}
+
+  throw new Error(`Package ${packageName} not found on npm`);
 }
 
 // Run update command using the best available tool
@@ -150,11 +199,11 @@ async function runUpdateCommand(
   source?: string
 ): Promise<{ ok: boolean; output: string; error?: string }> {
   let spec: string;
-  const gh = parseGithubSource(source);
+  const origin = resolvePackageOrigin(profileDir, packageName, source);
 
-  if (gh) {
+  if (origin.isGithub && origin.github) {
     // If installed via GitHub, update using github spec
-    spec = `github:${gh.owner}/${gh.repo}`;
+    spec = `github:${origin.github.owner}/${origin.github.repo}`;
   } else if (targetVersion) {
     spec = `${packageName}@${targetVersion}`;
   } else {
@@ -272,22 +321,23 @@ export function apply(ctx: any) {
         }
 
         const current = body.currentVersion || '0.0.0';
-        const gh = parseGithubSource(body.source) || parseGithubSource(body.packageName);
+        const { dir } = resolveProfileDir();
+        const origin = resolvePackageOrigin(dir, body.packageName, body.source);
 
         let latestVersion = current;
         let releaseDate: string | undefined;
         let description: string | undefined;
         let isGithub = false;
 
-        if (gh) {
-          // Check GitHub repo
+        if (origin.isGithub && origin.github) {
+          // GitHub package
           isGithub = true;
           try {
-            const ghInfo = await fetchGithubPackageInfo(gh.owner, gh.repo);
+            const ghInfo = await fetchGithubPackageInfo(origin.github.owner, origin.github.repo);
             latestVersion = ghInfo.version;
             description = ghInfo.description;
-          } catch (ghErr: any) {
-            // If GitHub fails, fallback to npm
+          } catch (ghErr) {
+            // Fallback: check npm
             try {
               const npmInfo = await fetchNpmPackageInfo(body.packageName);
               latestVersion = npmInfo.version;
@@ -295,7 +345,8 @@ export function apply(ctx: any) {
               description = npmInfo.description;
               isGithub = false;
             } catch {
-              throw ghErr;
+              // If both not reachable, treat current as latest without throwing fatal error
+              latestVersion = current;
             }
           }
         } else {
@@ -305,9 +356,20 @@ export function apply(ctx: any) {
             latestVersion = npmInfo.version;
             releaseDate = npmInfo.releaseDate;
             description = npmInfo.description;
-          } catch (npmErr: any) {
-            // Check if it might be a GitHub repo from manifest or name
-            throw npmErr;
+          } catch {
+            // Fallback: check if package has github repository declared in package.json
+            if (origin.github) {
+              try {
+                const ghInfo = await fetchGithubPackageInfo(origin.github.owner, origin.github.repo);
+                latestVersion = ghInfo.version;
+                description = ghInfo.description;
+                isGithub = true;
+              } catch {
+                latestVersion = current;
+              }
+            } else {
+              latestVersion = current;
+            }
           }
         }
 
@@ -321,7 +383,7 @@ export function apply(ctx: any) {
           hasUpdate,
           releaseDate,
           description,
-          source: body.source,
+          source: body.source || origin.declaredSpec,
           isGithub
         };
 
@@ -331,9 +393,10 @@ export function apply(ctx: any) {
       } catch (err: any) {
         // Return friendly message instead of crash
         return Response.json({
-          ok: false,
+          ok: true,
           packageName: '',
           hasUpdate: false,
+          latestVersion: '0.0.0',
           error: err?.message || 'Check failed'
         } as CheckUpdateResult, { status: 200 });
       }
