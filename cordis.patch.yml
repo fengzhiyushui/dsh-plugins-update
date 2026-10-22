@@ -1,0 +1,4 @@
+# dsh-plugins-update bundle patch
+- insert:
+    - id: dsh-plugins-update
+      name: dsh-plugins-update
