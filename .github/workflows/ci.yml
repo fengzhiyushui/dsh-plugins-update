@@ -25,7 +25,10 @@ jobs:
         version: 11
 
     - name: Install dependencies
-      run: pnpm install --no-frozen-lockfile
+      run: |
+        pnpm install --no-frozen-lockfile || true
+        pnpm approve-builds --all
+        pnpm install --no-frozen-lockfile
 
     - name: Run Build
       run: pnpm run build
