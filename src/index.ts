@@ -63,41 +63,68 @@ function resolveProfileDir(): { dir: string; profileName: string } {
   return { dir: desktopDir, profileName: 'desktop' };
 }
 
+// Read installed version directly from node_modules/<packageName>/package.json on disk
+function readInstalledVersion(profileDir: string, packageName: string): string | undefined {
+  const installedPkgJsonPath = join(profileDir, 'node_modules', packageName, 'package.json');
+  if (existsSync(installedPkgJsonPath)) {
+    try {
+      const pkgJson = JSON.parse(readFileSync(installedPkgJsonPath, 'utf8'));
+      if (typeof pkgJson.version === 'string' && pkgJson.version.trim()) {
+        return pkgJson.version.trim();
+      }
+    } catch {}
+  }
+  return undefined;
+}
+
 // Resolve package origin from profile manifest and installed node_modules
 function resolvePackageOrigin(
   profileDir: string,
   packageName: string,
   explicitSource?: string
-): { isGithub: boolean; github?: { owner: string; repo: string }; declaredSpec?: string } {
+): {
+  isGithub: boolean;
+  github?: { owner: string; repo: string };
+  repoGithub?: { owner: string; repo: string };
+  declaredSpec?: string;
+} {
+  // Read repository metadata from installed package.json as fallback info only (NOT install origin)
+  let repoGithub: { owner: string; repo: string } | undefined;
+  const installedPkgJsonPath = join(profileDir, 'node_modules', packageName, 'package.json');
+  if (existsSync(installedPkgJsonPath)) {
+    try {
+      const pkgJson = JSON.parse(readFileSync(installedPkgJsonPath, 'utf8'));
+      const repoUrl = typeof pkgJson.repository === 'string' ? pkgJson.repository : pkgJson.repository?.url;
+      const parsedRepo = parseGithubSource(repoUrl);
+      if (parsedRepo) repoGithub = parsedRepo;
+    } catch {}
+  }
+
   // 1. Check explicit source passed from client
   let gh = parseGithubSource(explicitSource);
-  if (gh) return { isGithub: true, github: gh, declaredSpec: explicitSource };
+  if (gh) return { isGithub: true, github: gh, repoGithub: repoGithub || gh, declaredSpec: explicitSource };
 
   // 2. Check profile's package.json dependencies
   const manifestPath = join(profileDir, 'package.json');
   if (existsSync(manifestPath)) {
     try {
       const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-      const spec = manifest?.dependencies?.[packageName] || manifest?.devDependencies?.[packageName];
+      const spec =
+        manifest?.dependencies?.[packageName] ||
+        manifest?.devDependencies?.[packageName] ||
+        manifest?.optionalDependencies?.[packageName];
       if (typeof spec === 'string') {
         gh = parseGithubSource(spec);
-        if (gh) return { isGithub: true, github: gh, declaredSpec: spec };
+        if (gh) {
+          return { isGithub: true, github: gh, repoGithub: repoGithub || gh, declaredSpec: spec };
+        }
+        // Installed via npm registry / version range
+        return { isGithub: false, repoGithub, declaredSpec: spec };
       }
     } catch {}
   }
 
-  // 3. Check installed node_modules/<packageName>/package.json repository field
-  const installedPkgJsonPath = join(profileDir, 'node_modules', packageName, 'package.json');
-  if (existsSync(installedPkgJsonPath)) {
-    try {
-      const pkgJson = JSON.parse(readFileSync(installedPkgJsonPath, 'utf8'));
-      const repoUrl = typeof pkgJson.repository === 'string' ? pkgJson.repository : pkgJson.repository?.url;
-      gh = parseGithubSource(repoUrl);
-      if (gh) return { isGithub: true, github: gh };
-    } catch {}
-  }
-
-  return { isGithub: false };
+  return { isGithub: false, repoGithub };
 }
 
 // Fetch package metadata from GitHub repository (fast multi-source race)
@@ -200,15 +227,18 @@ async function runUpdateCommand(
 ): Promise<{ ok: boolean; output: string; error?: string }> {
   let spec: string;
   const origin = resolvePackageOrigin(profileDir, packageName, source);
+  const cleanTarget = targetVersion ? targetVersion.replace(/^[v^~]/, '').trim() : '';
 
   if (origin.isGithub && origin.github) {
-    // If installed via GitHub, update using github spec
+    // If installed via GitHub, re-add using github spec
     spec = `github:${origin.github.owner}/${origin.github.repo}`;
-  } else if (targetVersion) {
-    spec = `${packageName}@${targetVersion}`;
+  } else if (cleanTarget) {
+    spec = `${packageName}@${cleanTarget}`;
   } else {
     spec = `${packageName}@latest`;
   }
+
+  const registryFlag = '--registry=https://registry.npmmirror.com/';
 
   // Candidate commands
   const execDir = process.execPath ? join(process.execPath, '..') : '';
@@ -220,13 +250,13 @@ async function runUpdateCommand(
   ];
 
   let command = 'pnpm';
-  let args = ['update', spec];
-  let useShell = process.platform === 'win32';
+  let args = ['add', spec, registryFlag];
+  const useShell = process.platform === 'win32';
 
   for (const p of dshCmdPaths) {
     if (existsSync(p)) {
-      command = p;
-      args = ['plugin', '--profile', profileName, 'update', spec];
+      command = useShell && p.includes(' ') ? `"${p}"` : p;
+      args = ['plugin', '--profile', profileName, 'add', spec, registryFlag];
       break;
     }
   }
@@ -253,32 +283,7 @@ async function runUpdateCommand(
         output += data.toString();
       });
 
-      child.on('error', (err) => {
-        if (settled) return;
-        settled = true;
-        resolve({
-          ok: false,
-          output,
-          error: `Process error: ${err.message}`
-        });
-      });
-
-      child.on('close', (code) => {
-        if (settled) return;
-        settled = true;
-        if (code === 0) {
-          resolve({ ok: true, output });
-        } else {
-          resolve({
-            ok: false,
-            output,
-            error: `Update process exited with code ${code}`
-          });
-        }
-      });
-
-      // Timeout after 2 minutes
-      setTimeout(() => {
+      const timeoutTimer = setTimeout(() => {
         if (!settled) {
           settled = true;
           try { child.kill(); } catch {}
@@ -289,6 +294,42 @@ async function runUpdateCommand(
           });
         }
       }, 120000);
+      timeoutTimer.unref?.();
+
+      child.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutTimer);
+        resolve({
+          ok: false,
+          output,
+          error: `Process error: ${err.message}`
+        });
+      });
+
+      child.on('close', (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutTimer);
+        if (code === 0) {
+          const afterVersion = readInstalledVersion(profileDir, packageName);
+          if (!origin.isGithub && cleanTarget && afterVersion && compareSemver(afterVersion, cleanTarget) < 0) {
+            resolve({
+              ok: false,
+              output,
+              error: `Update process exited with 0, but installed version remained ${afterVersion} (expected ${cleanTarget})`
+            });
+            return;
+          }
+          resolve({ ok: true, output });
+        } else {
+          resolve({
+            ok: false,
+            output,
+            error: `Update process exited with code ${code}`
+          });
+        }
+      });
 
     } catch (e: any) {
       resolve({
@@ -320,8 +361,13 @@ export function apply(ctx: any) {
           return Response.json({ ok: false, error: 'packageName is required' } as CheckUpdateResult, { status: 400 });
         }
 
-        const current = body.currentVersion || '0.0.0';
         const { dir } = resolveProfileDir();
+        const diskVersion = readInstalledVersion(dir, body.packageName);
+        const clientVersion = body.currentVersion || '0.0.0';
+        const current =
+          diskVersion && compareSemver(diskVersion, clientVersion) > 0
+            ? diskVersion
+            : clientVersion || diskVersion || '0.0.0';
         const origin = resolvePackageOrigin(dir, body.packageName, body.source);
 
         let latestVersion = current;
@@ -358,12 +404,12 @@ export function apply(ctx: any) {
             description = npmInfo.description;
           } catch {
             // Fallback: check if package has github repository declared in package.json
-            if (origin.github) {
+            const fallbackGh = origin.repoGithub || origin.github;
+            if (fallbackGh) {
               try {
-                const ghInfo = await fetchGithubPackageInfo(origin.github.owner, origin.github.repo);
+                const ghInfo = await fetchGithubPackageInfo(fallbackGh.owner, fallbackGh.repo);
                 latestVersion = ghInfo.version;
                 description = ghInfo.description;
-                isGithub = true;
               } catch {
                 latestVersion = current;
               }
@@ -417,6 +463,20 @@ export function apply(ctx: any) {
 
         const { dir, profileName } = resolveProfileDir();
         const runRes = await runUpdateCommand(dir, profileName, body.packageName, body.targetVersion, body.source);
+
+        if (runRes.ok) {
+          try {
+            const packages = ctx.get?.('pluginPackages');
+            if (packages?.refresh) await packages.refresh();
+          } catch {}
+          try {
+            const hmr = ctx.get?.('hmr');
+            if (hmr?.reconcileProfile) await hmr.reconcileProfile([]);
+          } catch {}
+          try {
+            ctx.emit?.('plugin-manager/changed', { reason: 'install' });
+          } catch {}
+        }
 
         const result: DoUpdateResult = {
           ok: runRes.ok,
