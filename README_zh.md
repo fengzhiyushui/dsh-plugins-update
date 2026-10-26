@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
-  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-brightgreen.svg" alt="Release" /></a>
+  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.1.2-brightgreen.svg" alt="Release" /></a>
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update"><img src="https://img.shields.io/badge/DeepSeek%20Harness-v0.2+-orange.svg" alt="DeepSeek Harness" /></a>
 </p>
 
@@ -29,6 +29,12 @@
   * **已是最新**：显示 `✓ 已是最新`，支持点击重新检测；
   * **正在更新**：显示 `正在更新...` Loading 状态并锁定操作；
   * **更新完成**：弹窗提示成功并引导重载生效。
+* **灵活的多源切换与自定义源**：
+  * **自动模式（推荐）**：并发探测测速，并智能检查国内镜像包版本完整度，缺包时无缝切换官方源；
+  * **npm 官方源**：直连官方，首发可用，绝无镜像同步滞后；
+  * **国内源 npmmirror**：与 DSH 客户端自带同款，国内高速解析；
+  * **自定义更新源**：支持用户自行添加、切换和删除私有源或云厂商镜像；
+  * **故障自动回退**：国内或自定义源安装失败时，自动重试官方源兜底。
 * **零侵入官方客户端**：不修改官方 DSH 的任何安装文件，通过 Cordis 微内核机制与本地环境协同工作。
 
 ---

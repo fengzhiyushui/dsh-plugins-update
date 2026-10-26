@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-10-26
+
+### Added
+- Added registry selection settings (`RegistrySettingsCard`) integrated into DSH bundle configuration (`plugins.bundle.config`) and directly accessible via a quick-settings button (`⚙️`) beside the updater button.
+- Added support for custom registries: users can freely add, switch to, and remove custom npm registries.
+- Added pre-configured official npm registry (`https://registry.npmjs.org/`) and DSH domestic mirror (`https://registry.npmmirror.com/`) options with detailed in-app guidance.
+- Added smart package presence validation in auto-selection mode: validates that all required versions exist on the mirror before proceeding, seamlessly switching to the official registry if any package is lagging or missing.
+- Added automated fallback to the official registry if an installation fails on domestic or custom registries (e.g. `ERR_PNPM_NO_MATCHING_VERSION`).
+
+### Fixed
+- Fixed update failure on other plugins (e.g. `dsh-context`) caused by hardcoded `--registry=https://registry.npmmirror.com/` resolving un-synced dependencies across shared profile `package.json`.
+- Fixed version check query race where fast-responding mirrors could return outdated versions over the official registry.
+
 ## [0.1.1] - 2026-10-25
 
 ### Fixed

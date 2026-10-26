@@ -1,9 +1,11 @@
 import * as esbuild from 'esbuild';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 
+const pkg = JSON.parse(readFileSync('./package.json', 'utf8'));
+
 async function build() {
-  console.log('🚀 Building dsh-plugins-update...');
+  console.log(`🚀 Building dsh-plugins-update v${pkg.version}...`);
   mkdirSync('lib', { recursive: true });
 
   // 1. Build backend index.js (ESM)
@@ -40,7 +42,7 @@ async function build() {
 
   const clientCode = clientResult.outputFiles[0].text;
   const wrappedClientCode = `/**
- * dsh-plugins-update v0.1.0
+ * dsh-plugins-update v${pkg.version}
  * One-click updater for third-party plugins in DeepSeek Harness.
  */
 window.__ModuleLoader__.load({

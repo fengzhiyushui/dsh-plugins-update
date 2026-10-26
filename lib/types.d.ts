@@ -1,3 +1,24 @@
+/** Official npm registry. */
+export declare const OFFICIAL_REGISTRY = "https://registry.npmjs.org/";
+/** Domestic mirror used by DSH itself (same as the DSH "Add plugin" dialog's China mainland source). */
+export declare const DOMESTIC_REGISTRY = "https://registry.npmmirror.com/";
+/**
+ * Registry selection stored in the plugin config:
+ * - `auto`: probe both built-in registries and pick a complete one, otherwise the official one
+ * - `npmjs`: official npm registry
+ * - `npmmirror`: DSH's domestic mirror
+ * - any `http(s)://` URL: one of the user's custom registries
+ */
+export type RegistryChoice = 'auto' | 'npmjs' | 'npmmirror' | string;
+export interface CustomRegistry {
+    name: string;
+    url: string;
+}
+export interface PluginSettings {
+    registry: RegistryChoice;
+    customRegistries: CustomRegistry[];
+    fallbackToOfficial: boolean;
+}
 export interface CheckUpdateParams {
     packageName: string;
     currentVersion?: string;
@@ -14,6 +35,8 @@ export interface CheckUpdateResult {
     source?: string;
     isGithub?: boolean;
     unreleased?: boolean;
+    /** Registry that reported `latestVersion` (npm packages only). */
+    registry?: string;
     error?: string;
 }
 export interface DoUpdateParams {
@@ -26,6 +49,12 @@ export interface DoUpdateResult {
     packageName: string;
     targetVersion?: string;
     source?: string;
+    /** Registry the successful (or last) install attempt used. */
+    registryUsed?: string;
+    /** Human-readable label of `registryUsed`. */
+    registryLabel?: string;
+    /** Whether the install was retried on the official registry after a failure. */
+    fellBack?: boolean;
     output?: string;
     error?: string;
 }
@@ -45,3 +74,7 @@ export interface SlotActionSubject {
 export interface SlotActionProps {
     subject: SlotActionSubject;
 }
+/** Normalize a registry URL the way pnpm compares them: lower-case host, trailing slash. Returns null if invalid. */
+export declare function normalizeRegistryUrl(url: string | undefined | null): string | null;
+/** Human-readable label for a registry URL. */
+export declare function registryLabel(url: string, customs?: CustomRegistry[]): string;

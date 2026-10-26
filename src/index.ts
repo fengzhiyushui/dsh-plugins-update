@@ -2,10 +2,87 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { CheckUpdateParams, CheckUpdateResult, DoUpdateParams, DoUpdateResult } from './types.js';
+import Schema from '@deepseek-ai/schemastery';
+import {
+  DOMESTIC_REGISTRY,
+  OFFICIAL_REGISTRY,
+  normalizeRegistryUrl,
+  registryLabel,
+  type CheckUpdateParams,
+  type CheckUpdateResult,
+  type CustomRegistry,
+  type DoUpdateParams,
+  type DoUpdateResult,
+  type PluginSettings
+} from './types.js';
 
 export const name = 'dsh-plugins-update';
 export const inject = ['connection'];
+
+// Mark a schema volatile when the running schemastery supports it, so setting changes apply without a restart
+function live<T>(schema: T): T {
+  const s = schema as any;
+  return typeof s?.volatile === 'function' ? s.volatile() : schema;
+}
+
+// Plugin configuration (persisted by DSH in the profile's cordis.patch.yml under `id: dsh-plugins-update`)
+export const Config: Schema<any> = Schema.object({
+  registry: live(
+    Schema.string()
+      .default('auto')
+      .description('更新源：auto（自动）/ npmjs（npm 官方源）/ npmmirror（DSH 同款国内源）/ 自定义源 URL')
+  ),
+  customRegistries: live(
+    Schema.array(
+      Schema.object({
+        name: Schema.string().default(''),
+        url: Schema.string().default('')
+      })
+    )
+      .default([])
+      .description('用户自行添加的更新源列表')
+  ),
+  fallbackToOfficial: live(
+    Schema.boolean()
+      .default(true)
+      .description('使用非官方源更新失败时，自动改用 npm 官方源重试一次')
+  )
+});
+
+// Read a config field that may be a plain value or a volatile wrapper with `.get()`
+function readField<T>(field: any, fallback: T): T {
+  let raw: any = field;
+  if (field && typeof field === 'object' && typeof field.get === 'function') {
+    try {
+      raw = field.get();
+    } catch {
+      raw = undefined;
+    }
+  }
+  return raw === undefined || raw === null ? fallback : (raw as T);
+}
+
+function readSettings(config: any): PluginSettings {
+  const registryRaw = readField<string>(config?.registry, 'auto');
+  const customRaw = readField<any[]>(config?.customRegistries, []);
+  const fallback = readField<boolean>(config?.fallbackToOfficial, true);
+
+  const customRegistries: CustomRegistry[] = Array.isArray(customRaw)
+    ? customRaw
+        .map(item => ({
+          name: typeof item?.name === 'string' ? item.name.trim() : '',
+          url: normalizeRegistryUrl(item?.url) ?? ''
+        }))
+        .filter(item => item.url)
+    : [];
+
+  let registry = typeof registryRaw === 'string' ? registryRaw.trim() : 'auto';
+  if (registry !== 'auto' && registry !== 'npmjs' && registry !== 'npmmirror') {
+    registry = normalizeRegistryUrl(registry) ?? 'auto';
+  }
+
+  return { registry, customRegistries, fallbackToOfficial: fallback !== false };
+}
 
 // Simple Semver Comparison: returns >0 if v1 > v2, <0 if v1 < v2, 0 if equal
 function compareSemver(v1: string, v2: string): number {
@@ -75,6 +152,22 @@ function readInstalledVersion(profileDir: string, packageName: string): string |
     } catch {}
   }
   return undefined;
+}
+
+// Read the profile manifest's direct dependencies
+function readProfileDependencies(profileDir: string): Record<string, string> {
+  const manifestPath = join(profileDir, 'package.json');
+  if (!existsSync(manifestPath)) return {};
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    return {
+      ...(manifest?.optionalDependencies || {}),
+      ...(manifest?.devDependencies || {}),
+      ...(manifest?.dependencies || {})
+    };
+  } catch {
+    return {};
+  }
 }
 
 // Resolve package origin from profile manifest and installed node_modules
@@ -178,67 +271,171 @@ async function fetchGithubPackageInfo(owner: string, repo: string): Promise<{ ve
   throw new Error(`Failed to read package.json from GitHub (${owner}/${repo})`);
 }
 
-// Fetch package metadata from npm registry (prioritize fast domestic mirrors)
-async function fetchNpmPackageInfo(packageName: string): Promise<{ version: string; releaseDate?: string; description?: string }> {
-  const encodedName = encodeURIComponent(packageName).replace(/^%40/, '@');
-
-  const fetchEndpoints = [
-    // 1. npmmirror (China domestic high speed, primary)
-    async () => {
-      const res = await fetch(`https://registry.npmmirror.com/${encodedName}/latest`, {
-        headers: { 'accept': 'application/json' },
-        signal: AbortSignal.timeout(4000)
-      });
-      if (!res.ok) throw new Error(`npmmirror HTTP ${res.status}`);
-      return await res.json();
-    },
-    // 2. npmjs.org official
-    async () => {
-      const res = await fetch(`https://registry.npmjs.org/${encodedName}/latest`, {
-        headers: { 'accept': 'application/json' },
-        signal: AbortSignal.timeout(5000)
-      });
-      if (!res.ok) throw new Error(`npmjs HTTP ${res.status}`);
-      return await res.json();
-    }
-  ];
-
-  try {
-    const data = await Promise.any(fetchEndpoints.map(fn => fn()));
-    if (data && typeof data.version === 'string') {
-      return {
-        version: data.version,
-        releaseDate: data.time?.[data.version],
-        description: data.description
-      };
-    }
-  } catch {}
-
-  throw new Error(`Package ${packageName} not found on npm`);
+function encodePackageName(packageName: string): string {
+  return encodeURIComponent(packageName).replace(/^%40/, '@');
 }
 
-// Run update command using the best available tool
-async function runUpdateCommand(
-  profileDir: string,
-  profileName: string,
-  packageName: string,
-  targetVersion?: string,
-  source?: string
-): Promise<{ ok: boolean; output: string; error?: string }> {
-  let spec: string;
-  const origin = resolvePackageOrigin(profileDir, packageName, source);
-  const cleanTarget = targetVersion ? targetVersion.replace(/^[v^~]/, '').trim() : '';
+// Registries consulted for version checks, by setting
+function checkRegistries(settings: PluginSettings): string[] {
+  switch (settings.registry) {
+    case 'auto':
+      return [DOMESTIC_REGISTRY, OFFICIAL_REGISTRY];
+    case 'npmjs':
+      return [OFFICIAL_REGISTRY];
+    case 'npmmirror':
+      return [DOMESTIC_REGISTRY];
+    default:
+      return [settings.registry];
+  }
+}
 
-  if (origin.isGithub && origin.github) {
-    // If installed via GitHub, re-add using github spec
-    spec = `github:${origin.github.owner}/${origin.github.repo}`;
-  } else if (cleanTarget) {
-    spec = `${packageName}@${cleanTarget}`;
-  } else {
-    spec = `${packageName}@latest`;
+async function fetchLatestFrom(registry: string, packageName: string) {
+  const res = await fetch(`${registry}${encodePackageName(packageName)}/latest`, {
+    headers: { 'accept': 'application/json' },
+    signal: AbortSignal.timeout(5000)
+  });
+  if (!res.ok) throw new Error(`${registry} HTTP ${res.status}`);
+  const data = (await res.json()) as any;
+  if (!data || typeof data.version !== 'string') throw new Error(`${registry} returned no version`);
+  return {
+    version: data.version as string,
+    releaseDate: data.time?.[data.version] as string | undefined,
+    description: data.description as string | undefined,
+    registry
+  };
+}
+
+// Fetch package metadata from the configured registries.
+// In auto mode both built-in registries are queried and the HIGHEST version wins,
+// so a lagging mirror can no longer hide a newer release.
+async function fetchNpmPackageInfo(
+  packageName: string,
+  settings: PluginSettings
+): Promise<{ version: string; releaseDate?: string; description?: string; registry: string }> {
+  const registries = checkRegistries(settings);
+
+  const pickHighest = (results: PromiseSettledResult<Awaited<ReturnType<typeof fetchLatestFrom>>>[]) => {
+    let best: Awaited<ReturnType<typeof fetchLatestFrom>> | undefined;
+    for (const r of results) {
+      if (r.status !== 'fulfilled') continue;
+      if (!best || compareSemver(r.value.version, best.version) > 0) best = r.value;
+    }
+    return best;
+  };
+
+  let best = pickHighest(await Promise.allSettled(registries.map(reg => fetchLatestFrom(reg, packageName))));
+
+  if (!best && settings.fallbackToOfficial && !registries.includes(OFFICIAL_REGISTRY)) {
+    best = pickHighest(await Promise.allSettled([fetchLatestFrom(OFFICIAL_REGISTRY, packageName)]));
   }
 
-  const registryFlag = '--registry=https://registry.npmmirror.com/';
+  if (best) return best;
+  throw new Error(`Package ${packageName} not found on ${registries.join(', ')}`);
+}
+
+// --- Registry selection for installs -------------------------------------------------
+
+// Ping a registry; resolves with the URL on a 2xx response, rejects otherwise
+async function pingRegistry(registry: string, timeoutMs: number): Promise<string> {
+  const res = await fetch(`${registry}-/ping`, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
+  try {
+    await res.body?.cancel();
+  } catch {}
+  if (res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res.status}`);
+  return registry;
+}
+
+// Same probing approach DSH's "Add plugin" dialog uses: first 2xx ping wins
+async function probeFastestRegistry(): Promise<string | null> {
+  try {
+    return await Promise.any([pingRegistry(OFFICIAL_REGISTRY, 1500), pingRegistry(DOMESTIC_REGISTRY, 1500)]);
+  } catch {
+    return null;
+  }
+}
+
+async function versionExists(registry: string, packageName: string, version: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${registry}${encodePackageName(packageName)}/${encodeURIComponent(version)}`, {
+      headers: { 'accept': 'application/json' },
+      signal: AbortSignal.timeout(5000)
+    });
+    try {
+      await res.body?.cancel();
+    } catch {}
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function isRegistrySpec(spec: string): boolean {
+  const s = spec.trim();
+  if (!s) return false;
+  if (/^(?:github:|gitlab:|bitbucket:|git[+:]|git@|https?:|file:|link:|workspace:|npm:|portal:|patch:)/i.test(s)) return false;
+  if (parseGithubSource(s)) return false; // bare owner/repo
+  return true;
+}
+
+// Every `name@version` pnpm will have to resolve from the registry during this install
+function collectRequiredVersions(
+  profileDir: string,
+  packageName: string,
+  targetVersion: string,
+  targetIsGithub: boolean
+): Array<{ name: string; version: string }> {
+  const required: Array<{ name: string; version: string }> = [];
+  const deps = readProfileDependencies(profileDir);
+
+  for (const [dep, spec] of Object.entries(deps)) {
+    if (dep === packageName) continue;
+    if (typeof spec !== 'string' || !isRegistrySpec(spec)) continue;
+    const installed = readInstalledVersion(profileDir, dep);
+    if (installed) required.push({ name: dep, version: installed });
+  }
+
+  if (!targetIsGithub && targetVersion) {
+    required.push({ name: packageName, version: targetVersion });
+  }
+  return required;
+}
+
+async function resolveInstallRegistry(
+  settings: PluginSettings,
+  profileDir: string,
+  packageName: string,
+  targetVersion: string,
+  targetIsGithub: boolean
+): Promise<{ registry: string; reason: string }> {
+  if (settings.registry === 'npmjs') return { registry: OFFICIAL_REGISTRY, reason: '设置中指定' };
+  if (settings.registry === 'npmmirror') return { registry: DOMESTIC_REGISTRY, reason: '设置中指定' };
+  if (settings.registry !== 'auto') return { registry: settings.registry, reason: '设置中指定' };
+
+  // auto
+  const fastest = await probeFastestRegistry();
+  if (fastest === OFFICIAL_REGISTRY) {
+    return { registry: OFFICIAL_REGISTRY, reason: '自动模式：npm 官方源响应更快' };
+  }
+
+  // Domestic registry is faster (or both pings failed): make sure it actually has everything this install needs
+  const required = collectRequiredVersions(profileDir, packageName, targetVersion, targetIsGithub);
+  const present = await Promise.all(required.map(r => versionExists(DOMESTIC_REGISTRY, r.name, r.version)));
+  const missing = required.filter((_, i) => !present[i]);
+
+  if (missing.length === 0) {
+    return { registry: DOMESTIC_REGISTRY, reason: '自动模式：国内源响应更快，且包含本次所需的全部版本' };
+  }
+  return {
+    registry: OFFICIAL_REGISTRY,
+    reason: `自动模式：国内源暂缺 ${missing.map(m => `${m.name}@${m.version}`).join('、')}，改用 npm 官方源`
+  };
+}
+
+// --- Install execution -----------------------------------------------------------------
+
+function resolveCommand(profileName: string, spec: string, registry: string): { command: string; args: string[]; useShell: boolean } {
+  const registryFlag = `--registry=${registry}`;
+  const useShell = process.platform === 'win32';
 
   // Candidate commands
   const execDir = process.execPath ? join(process.execPath, '..') : '';
@@ -249,17 +446,26 @@ async function runUpdateCommand(
     join(process.env.LOCALAPPDATA || '', 'Programs', 'DeepSeek Harness', 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd')
   ];
 
-  let command = 'pnpm';
-  let args = ['add', spec, registryFlag];
-  const useShell = process.platform === 'win32';
-
   for (const p of dshCmdPaths) {
     if (existsSync(p)) {
-      command = useShell && p.includes(' ') ? `"${p}"` : p;
-      args = ['plugin', '--profile', profileName, 'add', spec, registryFlag];
-      break;
+      return {
+        command: useShell && p.includes(' ') ? `"${p}"` : p,
+        args: ['plugin', '--profile', profileName, 'add', spec, registryFlag],
+        useShell
+      };
     }
   }
+
+  return { command: 'pnpm', args: ['add', spec, registryFlag], useShell };
+}
+
+function runInstall(
+  profileDir: string,
+  profileName: string,
+  spec: string,
+  registry: string
+): Promise<{ ok: boolean; output: string; error?: string }> {
+  const { command, args, useShell } = resolveCommand(profileName, spec, registry);
 
   return new Promise((resolve) => {
     let output = '';
@@ -271,7 +477,8 @@ async function runUpdateCommand(
         shell: useShell,
         env: {
           ...process.env,
-          npm_config_registry: process.env.npm_config_registry || 'https://registry.npmmirror.com/'
+          // Keep the env registry identical to the --registry flag
+          npm_config_registry: registry
         }
       });
 
@@ -312,15 +519,6 @@ async function runUpdateCommand(
         settled = true;
         clearTimeout(timeoutTimer);
         if (code === 0) {
-          const afterVersion = readInstalledVersion(profileDir, packageName);
-          if (!origin.isGithub && cleanTarget && afterVersion && compareSemver(afterVersion, cleanTarget) < 0) {
-            resolve({
-              ok: false,
-              output,
-              error: `Update process exited with 0, but installed version remained ${afterVersion} (expected ${cleanTarget})`
-            });
-            return;
-          }
           resolve({ ok: true, output });
         } else {
           resolve({
@@ -330,7 +528,6 @@ async function runUpdateCommand(
           });
         }
       });
-
     } catch (e: any) {
       resolve({
         ok: false,
@@ -341,7 +538,63 @@ async function runUpdateCommand(
   });
 }
 
-export function apply(ctx: any) {
+// Run update command using the configured registry, with optional fallback to the official registry
+async function runUpdateCommand(
+  settings: PluginSettings,
+  profileDir: string,
+  profileName: string,
+  packageName: string,
+  targetVersion?: string,
+  source?: string
+): Promise<{ ok: boolean; output: string; error?: string; registryUsed: string; fellBack: boolean }> {
+  let spec: string;
+  const origin = resolvePackageOrigin(profileDir, packageName, source);
+  const cleanTarget = targetVersion ? targetVersion.replace(/^[v^~]/, '').trim() : '';
+
+  if (origin.isGithub && origin.github) {
+    // If installed via GitHub, re-add using github spec
+    spec = `github:${origin.github.owner}/${origin.github.repo}`;
+  } else if (cleanTarget) {
+    spec = `${packageName}@${cleanTarget}`;
+  } else {
+    spec = `${packageName}@latest`;
+  }
+
+  const plan = await resolveInstallRegistry(settings, profileDir, packageName, cleanTarget, origin.isGithub);
+  const label = (url: string) => registryLabel(url, settings.customRegistries);
+
+  let output = `[dsh-plugins-update] 使用 ${label(plan.registry)}（${plan.registry}）— ${plan.reason}\n`;
+  let attempt = await runInstall(profileDir, profileName, spec, plan.registry);
+  output += attempt.output;
+  let registryUsed = plan.registry;
+  let fellBack = false;
+
+  if (!attempt.ok && settings.fallbackToOfficial && plan.registry !== OFFICIAL_REGISTRY) {
+    output += `\n[dsh-plugins-update] ${label(plan.registry)} 更新失败（${attempt.error || 'unknown'}），改用 npm 官方源（${OFFICIAL_REGISTRY}）重试…\n`;
+    attempt = await runInstall(profileDir, profileName, spec, OFFICIAL_REGISTRY);
+    output += attempt.output;
+    registryUsed = OFFICIAL_REGISTRY;
+    fellBack = true;
+  }
+
+  if (attempt.ok) {
+    const afterVersion = readInstalledVersion(profileDir, packageName);
+    if (!origin.isGithub && cleanTarget && afterVersion && compareSemver(afterVersion, cleanTarget) < 0) {
+      return {
+        ok: false,
+        output,
+        error: `Update process exited with 0, but installed version remained ${afterVersion} (expected ${cleanTarget})`,
+        registryUsed,
+        fellBack
+      };
+    }
+    return { ok: true, output, registryUsed, fellBack };
+  }
+
+  return { ok: false, output, error: attempt.error, registryUsed, fellBack };
+}
+
+export function apply(ctx: any, config: any) {
   const conn = ctx.get('connection');
   const registerFetch = conn?.fetch?.register?.bind(conn.fetch);
 
@@ -361,6 +614,7 @@ export function apply(ctx: any) {
           return Response.json({ ok: false, error: 'packageName is required' } as CheckUpdateResult, { status: 400 });
         }
 
+        const settings = readSettings(config);
         const { dir } = resolveProfileDir();
         const diskVersion = readInstalledVersion(dir, body.packageName);
         const clientVersion = body.currentVersion || '0.0.0';
@@ -373,6 +627,7 @@ export function apply(ctx: any) {
         let latestVersion = current;
         let releaseDate: string | undefined;
         let description: string | undefined;
+        let registry: string | undefined;
         let isGithub = false;
 
         if (origin.isGithub && origin.github) {
@@ -385,10 +640,11 @@ export function apply(ctx: any) {
           } catch (ghErr) {
             // Fallback: check npm
             try {
-              const npmInfo = await fetchNpmPackageInfo(body.packageName);
+              const npmInfo = await fetchNpmPackageInfo(body.packageName, settings);
               latestVersion = npmInfo.version;
               releaseDate = npmInfo.releaseDate;
               description = npmInfo.description;
+              registry = npmInfo.registry;
               isGithub = false;
             } catch {
               // If both not reachable, treat current as latest without throwing fatal error
@@ -398,10 +654,11 @@ export function apply(ctx: any) {
         } else {
           // Normal npm package
           try {
-            const npmInfo = await fetchNpmPackageInfo(body.packageName);
+            const npmInfo = await fetchNpmPackageInfo(body.packageName, settings);
             latestVersion = npmInfo.version;
             releaseDate = npmInfo.releaseDate;
             description = npmInfo.description;
+            registry = npmInfo.registry;
           } catch {
             // Fallback: check if package has github repository declared in package.json
             const fallbackGh = origin.repoGithub || origin.github;
@@ -430,7 +687,8 @@ export function apply(ctx: any) {
           releaseDate,
           description,
           source: body.source || origin.declaredSpec,
-          isGithub
+          isGithub,
+          registry
         };
 
         return Response.json(result, {
@@ -461,8 +719,9 @@ export function apply(ctx: any) {
           return Response.json({ ok: false, error: 'packageName is required' } as DoUpdateResult, { status: 400 });
         }
 
+        const settings = readSettings(config);
         const { dir, profileName } = resolveProfileDir();
-        const runRes = await runUpdateCommand(dir, profileName, body.packageName, body.targetVersion, body.source);
+        const runRes = await runUpdateCommand(settings, dir, profileName, body.packageName, body.targetVersion, body.source);
 
         if (runRes.ok) {
           try {
@@ -483,6 +742,9 @@ export function apply(ctx: any) {
           packageName: body.packageName,
           targetVersion: body.targetVersion,
           source: body.source,
+          registryUsed: runRes.registryUsed,
+          registryLabel: registryLabel(runRes.registryUsed, settings.customRegistries),
+          fellBack: runRes.fellBack,
           output: runRes.output,
           error: runRes.error
         };
