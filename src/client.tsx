@@ -14,6 +14,14 @@ import {
 const checkCache = new Map<string, { time: number; result: CheckUpdateResult }>();
 const CACHE_TTL_MS = 60 * 1000; // 1 minute
 
+// Official plugins are updated through DSH's own Update button. Older DSH versions do not pass `official`
+// to detail slots, so fall back to the official npm scope.
+function isOfficialPackage(pkg: SlotActionProps['subject']['pkg']): boolean {
+  if (!pkg) return false;
+  if (typeof pkg.official === 'boolean') return pkg.official;
+  return typeof pkg.name === 'string' && pkg.name.startsWith('@deepseek-ai/');
+}
+
 // Default fallback settings
 const DEFAULT_SETTINGS: PluginSettings = {
   registry: 'auto',
@@ -436,7 +444,6 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
   const pkg = subject?.pkg;
   const packageName = pkg?.name;
   const currentVersion = pkg?.version || '0.0.0';
-  const source = pkg?.source;
 
   const [status, setStatus] = useState<'idle' | 'checking' | 'has_update' | 'up_to_date' | 'updating' | 'success' | 'error'>('idle');
   const [latestVersion, setLatestVersion] = useState<string>('');
@@ -444,8 +451,8 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const checkingRef = useRef(false);
 
-  // If this is not a bundle or has no name, do not render
-  if (subject?.kind !== 'bundle' || !packageName) {
+  // Only user-installed bundles: official plugins use DSH's own update entry, and uninstalled bundles have nothing to update.
+  if (subject?.kind !== 'bundle' || !packageName || pkg?.installed === false || isOfficialPackage(pkg)) {
     return null;
   }
 
@@ -455,7 +462,8 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
 
     if (!force) {
       const cached = checkCache.get(packageName);
-      if (cached && Date.now() - cached.time < CACHE_TTL_MS) {
+      // Never replay a failed check: the button must show the retry state instead of "up to date".
+      if (cached && cached.result.ok && Date.now() - cached.time < CACHE_TTL_MS) {
         if (cached.result.hasUpdate) {
           setStatus('has_update');
           setLatestVersion(cached.result.latestVersion || '');
@@ -474,7 +482,7 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
       const res = await fetch('/api/dsh-plugins-update/check', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ packageName, currentVersion, source })
+        body: JSON.stringify({ packageName, currentVersion })
       });
 
       if (!res.ok) {
@@ -482,9 +490,9 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
       }
 
       const data = (await res.json()) as CheckUpdateResult;
-      checkCache.set(packageName, { time: Date.now(), result: data });
 
       if (data.ok) {
+        checkCache.set(packageName, { time: Date.now(), result: data });
         if (data.hasUpdate) {
           setStatus('has_update');
           setLatestVersion(data.latestVersion || '');
@@ -502,7 +510,7 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
     } finally {
       checkingRef.current = false;
     }
-  }, [packageName, currentVersion, source]);
+  }, [packageName, currentVersion]);
 
   // Trigger check when plugin detail opens
   useEffect(() => {
@@ -523,7 +531,7 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
       const res = await fetch('/api/dsh-plugins-update/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ packageName, targetVersion: latestVersion, source })
+        body: JSON.stringify({ packageName, targetVersion: latestVersion })
       });
 
       const data = (await res.json()) as DoUpdateResult;
@@ -531,7 +539,10 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
         setStatus('success');
         checkCache.delete(packageName); // Clear cache
         const usedMsg = data.registryLabel || data.registryUsed ? `\n（本次更新使用源：${data.registryLabel || data.registryUsed}${data.fellBack ? '，触发故障自动回退' : ''}）` : '';
-        alert(`🎉 插件「${packageName}」更新成功！${usedMsg}\n\n请刷新当前窗口或重启 DSH 以加载新版本。`);
+        const reloadMsg = data.selfUpdate
+          ? '本次更新的是本插件自身，请完全退出并重新启动 DSH 以加载新版本（仅刷新窗口可能不够）。'
+          : '请刷新当前窗口或重启 DSH 以加载新版本。';
+        alert(`🎉 插件「${packageName}」更新成功！${usedMsg}\n\n${reloadMsg}`);
       } else {
         setStatus('error');
         setErrorMsg(data.error || '更新失败');

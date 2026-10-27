@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-10-27
+
+### Fixed
+- Hide the update entry and reject update requests for official DSH plugins (`pkg.official`, `@deepseek-ai/*`); official bundles are upgraded through DSH's own update button.
+- Validate `packageName` and `targetVersion` in the check/update APIs instead of trusting request bodies.
+- Launch the DSH CLI through Electron in Node mode (`cli.js`) without a shell; the pnpm fallback is guarded and only accepts shell-safe characters. Removed the hard-coded `D:\dsh` / `C:\dsh` install paths and the hard-coded desktop profile assumption.
+- Serialize installs per profile: a second update started while one is running now fails fast instead of racing on the same `node_modules`.
+- Self-update responses are sent before the Host refreshes the plugin list; the UI now asks for a full DSH restart instead of a window reload.
+- Failed version checks now report `ok: false` ("检查失败") instead of being shown as "已是最新", and failures are no longer cached.
+- Use the Host plugin dependency spec (`pluginManager.listBundles().source`) for origin detection; the client-side `subject.pkg.source` assumption (never provided to detail slots) is gone.
+
 ## [0.1.2] - 2026-10-26
 
 ### Added

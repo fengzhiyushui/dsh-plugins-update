@@ -62,6 +62,8 @@ export interface DoUpdateResult {
   registryLabel?: string;
   /** Whether the install was retried on the official registry after a failure. */
   fellBack?: boolean;
+  /** The plugin updated itself; DSH must be restarted instead of just reloading the window. */
+  selfUpdate?: boolean;
   output?: string;
   error?: string;
 }
@@ -72,9 +74,13 @@ export interface SlotActionSubject {
     name: string;
     version?: string;
     installed?: boolean;
+    /** `profile` | `installation` | `missing`, as reported by the Host plugin manager. */
+    availability?: string;
     removable?: boolean;
+    /** True for project-maintained optional/on-demand official bundles; DSH owns their update entry. */
     official?: boolean;
     enabled?: boolean;
+    /** @deprecated The Host no longer passes the dependency spec to `plugins.detail.actions`; kept for older versions. */
     source?: string;
     [key: string]: any;
   };

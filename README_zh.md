@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
-  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.1.2-brightgreen.svg" alt="Release" /></a>
+  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.1.3-brightgreen.svg" alt="Release" /></a>
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update"><img src="https://img.shields.io/badge/DeepSeek%20Harness-v0.2+-orange.svg" alt="DeepSeek Harness" /></a>
 </p>
 

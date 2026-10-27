@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import Schema from '@deepseek-ai/schemastery';
 import {
   DOMESTIC_REGISTRY,
@@ -18,6 +18,38 @@ import {
 
 export const name = 'dsh-plugins-update';
 export const inject = ['connection'];
+
+/** This plugin's own package name; updating it from inside its own request needs a restart. */
+const OWN_PACKAGE_NAME = 'dsh-plugins-update';
+/** npm package name rules: lower-case, optional scope, at most 214 characters. */
+const PACKAGE_NAME_PATTERN = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+/** Exact semantic version accepted as an update target (a leading v/^/~ is stripped first). */
+const TARGET_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+/** Characters safe to place on a shell command line for the guarded pnpm fallback path. */
+const SHELL_SAFE_PATTERN = /^[A-Za-z0-9@._~:/\\+=,-]+$/;
+const INSTALL_TIMEOUT_MS = 120_000;
+
+/** Validate an npm package name from an HTTP request; returns undefined when invalid. */
+function readPackageName(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const packageName = value.trim();
+  if (!packageName || packageName.length > 214 || !PACKAGE_NAME_PATTERN.test(packageName)) return undefined;
+  return packageName;
+}
+
+/** Validate the requested update target; `undefined` means "latest", `null` means invalid. */
+function readTargetVersion(value: unknown): string | undefined | null {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string') return null;
+  const version = value.trim().replace(/^[v^~]/, '');
+  if (!version) return undefined;
+  return TARGET_VERSION_PATTERN.test(version) ? version : null;
+}
+
+/** `@deepseek-ai/*` packages are official, even on DSH versions that do not expose `official` to slots. */
+function isOfficialPackageName(packageName: string): boolean {
+  return packageName.startsWith('@deepseek-ai/');
+}
 
 // Mark a schema volatile when the running schemastery supports it, so setting changes apply without a restart
 function live<T>(schema: T): T {
@@ -119,25 +151,76 @@ function parseGithubSource(str?: string): { owner: string; repo: string } | null
   return null;
 }
 
-// Locate the profile directory where plugins are installed
-function resolveProfileDir(): { dir: string; profileName: string } {
+// Profile directories this installation may serve, preferring the active/desktop profile.
+function profileCandidates(): Array<{ dir: string; profileName: string }> {
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh');
-  const desktopDir = join(dshHome, 'profiles', 'desktop');
-
-  if (existsSync(join(desktopDir, 'package.json'))) {
-    return { dir: desktopDir, profileName: 'desktop' };
-  }
-
-  // Fallback to searching profiles
   const profilesDir = join(dshHome, 'profiles');
-  for (const name of ['desktop', 'default', 'web']) {
-    const candidate = join(profilesDir, name);
-    if (existsSync(join(candidate, 'package.json'))) {
-      return { dir: candidate, profileName: name };
-    }
+  const preferred = (process.env.DSH_PROFILE || '').trim();
+  const names = [...new Set([preferred, 'desktop', 'default', 'web'].filter(Boolean))];
+
+  const candidates = names
+    .map(profileName => ({ dir: join(profilesDir, profileName), profileName }))
+    .filter(candidate => existsSync(join(candidate.dir, 'package.json')));
+
+  if (candidates.length === 0) candidates.push({ dir: join(profilesDir, 'desktop'), profileName: 'desktop' });
+  return candidates;
+}
+
+// Locate the profile directory that owns the package, falling back to the desktop profile.
+function resolveProfileDir(packageName?: string): { dir: string; profileName: string } {
+  const candidates = profileCandidates();
+
+  if (packageName) {
+    const owner = candidates.find(candidate => {
+      const dependencies = readProfileDependencies(candidate.dir);
+      return Object.prototype.hasOwnProperty.call(dependencies, packageName);
+    });
+    if (owner) return owner;
   }
 
-  return { dir: desktopDir, profileName: 'desktop' };
+  return candidates.find(candidate => candidate.profileName === 'desktop') ?? candidates[0];
+}
+
+/** The subset of the Host plugin manager's `BundleInfo` this plugin relies on. */
+interface BundleInfo {
+  name?: string;
+  official?: boolean;
+  installed?: boolean;
+  availability?: string;
+  /** The spec `pnpm add` accepts for a profile dependency (GitHub installs appear as `github:owner/repo`). */
+  source?: string;
+  removable?: boolean;
+  installTarget?: { spec?: string; version?: string };
+}
+
+/** Best-effort read of the Host plugin-manager metadata for one bundle; undefined when unavailable. */
+async function readBundleInfo(ctx: any, packageName: string): Promise<BundleInfo | undefined> {
+  for (const service of ['pluginManager', 'plugin-manager']) {
+    try {
+      const manager = ctx?.get?.(service);
+      if (typeof manager?.listBundles !== 'function') continue;
+      const bundles = await manager.listBundles();
+      if (!Array.isArray(bundles)) continue;
+      const bundle = bundles.find((item: any) => item && item.name === packageName);
+      if (bundle) return bundle as BundleInfo;
+    } catch {}
+  }
+  return undefined;
+}
+
+// Reject official plugins (DSH owns their update entry) and bundles the profile does not install.
+function bundleGuardError(packageName: string, bundle: BundleInfo | undefined): string | undefined {
+  if (bundle?.official === true) {
+    return '官方插件由 DSH 自带的更新入口管理，请使用插件页右上角的「更新」按钮';
+  }
+  if (bundle?.installed === false) {
+    return '该插件未安装到当前 profile，无法更新';
+  }
+  // Older DSH versions may not report `official`; official packages all live in this npm scope.
+  if (!bundle && isOfficialPackageName(packageName)) {
+    return '官方插件由 DSH 自带的更新入口管理，请使用插件页右上角的「更新」按钮';
+  }
+  return undefined;
 }
 
 // Read installed version directly from node_modules/<packageName>/package.json on disk
@@ -433,30 +516,60 @@ async function resolveInstallRegistry(
 
 // --- Install execution -----------------------------------------------------------------
 
-function resolveCommand(profileName: string, spec: string, registry: string): { command: string; args: string[]; useShell: boolean } {
-  const registryFlag = `--registry=${registry}`;
-  const useShell = process.platform === 'win32';
+/** Candidate `cli.js` entries of the DSH desktop Host, next to the running executable. */
+function desktopCliCandidates(): string[] {
+  const candidates: string[] = [];
+  const override = process.env.DSH_CLI_JS?.trim();
+  if (override) candidates.push(override);
 
-  // Candidate commands
-  const execDir = process.execPath ? join(process.execPath, '..') : '';
-  const dshCmdPaths = [
-    join(execDir, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd'),
-    'D:\\dsh\\resources\\runtime\\cli\\bin\\dsh.cmd',
-    'C:\\dsh\\resources\\runtime\\cli\\bin\\dsh.cmd',
-    join(process.env.LOCALAPPDATA || '', 'Programs', 'DeepSeek Harness', 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd')
-  ];
+  const cliRel = join('resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js');
+  const execDir = process.execPath ? dirname(process.execPath) : '';
+  if (execDir) {
+    candidates.push(join(execDir, cliRel));
+    candidates.push(join(execDir, '..', 'Resources', cliRel));
+  }
+  const localAppData = process.env.LOCALAPPDATA;
+  if (localAppData) candidates.push(join(localAppData, 'Programs', 'DeepSeek Harness', cliRel));
+  return candidates;
+}
 
-  for (const p of dshCmdPaths) {
-    if (existsSync(p)) {
-      return {
-        command: useShell && p.includes(' ') ? `"${p}"` : p,
-        args: ['plugin', '--profile', profileName, 'add', spec, registryFlag],
-        useShell
-      };
-    }
+/**
+ * Build the install command without letting request data reach a shell.
+ * The DSH CLI is started the same way `dsh.cmd` starts it (Electron in Node mode + `cli.js`);
+ * only the guarded pnpm fallback needs a shell on Windows.
+ */
+function buildInstallCommand(
+  profileName: string,
+  spec: string,
+  registry: string
+): { command: string; args: string[]; env: NodeJS.ProcessEnv } | { error: string } {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    // Keep the env registry identical to the --registry flag
+    npm_config_registry: registry,
+    ELECTRON_RUN_AS_NODE: '1'
+  };
+
+  const cliJs = desktopCliCandidates().find(candidate => existsSync(candidate));
+  if (cliJs) {
+    return {
+      command: process.execPath,
+      args: ['--expose-internals', cliJs, 'plugin', '--profile', profileName, 'add', spec, `--registry=${registry}`],
+      env
+    };
   }
 
-  return { command: 'pnpm', args: ['add', spec, registryFlag], useShell };
+  if ([profileName, spec, registry].some(value => !SHELL_SAFE_PATTERN.test(value))) {
+    return { error: 'Could not locate the DSH CLI and the pnpm fallback would need unsafe characters' };
+  }
+  if (process.platform === 'win32') {
+    return {
+      command: process.env.ComSpec || 'cmd.exe',
+      args: ['/d', '/s', '/c', `pnpm add ${spec} --registry=${registry}`],
+      env
+    };
+  }
+  return { command: 'pnpm', args: ['add', spec, `--registry=${registry}`], env };
 }
 
 function runInstall(
@@ -465,21 +578,21 @@ function runInstall(
   spec: string,
   registry: string
 ): Promise<{ ok: boolean; output: string; error?: string }> {
-  const { command, args, useShell } = resolveCommand(profileName, spec, registry);
+  const plan = buildInstallCommand(profileName, spec, registry);
+  if ('error' in plan) {
+    return Promise.resolve({ ok: false, output: '', error: plan.error });
+  }
 
   return new Promise((resolve) => {
     let output = '';
     let settled = false;
 
     try {
-      const child = spawn(command, args, {
+      const child = spawn(plan.command, plan.args, {
         cwd: profileDir,
-        shell: useShell,
-        env: {
-          ...process.env,
-          // Keep the env registry identical to the --registry flag
-          npm_config_registry: registry
-        }
+        shell: false,
+        windowsHide: true,
+        env: plan.env
       });
 
       child.stdout?.on('data', (data) => {
@@ -497,10 +610,10 @@ function runInstall(
           resolve({
             ok: false,
             output,
-            error: 'Update command timed out after 120 seconds'
+            error: `Update command timed out after ${INSTALL_TIMEOUT_MS / 1000} seconds`
           });
         }
-      }, 120000);
+      }, INSTALL_TIMEOUT_MS);
       timeoutTimer.unref?.();
 
       child.on('error', (err) => {
@@ -550,6 +663,9 @@ async function runUpdateCommand(
   let spec: string;
   const origin = resolvePackageOrigin(profileDir, packageName, source);
   const cleanTarget = targetVersion ? targetVersion.replace(/^[v^~]/, '').trim() : '';
+  if (cleanTarget && !TARGET_VERSION_PATTERN.test(cleanTarget)) {
+    return { ok: false, output: '', error: `无效的目标版本: ${targetVersion}`, registryUsed: '', fellBack: false };
+  }
 
   if (origin.isGithub && origin.github) {
     // If installed via GitHub, re-add using github spec
@@ -602,6 +718,24 @@ export function apply(ctx: any, config: any) {
     return;
   }
 
+  // One install at a time per profile: concurrent `pnpm add` runs would race on the same node_modules.
+  const installing = new Set<string>();
+
+  // Refresh the Host plugin list after an install; delayed for self-updates so the HTTP response can leave first.
+  const refreshAfterInstall = async () => {
+    try {
+      const packages = ctx.get?.('pluginPackages');
+      if (packages?.refresh) await packages.refresh();
+    } catch {}
+    try {
+      const hmr = ctx.get?.('hmr');
+      if (hmr?.reconcileProfile) await hmr.reconcileProfile([]);
+    } catch {}
+    try {
+      ctx.emit?.('plugin-manager/changed', { reason: 'install' });
+    } catch {}
+  };
+
   // 1. API: Check update for a package (Supports npm & GitHub)
   ctx.effect(() => registerFetch({
     path: '/api/dsh-plugins-update/check',
@@ -609,84 +743,112 @@ export function apply(ctx: any, config: any) {
     requestBody: 'buffered',
     fetch: async (req: Request) => {
       try {
-        const body = (await req.json()) as CheckUpdateParams;
-        if (!body.packageName) {
-          return Response.json({ ok: false, error: 'packageName is required' } as CheckUpdateResult, { status: 400 });
+        const body = ((await req.json().catch(() => ({}))) ?? {}) as CheckUpdateParams & { packageName?: unknown };
+        const packageName = readPackageName(body?.packageName);
+        if (!packageName) {
+          return Response.json({ ok: false, packageName: '', hasUpdate: false, error: 'packageName 必须是合法的 npm 包名' } as CheckUpdateResult, { status: 400 });
         }
 
         const settings = readSettings(config);
-        const { dir } = resolveProfileDir();
-        const diskVersion = readInstalledVersion(dir, body.packageName);
-        const clientVersion = body.currentVersion || '0.0.0';
+        const bundle = await readBundleInfo(ctx, packageName);
+        const blocked = bundleGuardError(packageName, bundle);
+        if (blocked) {
+          return Response.json({ ok: false, packageName, hasUpdate: false, error: blocked } as CheckUpdateResult, { status: 200 });
+        }
+
+        const { dir } = resolveProfileDir(packageName);
+        const diskVersion = readInstalledVersion(dir, packageName);
+        const clientVersion = typeof body.currentVersion === 'string' && body.currentVersion ? body.currentVersion : '0.0.0';
         const current =
           diskVersion && compareSemver(diskVersion, clientVersion) > 0
             ? diskVersion
             : clientVersion || diskVersion || '0.0.0';
-        const origin = resolvePackageOrigin(dir, body.packageName, body.source);
+        const origin = resolvePackageOrigin(
+          dir,
+          packageName,
+          typeof body.source === 'string' && body.source ? body.source : bundle?.source
+        );
 
         let latestVersion = current;
         let releaseDate: string | undefined;
         let description: string | undefined;
         let registry: string | undefined;
         let isGithub = false;
+        let fetched = false;
+        let fetchError = '';
 
         if (origin.isGithub && origin.github) {
-          // GitHub package
+          // GitHub-installed package: read the repository first, then fall back to npm.
           isGithub = true;
           try {
             const ghInfo = await fetchGithubPackageInfo(origin.github.owner, origin.github.repo);
             latestVersion = ghInfo.version;
             description = ghInfo.description;
-          } catch (ghErr) {
-            // Fallback: check npm
+            fetched = true;
+          } catch (ghErr: any) {
+            fetchError = ghErr?.message || 'GitHub request failed';
             try {
-              const npmInfo = await fetchNpmPackageInfo(body.packageName, settings);
+              const npmInfo = await fetchNpmPackageInfo(packageName, settings);
               latestVersion = npmInfo.version;
               releaseDate = npmInfo.releaseDate;
               description = npmInfo.description;
               registry = npmInfo.registry;
               isGithub = false;
-            } catch {
-              // If both not reachable, treat current as latest without throwing fatal error
-              latestVersion = current;
+              fetched = true;
+            } catch (npmErr: any) {
+              fetchError += `；${npmErr?.message || 'npm request failed'}`;
             }
           }
         } else {
-          // Normal npm package
+          // Normal npm package.
           try {
-            const npmInfo = await fetchNpmPackageInfo(body.packageName, settings);
+            const npmInfo = await fetchNpmPackageInfo(packageName, settings);
             latestVersion = npmInfo.version;
             releaseDate = npmInfo.releaseDate;
             description = npmInfo.description;
             registry = npmInfo.registry;
-          } catch {
-            // Fallback: check if package has github repository declared in package.json
+            fetched = true;
+          } catch (npmErr: any) {
+            fetchError = npmErr?.message || 'npm request failed';
+            // Fallback: check the GitHub repository declared by the installed package.
             const fallbackGh = origin.repoGithub || origin.github;
             if (fallbackGh) {
               try {
                 const ghInfo = await fetchGithubPackageInfo(fallbackGh.owner, fallbackGh.repo);
                 latestVersion = ghInfo.version;
                 description = ghInfo.description;
-              } catch {
-                latestVersion = current;
+                fetched = true;
+              } catch (ghErr: any) {
+                fetchError += `；${ghErr?.message || 'GitHub request failed'}`;
               }
-            } else {
-              latestVersion = current;
             }
           }
+        }
+
+        if (!fetched) {
+          // A failed lookup must never be reported as "already up to date".
+          return Response.json({
+            ok: false,
+            packageName,
+            currentVersion: current,
+            latestVersion: current,
+            hasUpdate: false,
+            isGithub,
+            error: `无法获取远端版本信息：${fetchError || '网络不可达'}`
+          } as CheckUpdateResult, { status: 200 });
         }
 
         const hasUpdate = compareSemver(latestVersion, current) > 0;
 
         const result: CheckUpdateResult = {
           ok: true,
-          packageName: body.packageName,
+          packageName,
           currentVersion: current,
           latestVersion,
           hasUpdate,
           releaseDate,
           description,
-          source: body.source || origin.declaredSpec,
+          source: origin.declaredSpec,
           isGithub,
           registry
         };
@@ -695,9 +857,8 @@ export function apply(ctx: any, config: any) {
           headers: { 'cache-control': 'no-store' }
         });
       } catch (err: any) {
-        // Return friendly message instead of crash
         return Response.json({
-          ok: true,
+          ok: false,
           packageName: '',
           hasUpdate: false,
           latestVersion: '0.0.0',
@@ -713,49 +874,73 @@ export function apply(ctx: any, config: any) {
     methods: ['POST'],
     requestBody: 'buffered',
     fetch: async (req: Request) => {
+      let packageName = '';
       try {
-        const body = (await req.json()) as DoUpdateParams;
-        if (!body.packageName) {
-          return Response.json({ ok: false, error: 'packageName is required' } as DoUpdateResult, { status: 400 });
+        const body = ((await req.json().catch(() => ({}))) ?? {}) as DoUpdateParams & { packageName?: unknown };
+        packageName = readPackageName(body?.packageName) ?? '';
+        if (!packageName) {
+          return Response.json({ ok: false, packageName: '', error: 'packageName 必须是合法的 npm 包名' } as DoUpdateResult, { status: 400 });
+        }
+        const targetVersion = readTargetVersion(body?.targetVersion);
+        if (targetVersion === null) {
+          return Response.json({ ok: false, packageName, error: 'targetVersion 必须是合法的语义化版本' } as DoUpdateResult, { status: 400 });
         }
 
         const settings = readSettings(config);
-        const { dir, profileName } = resolveProfileDir();
-        const runRes = await runUpdateCommand(settings, dir, profileName, body.packageName, body.targetVersion, body.source);
-
-        if (runRes.ok) {
-          try {
-            const packages = ctx.get?.('pluginPackages');
-            if (packages?.refresh) await packages.refresh();
-          } catch {}
-          try {
-            const hmr = ctx.get?.('hmr');
-            if (hmr?.reconcileProfile) await hmr.reconcileProfile([]);
-          } catch {}
-          try {
-            ctx.emit?.('plugin-manager/changed', { reason: 'install' });
-          } catch {}
+        const bundle = await readBundleInfo(ctx, packageName);
+        const blocked = bundleGuardError(packageName, bundle);
+        if (blocked) {
+          return Response.json({ ok: false, packageName, error: blocked } as DoUpdateResult, { status: 200 });
         }
 
-        const result: DoUpdateResult = {
-          ok: runRes.ok,
-          packageName: body.packageName,
-          targetVersion: body.targetVersion,
-          source: body.source,
-          registryUsed: runRes.registryUsed,
-          registryLabel: registryLabel(runRes.registryUsed, settings.customRegistries),
-          fellBack: runRes.fellBack,
-          output: runRes.output,
-          error: runRes.error
-        };
+        const { dir, profileName } = resolveProfileDir(packageName);
+        if (!existsSync(join(dir, 'package.json'))) {
+          return Response.json({ ok: false, packageName, error: '找不到可用的 DSH profile 目录' } as DoUpdateResult, { status: 200 });
+        }
 
-        return Response.json(result, {
-          headers: { 'cache-control': 'no-store' }
-        });
+        if (installing.has(dir)) {
+          return Response.json({ ok: false, packageName, error: '另一个插件正在更新，请稍后再试' } as DoUpdateResult, { status: 200 });
+        }
+        installing.add(dir);
+
+        try {
+          const source = typeof body.source === 'string' && body.source ? body.source : bundle?.source;
+          const runRes = await runUpdateCommand(settings, dir, profileName, packageName, targetVersion, source);
+          const selfUpdate = packageName === OWN_PACKAGE_NAME;
+
+          if (runRes.ok) {
+            if (selfUpdate) {
+              // Respond before the Host reloads this very plugin, otherwise the client sees a failed request.
+              const timer = setTimeout(() => { void refreshAfterInstall(); }, 1500);
+              timer.unref?.();
+            } else {
+              await refreshAfterInstall();
+            }
+          }
+
+          const result: DoUpdateResult = {
+            ok: runRes.ok,
+            packageName,
+            targetVersion,
+            source,
+            registryUsed: runRes.registryUsed,
+            registryLabel: registryLabel(runRes.registryUsed, settings.customRegistries),
+            fellBack: runRes.fellBack,
+            selfUpdate,
+            output: runRes.output,
+            error: runRes.error
+          };
+
+          return Response.json(result, {
+            headers: { 'cache-control': 'no-store' }
+          });
+        } finally {
+          installing.delete(dir);
+        }
       } catch (err: any) {
         return Response.json({
           ok: false,
-          packageName: '',
+          packageName,
           error: err?.message || 'Update failed'
         } as DoUpdateResult, { status: 200 });
       }
