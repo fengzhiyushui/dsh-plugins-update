@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.4] - 2026-10-28
+## [0.1.4] - 2026-10-29
 
 ### Added
 - GitHub-aware updates: resolve the repository default branch, pin releases to matching `vX.Y.Z` tags, and detect commit-level updates even when `package.json` version did not change.
@@ -15,6 +15,17 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Registry completeness checks now read the resolved dependency set from `pnpm-lock.yaml` instead of only direct dependencies.
 - Semver comparison now implements full prerelease precedence (alpha/beta/rc) and ignores build metadata.
+
+### Fixed
+- Client plugin now declares `locale` in its cordis `inject` list: without it `ctx.locale` was never available, so the UI silently stayed on the bundled Chinese dictionary even when DSH ran in English.
+- Added `locale/en.json` / `locale/zh.json` and exported `./locale/*.json` so DSH's `readPluginMeta` can resolve the plugin page title/description in both languages.
+- Post-install refresh now runs HMR inside `hmr.runExclusive()` (calling `reconcileProfile` bare always threw, making the refresh a silent no-op).
+- GitHub version reads use the head commit SHA when available (immutable) and prefer fresh sources (`raw.githubusercontent`, API) over jsDelivr's 12h branch cache; unpinned installs are verified by commit identity first, so a stale cached version can no longer trigger a rollback of a correct update.
+- A commit change with an older version is no longer offered as an update (prevents GitHub downgrades).
+- pnpm's 24h `minimumReleaseAge` policy: an explicitly selected target version is retried once with `--config.minimum-release-age=0` when pnpm refuses it (policy still applies to everything else).
+- GitHub credentials (token + git `insteadOf` rewrite) are now passed only to GitHub-origin installs; npm install children no longer inherit them. Proxy CONNECT requests send `Proxy-Authorization` for credentials in the proxy URL.
+- Tag lookup falls back to direct git-ref queries (repos with more than 100 tags), rollback verifies the restored disk version, cancel is honoured after verification, and GitHub API reads abort/close cleanly instead of hanging.
+- Cancelled updates keep their rollback result: a failed rollback is shown instead of only "update cancelled". Check requests use a longer timeout with a check-specific localized message; the English UI no longer falls back to the server's Chinese registry label, and blank custom-registry names are no longer persisted in the UI language.
 
 ## [0.1.3] - 2026-10-27
 

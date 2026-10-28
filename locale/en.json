@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Plugin Updater",
+    "description": "One-click updater for third-party DeepSeek Harness plugins, with GitHub tag/commit awareness, verified rollback-safe installs, live progress and a bilingual UI."
+  }
+}

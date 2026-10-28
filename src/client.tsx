@@ -317,6 +317,9 @@ const CACHE_TTL_MS = 60 * 1000; // 1 minute
 const POLL_INTERVAL_MS = 800;
 const POLL_TIMEOUT_MS = 8000;
 const REQUEST_TIMEOUT_MS = 20000;
+// A cold GitHub check can legitimately take multiple paginated/retried metadata calls; the client
+// must not abort a check while the server is still within its own retry budget.
+const CHECK_TIMEOUT_MS = 45000;
 const CANCEL_TIMEOUT_MS = 15000;
 /** This plugin's own package name: updating it needs a full DSH restart. */
 const SELF_PACKAGE_NAME = 'dsh-plugins-update';
@@ -454,7 +457,7 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({
 
   const handleAddCustom = async () => {
     setCustomErrorKey('');
-    const name = newCustomName.trim() || t('settings.customFallbackName');
+    const name = newCustomName.trim();
     const normalized = normalizeRegistryUrl(newCustomUrl);
     if (!normalized) {
       setCustomErrorKey('settings.error.invalidUrl');
@@ -974,7 +977,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({
         } catch {
           // Ignore abort errors.
         }
-      }, REQUEST_TIMEOUT_MS);
+      }, CHECK_TIMEOUT_MS);
       try {
         const res = await fetch(CHECK_PATH, {
           method: 'POST',
@@ -1011,7 +1014,11 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({
         setCheckResult(null);
         setStatus('error');
         setErrorSource('check');
-        setCheckError(describeRequestError(error));
+        setCheckError(
+          error?.name === 'AbortError'
+            ? { notice: { key: 'error.checkTimeout' } }
+            : describeRequestError(error)
+        );
       } finally {
         clearTimeout(timer);
         checkingRef.current = false;
@@ -1071,7 +1078,16 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({
       }
       if (fallback.cancelled) {
         setStatus(updateAvailableRef.current ? 'has_update' : 'idle');
-        finishFailure({ errorCode: fallback.errorCode || ERROR_CODES.cancelled, cancelled: true });
+        finishFailure({
+          errorCode: fallback.errorCode || ERROR_CODES.cancelled,
+          cancelled: true,
+          rollback: result?.rollback,
+          registryUsed: result?.registryUsed,
+          registryLabel: result?.registryLabel,
+          fellBack: result?.fellBack,
+          output: result?.output,
+          installedCommit: result?.installedCommit
+        });
         return;
       }
       setStatus('error');
@@ -1160,7 +1176,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({
               );
               return;
             }
-            finishWithResult(phase === 'cancelled' ? undefined : state.result, {
+            finishWithResult(state.result, {
               errorCode: state.errorCode,
               fallbackText: state.error,
               cancelled: phase === 'cancelled'
@@ -1669,10 +1685,13 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({
 
   if (!renderable) return null;
 
+  // Never fall back to the server's Chinese label in the localized UI; only use it when the URL is known.
   const successRegistry =
-    localizedRegistryLabel(t, successInfo?.registryUsed, customRegistries) ?? successInfo?.registryLabel;
+    localizedRegistryLabel(t, successInfo?.registryUsed, customRegistries) ??
+    (successInfo?.registryUsed ? successInfo?.registryLabel : undefined);
   const failureRegistry =
-    localizedRegistryLabel(t, failureInfo?.registryUsed, customRegistries) ?? failureInfo?.registryLabel;
+    localizedRegistryLabel(t, failureInfo?.registryUsed, customRegistries) ??
+    (failureInfo?.registryUsed ? failureInfo?.registryLabel : undefined);
   const progressPercent = progress?.percent;
   const progressPhaseText = progress
     ? phaseLabel(t, progress.messageKey, progress.phase)
@@ -1865,10 +1884,14 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({
         </div>
       )}
 
-      {/* Cancelled notice: back to the update button, so the user can retry */}
+      {/* Cancelled notice: back to the update button, so the user can retry; a failed rollback must stay visible */}
       {failureInfo?.cancelled && status !== 'error' && (
         <div style={{ ...hintLineStyle, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>
-          {t('update.cancelled')}
+          <div>{t('update.cancelled')}</div>
+          {failureInfo.rollback === 'failed' && (
+            <div style={{ color: '#b91c1c' }}>{t('update.rollbackFailed')}</div>
+          )}
+          {failureInfo.rollback === 'restored' && <div>{t('update.rollbackRestored')}</div>}
         </div>
       )}
     </div>
@@ -1939,4 +1962,6 @@ export function apply(ctx: any) {
 }
 
 export const name = 'dsh-plugins-update';
-export const inject = ['slots', 'configForms'];
+// `locale` is required: without it the DSH client context never exposes `ctx.locale`, so the UI
+// silently stayed on the bundled Chinese dictionary regardless of the DSH language setting.
+export const inject = ['slots', 'configForms', 'locale'];

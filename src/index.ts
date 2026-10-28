@@ -584,6 +584,18 @@ function proxyUrlFor(target: URL): URL | null {
   }
 }
 
+/** Basic proxy credentials from a `user:pass@` proxy URL (URL username/password are percent-encoded). */
+function proxyAuthorizationHeaders(proxy: URL): Record<string, string> {
+  if (!proxy.username && !proxy.password) return {};
+  try {
+    const user = decodeURIComponent(proxy.username);
+    const pass = decodeURIComponent(proxy.password);
+    return { 'proxy-authorization': `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}` };
+  } catch {
+    return {};
+  }
+}
+
 /**
  * HTTPS agent that CONNECTs through an HTTP(S) proxy and wraps the tunnel in TLS.
  * This is the same trick undici's ProxyAgent uses, implemented without adding a dependency.
@@ -616,7 +628,7 @@ class ProxyHttpsAgent extends https.Agent {
         port: proxyPort,
         method: 'CONNECT',
         path: `${targetHost}:${targetPort}`,
-        headers: { host: `${targetHost}:${targetPort}` },
+        headers: { host: `${targetHost}:${targetPort}`, ...proxyAuthorizationHeaders(proxy) },
         timeout: 15000
       });
     } catch (error: any) {
@@ -669,6 +681,7 @@ function rawRequest(target: URL, headers: Record<string, string>, timeoutMs: num
     const onResponse = (response: http.IncomingMessage) => {
       const chunks: Buffer[] = [];
       let size = 0;
+      let ended = false;
       response.on('data', (chunk: Buffer) => {
         size += chunk.length;
         if (size > HTTP_MAX_RESPONSE_BYTES) {
@@ -681,6 +694,7 @@ function rawRequest(target: URL, headers: Record<string, string>, timeoutMs: num
         chunks.push(chunk);
       });
       response.on('end', () => {
+        ended = true;
         finish(() =>
           resolve({
             status: response.statusCode ?? 0,
@@ -691,6 +705,12 @@ function rawRequest(target: URL, headers: Record<string, string>, timeoutMs: num
         );
       });
       response.on('error', error => fail(error));
+      // A peer reset / premature close emits `aborted` and/or `close` without `end` or `error`.
+      // Without these handlers the promise would never settle and the check would hang forever.
+      response.on('aborted', () => fail(new Error('HTTP response aborted by the remote server')));
+      response.on('close', () => {
+        if (!ended) fail(new Error('HTTP response closed before completion'));
+      });
     };
 
     let request: http.ClientRequest;
@@ -707,6 +727,10 @@ function rawRequest(target: URL, headers: Record<string, string>, timeoutMs: num
     watchdog.unref?.();
 
     request.once('error', error => fail(error));
+    request.once('close', () => {
+      // The socket can close before a response without emitting `error` on every Node version.
+      if (!settled) fail(new Error('HTTP request closed before a response'));
+    });
     request.end();
   });
 }
@@ -724,7 +748,7 @@ function createRequest(
 
   if (proxy) {
     const proxyPort = proxy.port ? Number(proxy.port) : proxy.protocol === 'https:' ? 443 : 80;
-    const proxiedHeaders = { ...headers, host: target.host };
+    const proxiedHeaders = { ...headers, host: target.host, ...proxyAuthorizationHeaders(proxy) };
     const requestOptions: https.RequestOptions = {
       host: proxy.hostname,
       port: proxyPort,
@@ -767,7 +791,7 @@ function isRetryableNetworkError(error: any): boolean {
   ) {
     return true;
   }
-  return /socket hang up|timed out|timeout/i.test(message);
+  return /socket hang up|timed out|timeout|aborted|closed before|premature/i.test(message);
 }
 
 function readRetryAfterMs(headers?: http.IncomingHttpHeaders): number | undefined {
@@ -900,7 +924,22 @@ function redactSecrets(input: string): string {
   if (token && token.length >= 6) text = text.split(token).join('***');
   text = text.replace(/x-access-token:[^@\s/]+@/gi, 'x-access-token:***@');
   text = text.replace(/(https?:\/\/)[^@\s/]+@github\.com/gi, '$1***@github.com');
+  // Any other registry URL with embedded credentials (https://user:token@host/...) must not leak.
+  text = text.replace(/(https?:\/\/)[^@\s/]+@/gi, '$1***@');
   return text;
+}
+
+/** Registry URL safe to show in logs/responses: credentials stripped, everything else intact. */
+function safeRegistryUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const parsed = new URL(url);
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.href;
+  } catch {
+    return url;
+  }
 }
 
 /** Map a GitHub API failure to a shared error code with a clear Chinese fallback message. */
@@ -1109,6 +1148,27 @@ async function resolveGithubTagCommit(owner: string, repo: string, tag: string):
   }
 }
 
+/**
+ * Find the tag for a version, falling back to direct git-ref lookups when the repo has more than
+ * the 100 tags fetched for metadata (mature repos regularly exceed the first page).
+ */
+async function findOrResolveGithubTag(
+  owner: string,
+  repo: string,
+  metadata: GithubRepoMetadata | undefined,
+  version: string | undefined
+): Promise<GithubTagInfo | undefined> {
+  const listed = findGithubTag(metadata, version);
+  if (listed) return listed;
+  if (!version) return undefined;
+  const clean = version.trim().replace(/^[vV]/, '');
+  for (const name of [`v${clean}`, clean]) {
+    const commit = await resolveGithubTagCommit(owner, repo, name);
+    if (commit) return { name, commit };
+  }
+  return undefined;
+}
+
 /** Encode a branch/ref for a raw GitHub URL while keeping path separators readable. */
 function encodeGithubRef(ref: string): string {
   return ref
@@ -1170,34 +1230,47 @@ async function readGithubPackageJson(
     }
   };
 
-  const attempts: Array<Promise<GithubPackageJsonInfo>> = [
-    load('jsDelivr', `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${encodedRef}/package.json`, {}, 4000),
-    load('jsDelivr (fastly)', `https://fastly.jsdelivr.net/gh/${owner}/${repo}@${encodedRef}/package.json`, {}, 4000),
-    load(
-      'raw.githubusercontent.com',
-      `https://raw.githubusercontent.com/${owner}/${repo}/${encodedRef}/package.json`,
-      {},
-      5000
-    )
-  ];
+  const looksLikeSha = /^[0-9a-f]{7,40}$/i.test(ref);
+  const jsdelivr = () =>
+    load('jsDelivr', `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${encodedRef}/package.json`, {}, 4000);
+  const fastly = () =>
+    load('jsDelivr (fastly)', `https://fastly.jsdelivr.net/gh/${owner}/${repo}@${encodedRef}/package.json`, {}, 4000);
+  const raw = () =>
+    load('raw.githubusercontent.com', `https://raw.githubusercontent.com/${owner}/${repo}/${encodedRef}/package.json`, {}, 5000);
+  const api = () =>
+    (async () => {
+      try {
+        return await loadGithubApiPackageJson(owner, repo, ref);
+      } catch (error: any) {
+        errors.push(error);
+        throw error;
+      }
+    })();
 
-  // The API endpoint is the only one that works for private repositories (token auth).
-  if (githubToken()) {
-    attempts.push(
-      (async () => {
-        try {
-          return await loadGithubApiPackageJson(owner, repo, ref);
-        } catch (error: any) {
-          errors.push(error);
-          throw error;
-        }
-      })()
-    );
+  const attempts: Array<() => Promise<GithubPackageJsonInfo>> = [];
+  if (looksLikeSha) {
+    // Commit SHAs are immutable in every CDN, so racing is safe and fastest.
+    attempts.push(jsdelivr, fastly, raw);
+    if (githubToken()) attempts.push(api);
+  } else {
+    // Branch reads must not trust jsDelivr first: its branch cache is shared for 12 h, while
+    // raw.githubusercontent (5 min) and the GitHub API are fresh. jsDelivr stays as a fallback.
+    if (githubToken()) attempts.push(api);
+    attempts.push(raw, jsdelivr, fastly);
+    if (!githubToken()) attempts.push(api);
   }
 
   let info: GithubPackageJsonInfo | undefined;
   try {
-    info = await Promise.any(attempts);
+    for (const attempt of attempts) {
+      try {
+        info = await attempt();
+        break;
+      } catch (error: any) {
+        errors.push(error);
+      }
+    }
+    if (!info) throw new Error('All GitHub package.json sources failed');
   } catch {
     const detail = errors.length > 0 ? redactSecrets(errors[errors.length - 1]?.message || '') : '';
     throw new RemoteError(
@@ -1667,7 +1740,8 @@ function withGithubAuthEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 function buildInstallCommand(
   profileName: string,
   spec: string,
-  registry: string
+  registry: string,
+  options: { githubAuth?: boolean; policyBypass?: boolean } = {}
 ): { command: string; args: string[]; env: NodeJS.ProcessEnv } | { error: string } {
   const baseEnv: NodeJS.ProcessEnv = {
     ...process.env,
@@ -1675,13 +1749,34 @@ function buildInstallCommand(
     npm_config_registry: registry,
     ELECTRON_RUN_AS_NODE: '1'
   };
-  const env = withGithubAuthEnv(baseEnv);
+  if (!options.githubAuth) {
+    // The parent environment may carry GitHub credentials for other tools; an npm install must not see them.
+    delete baseEnv.GITHUB_TOKEN;
+    delete baseEnv.GH_TOKEN;
+    delete baseEnv.GIT_CONFIG_COUNT;
+    delete baseEnv.GIT_CONFIG_KEY_0;
+    delete baseEnv.GIT_CONFIG_VALUE_0;
+  }
+  // The GitHub token and the git insteadOf rewrite must only reach installs that clone from GitHub.
+  const env = options.githubAuth ? withGithubAuthEnv(baseEnv) : baseEnv;
+  // pnpm's 24h `minimumReleaseAge` blocks a version the user just explicitly chose; retry flag only.
+  const policyArgs = options.policyBypass ? ['--config.minimum-release-age=0'] : [];
 
   const cliJs = desktopCliCandidates().find(candidate => existsSync(candidate));
   if (cliJs) {
     return {
       command: process.execPath,
-      args: ['--expose-internals', cliJs, 'plugin', '--profile', profileName, 'add', spec, `--registry=${registry}`],
+      args: [
+        '--expose-internals',
+        cliJs,
+        'plugin',
+        '--profile',
+        profileName,
+        'add',
+        spec,
+        `--registry=${registry}`,
+        ...policyArgs
+      ],
       env
     };
   }
@@ -1692,11 +1787,11 @@ function buildInstallCommand(
   if (process.platform === 'win32') {
     return {
       command: process.env.ComSpec || 'cmd.exe',
-      args: ['/d', '/s', '/c', `pnpm add ${spec} --registry=${registry}`],
+      args: ['/d', '/s', '/c', `pnpm add ${spec} --registry=${registry} ${policyArgs.join(' ')}`.trim()],
       env
     };
   }
-  return { command: 'pnpm', args: ['add', spec, `--registry=${registry}`], env };
+  return { command: 'pnpm', args: ['add', spec, `--registry=${registry}`, ...policyArgs], env };
 }
 
 /** Kill an install process and its children (pnpm spawns workers that would survive a plain kill). */
@@ -1724,6 +1819,10 @@ interface SpawnInstallOptions {
   spec: string;
   registry: string;
   timeoutMs: number;
+  /** Only pass the GitHub token / git insteadOf rewrite for GitHub-origin installs. */
+  githubAuth?: boolean;
+  /** Retry path for pnpm's minimumReleaseAge policy on an explicitly chosen version. */
+  policyBypass?: boolean;
   onStart?: (child: ChildProcess) => void;
   onOutput?: (chunk: string) => void;
   isCancelled?: () => boolean;
@@ -1739,7 +1838,10 @@ interface InstallAttemptResult {
 
 /** Spawn the install command, stream its output and enforce a hard timeout. */
 function spawnInstall(options: SpawnInstallOptions): Promise<InstallAttemptResult> {
-  const plan = buildInstallCommand(options.profileName, options.spec, options.registry);
+  const plan = buildInstallCommand(options.profileName, options.spec, options.registry, {
+    githubAuth: options.githubAuth,
+    policyBypass: options.policyBypass
+  });
   if ('error' in plan) {
     return Promise.resolve({ ok: false, output: '', error: plan.error, timedOut: false, cancelled: false });
   }
@@ -1851,12 +1953,12 @@ async function resolveInstallPlan(
   if (origin.isGithub && origin.github) {
     const { owner, repo } = origin.github;
     const metadata = await getGithubRepoMetadata(owner, repo);
-    const remote = await readGithubPackageJson(owner, repo, metadata.defaultBranch);
+    const remote = await readGithubPackageJson(owner, repo, metadata.headCommit || metadata.defaultBranch);
     const remoteVersion = remote.version;
 
     let githubPlan: GithubInstallPlan;
     if (cleanTarget) {
-      const tag = findGithubTag(metadata, cleanTarget);
+      const tag = await findOrResolveGithubTag(owner, repo, metadata, cleanTarget);
       if (tag) {
         githubPlan = { owner, repo, branch: metadata.defaultBranch, tag: tag.name, expectedCommit: tag.commit };
       } else if (compareSemver(remoteVersion, cleanTarget) === 0) {
@@ -1909,66 +2011,84 @@ function shortCommit(value?: string): string {
   return value ? value.slice(0, 7) : '';
 }
 
-/** Post-install verification (P1 item 5): disk version + lockfile commit must match the plan. */
+/**
+ * Post-install verification (P1 item 5).
+ * npm: disk version must reach the target. GitHub: commit identity is authoritative for unpinned
+ * installs (the branch package.json read may come from a stale CDN cache); pinned tag installs
+ * additionally require the tag's version on disk.
+ */
 async function verifyInstall(profileDir: string, packageName: string, plan: InstallPlan): Promise<VerificationResult> {
   const diskVersion = readInstalledVersion(profileDir, packageName);
   if (!diskVersion) {
     return { ok: false, message: `安装完成后未在 node_modules 中找到 ${packageName}，更新可能没有真正写入 profile` };
   }
 
-  if (plan.targetVersion) {
-    if (plan.isGithub) {
-      if (compareSemver(diskVersion, plan.targetVersion) !== 0) {
-        return { ok: false, message: `版本校验失败：期望 ${plan.targetVersion}，实际 ${diskVersion}` };
-      }
-    } else if (compareSemver(diskVersion, plan.targetVersion) < 0) {
+  if (!plan.isGithub || !plan.github) {
+    if (plan.targetVersion && compareSemver(diskVersion, plan.targetVersion) < 0) {
       return { ok: false, message: `版本校验失败：期望至少 ${plan.targetVersion}，实际 ${diskVersion}` };
     }
+    return { ok: true };
   }
 
-  if (!plan.isGithub || !plan.github) return { ok: true };
+  const pinnedVersionCheck = (): VerificationResult => {
+    if (plan.github?.tag && plan.targetVersion && compareSemver(diskVersion, plan.targetVersion) !== 0) {
+      return { ok: false, message: `版本校验失败：期望 ${plan.targetVersion}，实际 ${diskVersion}` };
+    }
+    return { ok: true, installedCommit: undefined };
+  };
 
   const lockText = readLockfileText(profileDir);
   const installedCommit = extractGithubCommit(lockText, plan.github.owner, plan.github.repo);
   const expectedCommit = plan.github.expectedCommit;
 
   if (!expectedCommit) {
-    // The remote head could not be resolved before installing; the version check above is all we have.
+    // No remote identity could be resolved before installing; only the version can be compared.
+    if (plan.targetVersion && compareSemver(diskVersion, plan.targetVersion) !== 0) {
+      return { ok: false, message: `版本校验失败：期望 ${plan.targetVersion}，实际 ${diskVersion}` };
+    }
     return { ok: true, installedCommit };
   }
+
   if (!installedCommit) {
     return {
       ok: false,
       message: `无法从 pnpm-lock.yaml 读取 ${plan.github.owner}/${plan.github.repo} 的已安装提交，无法确认 GitHub 安装结果`
     };
   }
-  if (installedCommit.toLowerCase() === expectedCommit.toLowerCase()) {
-    return { ok: true, installedCommit };
+
+  if (installedCommit === expectedCommit.toLowerCase()) {
+    const versionCheck = pinnedVersionCheck();
+    return versionCheck.ok ? { ok: true, installedCommit } : versionCheck;
   }
+
   if (plan.github.tag) {
     // Annotated tags: the tags list can expose the tag object instead of the commit it points to.
     const tagCommit = await resolveGithubTagCommit(plan.github.owner, plan.github.repo, plan.github.tag);
-    if (tagCommit && tagCommit === installedCommit.toLowerCase()) {
+    if (tagCommit && tagCommit === installedCommit) {
       plan.github.expectedCommit = tagCommit;
+      const versionCheck = pinnedVersionCheck();
+      return versionCheck.ok ? { ok: true, installedCommit } : versionCheck;
+    }
+    return {
+      ok: false,
+      message: `提交校验失败：期望 ${shortCommit(expectedCommit)}（标签 ${plan.github.tag}），实际 ${shortCommit(installedCommit)}`
+    };
+  }
+
+  // Unpinned install: a newer commit may have landed between planning and installing. If the disk
+  // matches the fresh branch head, the install is correct even when the cached package.json version
+  // (and therefore plan.targetVersion) was stale.
+  try {
+    const fresh = await getGithubRepoMetadata(plan.github.owner, plan.github.repo, { noCache: true });
+    if (fresh.headCommit && installedCommit === fresh.headCommit.toLowerCase()) {
+      plan.github.expectedCommit = fresh.headCommit;
       return { ok: true, installedCommit };
     }
-  }
-  if (!plan.github.tag) {
-    // Unpinned install: a newer commit may have landed between planning and installing.
-    try {
-      const fresh = await getGithubRepoMetadata(plan.github.owner, plan.github.repo, { noCache: true });
-      if (fresh.headCommit && installedCommit.toLowerCase() === fresh.headCommit.toLowerCase()) {
-        plan.github.expectedCommit = fresh.headCommit;
-        return { ok: true, installedCommit };
-      }
-    } catch {}
-  }
+  } catch {}
 
   return {
     ok: false,
-    message: `提交校验失败：期望 ${shortCommit(expectedCommit)}（${
-      plan.github.tag ? `标签 ${plan.github.tag}` : `分支 ${plan.github.branch}`
-    }），实际 ${shortCommit(installedCommit)}`
+    message: `提交校验失败：期望 ${shortCommit(expectedCommit)}（分支 ${plan.github.branch}），实际 ${shortCommit(installedCommit)}`
   };
 }
 
@@ -2020,17 +2140,45 @@ async function rollbackProfile(
 
   if (previousSpec) {
     output += `\n[dsh-plugins-update] 回滚：重新安装更新前的版本（${previousSpec}）…\n`;
-    let attempt = await spawnInstall({ profileDir, profileName, spec: previousSpec, registry: registryUsed, timeoutMs });
+    let attempt = await spawnInstall({ profileDir, profileName, spec: previousSpec, registry: registryUsed, timeoutMs, githubAuth: origin.isGithub });
     output += attempt.output;
+    if (!attempt.ok && isSupplyChainPolicyFailure(attempt.output)) {
+      attempt = await spawnInstall({
+        profileDir,
+        profileName,
+        spec: previousSpec,
+        registry: registryUsed,
+        timeoutMs,
+        githubAuth: origin.isGithub,
+        policyBypass: true
+      });
+      output += attempt.output;
+    }
     if (!attempt.ok) {
       if (settings.fallbackToOfficial && registryUsed !== OFFICIAL_REGISTRY && !origin.isGithub) {
         output += `\n[dsh-plugins-update] 回滚重试 npm 官方源…\n`;
-        attempt = await spawnInstall({ profileDir, profileName, spec: previousSpec, registry: OFFICIAL_REGISTRY, timeoutMs });
+        attempt = await spawnInstall({
+          profileDir,
+          profileName,
+          spec: previousSpec,
+          registry: OFFICIAL_REGISTRY,
+          timeoutMs,
+          githubAuth: origin.isGithub
+        });
         output += attempt.output;
         reinstallOk = attempt.ok;
       } else {
         reinstallOk = false;
       }
+    }
+  }
+
+  // A reinstall that exits 0 may still leave the wrong revision on disk; verify before claiming "restored".
+  if (reinstallOk && snapshot.previousVersion) {
+    const restoredVersion = readInstalledVersion(profileDir, packageName);
+    if (restoredVersion !== snapshot.previousVersion) {
+      reinstallOk = false;
+      output += `\n[dsh-plugins-update] 回滚后磁盘版本为 ${restoredVersion ?? '未知'}（期望 ${snapshot.previousVersion}），回滚未完全成功\n`;
     }
   }
 
@@ -2220,6 +2368,12 @@ function missingJobState(jobId: string): UpdateJobState {
   };
 }
 
+/** pnpm refused a version because of its 24h minimumReleaseAge supply-chain policy. */
+function isSupplyChainPolicyFailure(output: string): boolean {
+  const text = typeof output === 'string' ? output : '';
+  return /ERR_PNPM_NO_MATURE_MATCHING_VERSION|ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION|minimumReleaseAge/i.test(text);
+}
+
 function jobFailureFromError(error: any): { errorCode: ErrorCode; message: string } {
   if (error instanceof RemoteError) return { errorCode: error.errorCode, message: redactSecrets(error.message) };
   if (error instanceof HttpError) return { errorCode: classifyAggregateError([error]), message: redactSecrets(error.message) };
@@ -2246,12 +2400,14 @@ async function runJob(job: InternalJob, refreshAfterInstall: () => Promise<void>
   const checkCancelled = () => {
     if (job.cancelRequested) throw new RemoteError(ERROR_CODES.cancelled, '更新已取消');
   };
-  const spawnOptions = (spec: string, registry: string) => ({
+  const spawnOptions = (spec: string, registry: string, extra: { policyBypass?: boolean } = {}) => ({
     profileDir,
     profileName,
     spec,
     registry,
     timeoutMs: installTimeoutMs,
+    githubAuth: plan?.isGithub ?? origin.isGithub,
+    policyBypass: extra.policyBypass,
     onStart: (child: ChildProcess) => {
       job.child = child;
       job.startedInstall = true;
@@ -2289,6 +2445,13 @@ async function runJob(job: InternalJob, refreshAfterInstall: () => Promise<void>
       attempt = await spawnInstall(spawnOptions(plan.spec, OFFICIAL_REGISTRY));
     }
 
+    // pnpm's 24h minimumReleaseAge refuses a release the user just chose; retry that exact version
+    // once with the policy disabled for this install only (mirrors DSH's documented explicit-install path).
+    if (!attempt.ok && !attempt.timedOut && !attempt.cancelled && isSupplyChainPolicyFailure(attempt.output)) {
+      append('\n[dsh-plugins-update] pnpm 供应链策略（minimumReleaseAge）拒绝了该版本；目标版本由用户明确指定，禁用该策略重试一次…\n');
+      attempt = await spawnInstall(spawnOptions(plan.spec, registryUsed, { policyBypass: true }));
+    }
+
     if (attempt.timedOut) {
       throw new RemoteError(ERROR_CODES.timeout, `安装超时（${settings.installTimeoutSeconds} 秒）`);
     }
@@ -2305,6 +2468,8 @@ async function runJob(job: InternalJob, refreshAfterInstall: () => Promise<void>
     if (!verification.ok) {
       throw new RemoteError(ERROR_CODES.verificationFailed, verification.message || '安装后校验失败');
     }
+    // Verification can take a while (fresh metadata); honour a cancel that arrived in the meantime.
+    checkCancelled();
 
     const selfUpdate = packageName === OWN_PACKAGE_NAME;
     setJobPhase(job, 'done', 100);
@@ -2313,7 +2478,7 @@ async function runJob(job: InternalJob, refreshAfterInstall: () => Promise<void>
       packageName,
       targetVersion: plan.targetVersion,
       source: job.source,
-      registryUsed,
+      registryUsed: safeRegistryUrl(registryUsed),
       registryLabel: registryLabel(registryUsed, settings.customRegistries),
       fellBack: job.fellBack,
       selfUpdate,
@@ -2367,7 +2532,7 @@ async function runJob(job: InternalJob, refreshAfterInstall: () => Promise<void>
       packageName,
       targetVersion: plan?.targetVersion ?? job.targetVersion,
       source: job.source,
-      registryUsed: registryUsed || undefined,
+      registryUsed: safeRegistryUrl(registryUsed) || undefined,
       registryLabel: registryLabel(registryUsed || plan?.registry || OFFICIAL_REGISTRY, settings.customRegistries),
       fellBack: job.fellBack,
       selfUpdate: packageName === OWN_PACKAGE_NAME,
@@ -2438,7 +2603,13 @@ export function apply(ctx: any, config: any) {
     } catch {}
     try {
       const hmr = ctx.get?.('hmr');
-      if (hmr?.reconcileProfile) await hmr.reconcileProfile([]);
+      if (hmr?.runExclusive && typeof hmr.reconcileProfile === 'function') {
+        // Host contract: reconcileProfile may only run inside runExclusive (same as DSH's own
+        // plugin manager); calling it bare throws and used to make this refresh a silent no-op.
+        await hmr.runExclusive(() => hmr.reconcileProfile([]));
+      } else if (typeof hmr?.reconcileProfile === 'function') {
+        await hmr.reconcileProfile([]);
+      }
     } catch {}
     try {
       ctx.emit?.('plugin-manager/changed', { reason: 'install' });
@@ -2506,10 +2677,14 @@ export function apply(ctx: any, config: any) {
                 const metadata = await getGithubRepoMetadata(origin.github.owner, origin.github.repo);
                 branch = metadata.defaultBranch;
                 latestCommit = metadata.headCommit;
-                const remote = await readGithubPackageJson(origin.github.owner, origin.github.repo, metadata.defaultBranch);
+                const remote = await readGithubPackageJson(
+                  origin.github.owner,
+                  origin.github.repo,
+                  metadata.headCommit || metadata.defaultBranch
+                );
                 latestVersion = remote.version;
                 description = remote.description;
-                tag = findGithubTag(metadata, latestVersion);
+                tag = await findOrResolveGithubTag(origin.github.owner, origin.github.repo, metadata, latestVersion);
                 fetched = true;
               } catch (githubError: any) {
                 const remote =
@@ -2619,8 +2794,10 @@ export function apply(ctx: any, config: any) {
             }
 
             const commitAhead = !!(installedCommit && latestCommit && installedCommit !== latestCommit);
+            // A different commit with an OLDER version must not be offered as an update: only a newer
+            // version, or a same-version commit advance, is an update.
             const hasUpdate =
-              compareSemver(latestVersion, current) > 0 || (commitAhead && compareSemver(latestVersion, current) <= 0);
+              compareSemver(latestVersion, current) > 0 || (commitAhead && compareSemver(latestVersion, current) === 0);
 
             const result: CheckUpdateResult = {
               ok: true,
@@ -2632,7 +2809,7 @@ export function apply(ctx: any, config: any) {
               description,
               source: origin.declaredSpec,
               isGithub,
-              registry,
+              registry: safeRegistryUrl(registry),
               branch,
               latestCommit,
               installedCommit,

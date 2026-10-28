@@ -79,6 +79,7 @@ declare const zh: {
     'error.githubAuth': string;
     'error.installFailed': string;
     'error.timeout': string;
+    'error.checkTimeout': string;
     'error.cancelled': string;
     'error.verificationFailed': string;
     'error.rollbackFailed': string;

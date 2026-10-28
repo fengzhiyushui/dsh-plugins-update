@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "插件一键更新",
+    "description": "DeepSeek Harness 第三方插件一键更新器，支持 GitHub 标签/提交检测、安装后校验与自动回滚、实时进度与中英双语界面。"
+  }
+}
