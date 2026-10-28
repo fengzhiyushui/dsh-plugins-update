@@ -1,21 +1,328 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  CANCEL_PATH,
+  CHECK_PATH,
   DOMESTIC_REGISTRY,
+  ERROR_CODES,
+  LOCALE_NAMESPACE,
   OFFICIAL_REGISTRY,
+  PROGRESS_PATH,
+  UPDATE_PATH,
   normalizeRegistryUrl,
   type CheckUpdateResult,
   type CustomRegistry,
   type DoUpdateResult,
+  type ErrorCode,
   type PluginSettings,
-  type SlotActionProps
+  type SlotActionProps,
+  type UpdateJobState,
+  type UpdatePhase
 } from './types.js';
+import { en, zh } from './locales.js';
 
-// Cache for check results to avoid repeating requests in short intervals
+// =====================================================================================
+// Shared helpers: translators, DSH locale service access, error and registry text
+// =====================================================================================
+
+/** Copy of a user-facing sentence, resolved at render time so it follows locale switches. */
+type TranslateParams = Record<string, string | number>;
+type Translator = (key: string, params?: TranslateParams) => string;
+
+/** The subset of the DSH client `locale` service this plugin relies on (all optional). */
+interface LocaleSnapshotLike {
+  active?: string;
+  revision?: number;
+  [key: string]: unknown;
+}
+
+interface LocaleServiceLike {
+  register?: (namespace: string, dictionaries: Record<string, Record<string, string>>) => (() => void) | void;
+  bind?: (namespace: string) => Translator;
+  getSnapshot?: () => LocaleSnapshotLike;
+  subscribe?: (listener: () => void) => (() => void) | void;
+  resolveText?: (text: unknown) => string;
+}
+
+/** Interpolate `{name}` placeholders the same way the DSH locale runtime does. */
+function interpolate(template: string, params?: TranslateParams): string {
+  if (!params) return template;
+  return template.replace(/\{(\w+)\}/g, (match, name: string) =>
+    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : match
+  );
+}
+
+/** Look a key up in the bundled Chinese dictionary (older DSH without a locale service). */
+function translateFromZh(key: string, params?: TranslateParams): string {
+  const dictionary = zh as unknown as Record<string, string>;
+  const template = Object.prototype.hasOwnProperty.call(dictionary, key) ? dictionary[key] : key;
+  return interpolate(template, params);
+}
+
+/** Fallback translator used when the DSH locale service is unavailable and by direct component use. */
+const FALLBACK_TRANSLATOR: Translator = (key, params) => translateFromZh(key, params);
+
+/**
+ * Wrap a locale-service translator: when the bound namespace has no entry for a key
+ * (e.g. dictionaries are not registered yet, or an older DSH ignores late namespaces),
+ * show the bundled Chinese text instead of the raw key.
+ */
+function wrapTranslator(bound: Translator): Translator {
+  return (key, params) => {
+    let resolved: unknown;
+    try {
+      resolved = bound(key, params);
+    } catch {
+      resolved = key;
+    }
+    if (typeof resolved !== 'string' || resolved === key) return translateFromZh(key, params);
+    return resolved;
+  };
+}
+
+/** Read the locale service defensively: older DSH versions do not provide it at all. */
+function getLocaleService(ctx: any): LocaleServiceLike | undefined {
+  try {
+    const direct = ctx?.locale;
+    if (direct && typeof direct === 'object') return direct as LocaleServiceLike;
+  } catch {
+    // Accessing an unprovided service may throw on some cordis versions; ignore.
+  }
+  try {
+    const viaGet = typeof ctx?.get === 'function' ? ctx.get('locale') : undefined;
+    if (viaGet && typeof viaGet === 'object') return viaGet as LocaleServiceLike;
+  } catch {
+    // Ignore and report "no locale service".
+  }
+  return undefined;
+}
+
+/** Build the plugin translator: live locale-service binding when available, Chinese fallback otherwise. */
+function createTranslator(locale: LocaleServiceLike | undefined): Translator {
+  if (locale && typeof locale.bind === 'function') {
+    try {
+      const bound = locale.bind(LOCALE_NAMESPACE);
+      if (typeof bound === 'function') return wrapTranslator(bound);
+    } catch (error) {
+      console.error('dsh-plugins-update: failed to bind the locale namespace, using the bundled fallback', error);
+    }
+  }
+  return FALLBACK_TRANSLATOR;
+}
+
+/** Register zh/en dictionaries under the plugin namespace inside a cordis effect (disposed with the plugin). */
+function registerLocaleDictionaries(ctx: any, locale: LocaleServiceLike | undefined): void {
+  if (!locale || typeof locale.register !== 'function') return;
+  const register = () => {
+    try {
+      const disposer = locale.register?.(LOCALE_NAMESPACE, { zh, en });
+      return typeof disposer === 'function' ? disposer : undefined;
+    } catch (error) {
+      console.error('dsh-plugins-update: failed to register locale dictionaries', error);
+      return undefined;
+    }
+  };
+  if (typeof ctx?.effect === 'function') {
+    try {
+      ctx.effect(register, 'dsh-plugins-update: locale dictionaries');
+      return;
+    } catch (error) {
+      console.error('dsh-plugins-update: failed to install the locale registration effect', error);
+    }
+  }
+  register();
+}
+
+/** Re-render a component whenever the DSH locale snapshot changes (language switch or late registration). */
+function useLocaleRevision(locale: LocaleServiceLike | undefined): number {
+  const readRevision = (): number => {
+    try {
+      const snapshot = locale?.getSnapshot?.();
+      return typeof snapshot?.revision === 'number' ? snapshot.revision : 0;
+    } catch {
+      return 0;
+    }
+  };
+  const [revision, setRevision] = useState<number>(readRevision);
+
+  useEffect(() => {
+    if (!locale || typeof locale.subscribe !== 'function') return undefined;
+    const sync = () => setRevision(readRevision());
+    let unsubscribe: (() => void) | void;
+    try {
+      unsubscribe = locale.subscribe(sync);
+    } catch {
+      return undefined;
+    }
+    sync();
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        try {
+          unsubscribe();
+        } catch {
+          // Ignore unsubscribe failures during teardown.
+        }
+      }
+    };
+  }, [locale]);
+
+  return revision;
+}
+
+/** One localized error message key per machine-readable error code (compile-time complete). */
+const ERROR_KEY_BY_CODE = {
+  [ERROR_CODES.invalidPackageName]: 'error.invalidPackageName',
+  [ERROR_CODES.invalidTargetVersion]: 'error.invalidTargetVersion',
+  [ERROR_CODES.officialPlugin]: 'error.officialPlugin',
+  [ERROR_CODES.notInstalled]: 'error.notInstalled',
+  [ERROR_CODES.profileNotFound]: 'error.profileNotFound',
+  [ERROR_CODES.installInProgress]: 'error.installInProgress',
+  [ERROR_CODES.jobNotFound]: 'error.jobNotFound',
+  [ERROR_CODES.offline]: 'error.offline',
+  [ERROR_CODES.rateLimited]: 'error.rateLimited',
+  [ERROR_CODES.githubAuth]: 'error.githubAuth',
+  [ERROR_CODES.installFailed]: 'error.installFailed',
+  [ERROR_CODES.timeout]: 'error.timeout',
+  [ERROR_CODES.cancelled]: 'error.cancelled',
+  [ERROR_CODES.verificationFailed]: 'error.verificationFailed',
+  [ERROR_CODES.rollbackFailed]: 'error.rollbackFailed',
+  [ERROR_CODES.unknown]: 'error.unknown'
+} satisfies Record<ErrorCode, string>;
+
+function errorMessageKey(errorCode: string | undefined): string | undefined {
+  if (!errorCode) return undefined;
+  return (ERROR_KEY_BY_CODE as Record<string, string | undefined>)[errorCode];
+}
+
+/** Text to show for a failed check/update, preferring the localized error code over the server fallback. */
+interface ErrorTextInfo {
+  errorCode?: string;
+  fallbackText?: string;
+  notice?: { key: string; params?: TranslateParams };
+}
+
+function localizeErrorInfo(t: Translator, info: ErrorTextInfo | null | undefined): string {
+  if (!info) return t('error.unknown');
+  const key = errorMessageKey(info.errorCode);
+  if (key) return t(key);
+  if (info.notice) return t(info.notice.key, info.notice.params);
+  if (typeof info.fallbackText === 'string' && info.fallbackText.trim()) return info.fallbackText;
+  return t('error.unknown');
+}
+
+/** Translate a thrown fetch error into localized text. */
+function describeRequestError(error: any): ErrorTextInfo {
+  const name = typeof error?.name === 'string' ? error.name : '';
+  const message = typeof error?.message === 'string' ? error.message : '';
+  if (name === 'AbortError') return { errorCode: ERROR_CODES.timeout };
+  const httpMatch = /^HTTP (\d{3})$/.exec(message);
+  if (httpMatch) return { notice: { key: 'error.httpStatus', params: { status: httpMatch[1] } } };
+  if (message) return { notice: { key: 'error.requestFailedDetail', params: { error: message } } };
+  return { errorCode: ERROR_CODES.offline };
+}
+
+/** Localize a registry URL using the same labels the backend uses (custom registries included). */
+function localizedRegistryLabel(
+  t: Translator,
+  url: string | undefined,
+  customs: CustomRegistry[]
+): string | undefined {
+  if (typeof url !== 'string' || !url.trim()) return undefined;
+  const normalized = normalizeRegistryUrl(url) ?? url;
+  if (normalized === OFFICIAL_REGISTRY) return t('registry.official');
+  if (normalized === DOMESTIC_REGISTRY) return t('registry.domestic');
+  const custom = customs.find(item => normalizeRegistryUrl(item.url) === normalized);
+  if (custom && custom.name) return t('registry.customNamed', { name: custom.name });
+  try {
+    return t('registry.customHost', { host: new URL(normalized).host });
+  } catch {
+    return normalized;
+  }
+}
+
+function shortCommit(commit: string | undefined): string {
+  if (typeof commit !== 'string') return '';
+  return commit.slice(0, 7);
+}
+
+/** Localization keys for the job phases emitted by the progress endpoint. */
+const PHASE_TEXT_KEY: Record<UpdatePhase, string> = {
+  queued: 'phaseQueued',
+  resolving: 'phaseResolving',
+  downloading: 'phaseDownloading',
+  installing: 'phaseInstalling',
+  verifying: 'phaseVerifying',
+  'rolling-back': 'phaseRollingBack',
+  done: 'phaseDone',
+  failed: 'phaseFailed',
+  cancelled: 'phaseCancelled'
+};
+
+/** Accept the agreed `phaseXxx` message keys plus dotted/snake/lower-case spellings from older builds. */
+function normalizePhaseAlias(messageKey: string): UpdatePhase | undefined {
+  const compact = messageKey
+    .trim()
+    .toLowerCase()
+    .replace(/^progress[._-]/, '')
+    .replace(/^phase[._-]/, '')
+    .replace(/[^a-z]/g, '');
+  switch (compact) {
+    case 'queued':
+      return 'queued';
+    case 'resolving':
+      return 'resolving';
+    case 'downloading':
+      return 'downloading';
+    case 'installing':
+      return 'installing';
+    case 'verifying':
+      return 'verifying';
+    case 'rollingback':
+      return 'rolling-back';
+    case 'done':
+      return 'done';
+    case 'failed':
+      return 'failed';
+    case 'cancelled':
+    case 'canceled':
+      return 'cancelled';
+    default:
+      return undefined;
+  }
+}
+
+/** Resolve the dictionary key for a phase label, honoring the job's own messageKey when known. */
+function resolvePhaseTextKey(messageKey: string | undefined, phase: UpdatePhase | undefined): string {
+  if (typeof messageKey === 'string' && messageKey.trim()) {
+    const trimmed = messageKey.trim();
+    if (Object.prototype.hasOwnProperty.call(zh, trimmed)) return trimmed;
+    const aliased = normalizePhaseAlias(trimmed);
+    if (aliased) return PHASE_TEXT_KEY[aliased];
+  }
+  if (phase && Object.prototype.hasOwnProperty.call(PHASE_TEXT_KEY, phase)) return PHASE_TEXT_KEY[phase];
+  return 'progress.phaseUnknown';
+}
+
+function phaseLabel(t: Translator, messageKey: string | undefined, phase: UpdatePhase | undefined): string {
+  const key = resolvePhaseTextKey(messageKey, phase);
+  if (key === 'progress.phaseUnknown') return t(key, { phase: phase || messageKey || '' });
+  return t(key);
+}
+
+// =====================================================================================
+// Module-level state: check cache (successful checks only, 60s TTL)
+// =====================================================================================
+
 const checkCache = new Map<string, { time: number; result: CheckUpdateResult }>();
 const CACHE_TTL_MS = 60 * 1000; // 1 minute
+const POLL_INTERVAL_MS = 800;
+const POLL_TIMEOUT_MS = 8000;
+const REQUEST_TIMEOUT_MS = 20000;
+const CANCEL_TIMEOUT_MS = 15000;
+/** This plugin's own package name: updating it needs a full DSH restart. */
+const SELF_PACKAGE_NAME = 'dsh-plugins-update';
 
-// Official plugins are updated through DSH's own Update button. Older DSH versions do not pass `official`
-// to detail slots, so fall back to the official npm scope.
+/** Official plugins are updated through DSH's own Update button. Older DSH versions do not pass
+ *  `official` to detail slots, so fall back to the official npm scope. */
 function isOfficialPackage(pkg: SlotActionProps['subject']['pkg']): boolean {
   if (!pkg) return false;
   if (typeof pkg.official === 'boolean') return pkg.official;
@@ -26,10 +333,14 @@ function isOfficialPackage(pkg: SlotActionProps['subject']['pkg']): boolean {
 const DEFAULT_SETTINGS: PluginSettings = {
   registry: 'auto',
   customRegistries: [],
-  fallbackToOfficial: true
+  fallbackToOfficial: true,
+  installTimeoutSeconds: 120
 };
 
-// Hook to subscribe to a DSH configForms form controller
+// =====================================================================================
+// Config form state hook
+// =====================================================================================
+
 function useConfigFormState(form: any): {
   settings: PluginSettings;
   writable: boolean;
@@ -39,12 +350,14 @@ function useConfigFormState(form: any): {
   const [snapshot, setSnapshot] = useState<any>(() => (form?.getSnapshot ? form.getSnapshot() : { status: 'idle' }));
 
   useEffect(() => {
-    if (!form?.subscribe) return;
+    if (!form?.subscribe) return undefined;
     const unsub = form.subscribe(() => {
       setSnapshot(form.getSnapshot?.() ?? {});
     });
     setSnapshot(form.getSnapshot?.() ?? {});
-    return unsub;
+    return () => {
+      if (typeof unsub === 'function') unsub();
+    };
   }, [form]);
 
   const rawValue = snapshot?.value;
@@ -53,9 +366,14 @@ function useConfigFormState(form: any): {
     customRegistries: Array.isArray(rawValue?.customRegistries)
       ? rawValue.customRegistries.filter((c: any) => c && typeof c.url === 'string')
       : DEFAULT_SETTINGS.customRegistries,
-    fallbackToOfficial: typeof rawValue?.fallbackToOfficial === 'boolean'
-      ? rawValue.fallbackToOfficial
-      : DEFAULT_SETTINGS.fallbackToOfficial
+    fallbackToOfficial:
+      typeof rawValue?.fallbackToOfficial === 'boolean'
+        ? rawValue.fallbackToOfficial
+        : DEFAULT_SETTINGS.fallbackToOfficial,
+    installTimeoutSeconds:
+      typeof rawValue?.installTimeoutSeconds === 'number'
+        ? rawValue.installTimeoutSeconds
+        : DEFAULT_SETTINGS.installTimeoutSeconds
   };
 
   const updateField = useCallback(
@@ -84,38 +402,62 @@ function useConfigFormState(form: any): {
 // Settings Card Component (Rendered in bundle config slot and available in modal)
 // =====================================================================================
 
-export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }> = ({ form, onClose }) => {
+interface RegistrySettingsCardProps {
+  form?: any;
+  onClose?: () => void;
+  /** Translator injected by apply(); falls back to the bundled Chinese dictionary. */
+  t?: Translator;
+  /** DSH locale service, used only to re-render on language switches. */
+  locale?: LocaleServiceLike;
+}
+
+export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({
+  form,
+  onClose,
+  t: providedT,
+  locale
+}) => {
+  useLocaleRevision(locale);
+  const t = providedT ?? FALLBACK_TRANSLATOR;
   const { settings, writable, updateField } = useConfigFormState(form);
 
   // Local state for adding a new custom registry
   const [isAddingCustom, setIsAddingCustom] = useState(false);
   const [newCustomName, setNewCustomName] = useState('');
   const [newCustomUrl, setNewCustomUrl] = useState('');
-  const [customError, setCustomError] = useState('');
-  const [savingNotice, setSavingNotice] = useState('');
+  const [customErrorKey, setCustomErrorKey] = useState('');
+  const [notice, setNotice] = useState<{ key: string; params?: TranslateParams } | null>(null);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  const showNotice = (msg: string) => {
-    setSavingNotice(msg);
-    setTimeout(() => setSavingNotice(''), 2500);
+  useEffect(() => {
+    return () => {
+      if (noticeTimerRef.current !== undefined) clearTimeout(noticeTimerRef.current);
+    };
+  }, []);
+
+  const showNotice = (key: string, params?: TranslateParams) => {
+    setNotice({ key, params });
+    if (noticeTimerRef.current !== undefined) clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = setTimeout(() => setNotice(null), 2500);
   };
 
   const handleSelectRegistry = async (val: string) => {
     const ok = await updateField('registry', val);
-    if (ok) showNotice('已更新默认更新源');
+    if (ok) showNotice('settings.notice.registryUpdated');
   };
 
   const handleToggleFallback = async () => {
     const next = !settings.fallbackToOfficial;
     const ok = await updateField('fallbackToOfficial', next);
-    if (ok) showNotice(next ? '已开启自动回退' : '已关闭自动回退');
+    if (ok) showNotice(next ? 'settings.notice.fallbackOn' : 'settings.notice.fallbackOff');
   };
 
   const handleAddCustom = async () => {
-    setCustomError('');
-    const name = newCustomName.trim() || '自定义源';
+    setCustomErrorKey('');
+    const name = newCustomName.trim() || t('settings.customFallbackName');
     const normalized = normalizeRegistryUrl(newCustomUrl);
     if (!normalized) {
-      setCustomError('请输入合法的 HTTP/HTTPS 源地址 (例如 https://mirrors.cloud.tencent.com/npm/)');
+      setCustomErrorKey('settings.error.invalidUrl');
       return;
     }
 
@@ -124,7 +466,7 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
       normalized === DOMESTIC_REGISTRY ||
       settings.customRegistries.some(c => normalizeRegistryUrl(c.url) === normalized)
     ) {
-      setCustomError('该源地址已存在于列表中，无需重复添加');
+      setCustomErrorKey('settings.error.duplicate');
       return;
     }
 
@@ -135,9 +477,9 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
       setNewCustomName('');
       setNewCustomUrl('');
       setIsAddingCustom(false);
-      showNotice(`已添加并切换为「${name}」`);
+      showNotice('settings.notice.customAdded', { name });
     } else {
-      setCustomError('保存自定义源失败');
+      setCustomErrorKey('settings.error.saveFailed');
     }
   };
 
@@ -148,7 +490,7 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
     if (normalizeRegistryUrl(settings.registry) === norm) {
       await updateField('registry', 'auto');
     }
-    showNotice('已移除自定义源');
+    showNotice('settings.notice.customRemoved');
   };
 
   const cardStyle: React.CSSProperties = {
@@ -188,7 +530,9 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
     alignItems: 'flex-start',
     padding: '10px 12px',
     borderRadius: '8px',
-    border: active ? '1.5px solid var(--dsw-alias-primary, #2563eb)' : '1px solid var(--dsw-alias-border-l2, #e2e8f0)',
+    border: active
+      ? '1.5px solid var(--dsw-alias-primary, #2563eb)'
+      : '1px solid var(--dsw-alias-border-l2, #e2e8f0)',
     background: active ? 'rgba(37, 99, 235, 0.04)' : 'var(--dsw-alias-bg-subtle, #f8fafc)',
     marginBottom: '8px',
     cursor: writable ? 'pointer' : 'default',
@@ -216,10 +560,18 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
     <div style={cardStyle}>
       <div style={sectionHeaderStyle}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span style={{ fontSize: '15px', fontWeight: 600 }}>⚙️ 插件默认更新源配置</span>
-          {savingNotice && (
-            <span style={{ fontSize: '11px', color: '#16a34a', background: '#dcfce7', padding: '1px 6px', borderRadius: '4px' }}>
-              {savingNotice}
+          <span style={{ fontSize: '15px', fontWeight: 600 }}>{t('settings.title')}</span>
+          {notice && (
+            <span
+              style={{
+                fontSize: '11px',
+                color: '#16a34a',
+                background: '#dcfce7',
+                padding: '1px 6px',
+                borderRadius: '4px'
+              }}
+            >
+              {t(notice.key, notice.params)}
             </span>
           )}
         </div>
@@ -228,19 +580,17 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
             type="button"
             onClick={onClose}
             style={{ ...btnStyle, padding: '2px 8px', fontSize: '12px' }}
-            title="关闭设置"
+            title={t('settings.closeTitle')}
           >
-            ✕ 关闭
+            {t('settings.close')}
           </button>
         )}
       </div>
 
       <div style={{ marginBottom: '14px' }}>
-        <div style={{ ...hintStyle, marginBottom: '10px' }}>
-          在此设置进行第三方插件更新时默认使用的 npm 仓库源。
-        </div>
+        <div style={{ ...hintStyle, marginBottom: '10px' }}>{t('settings.intro')}</div>
 
-        {/* 1. 自动探测 (推荐) */}
+        {/* 1. Automatic probing (recommended) */}
         <div style={optionItemStyle(isCurrent('auto'))} onClick={() => writable && handleSelectRegistry('auto')}>
           <input
             type="radio"
@@ -252,18 +602,25 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
           />
           <div style={{ flex: 1 }}>
             <div style={labelStyle}>
-              自动模式（智能探测与包完整度检查）
-              <span style={{ marginLeft: 6, fontSize: '11px', color: '#2563eb', background: '#eff6ff', padding: '1px 5px', borderRadius: '3px' }}>
-                推荐
+              {t('settings.autoTitle')}
+              <span
+                style={{
+                  marginLeft: 6,
+                  fontSize: '11px',
+                  color: '#2563eb',
+                  background: '#eff6ff',
+                  padding: '1px 5px',
+                  borderRadius: '3px'
+                }}
+              >
+                {t('settings.autoBadge')}
               </span>
             </div>
-            <div style={hintStyle}>
-              优先并发 ping 测速。若国内源较快，会自动预检国内源是否包含本次更新及现有全部直接依赖的对应版本；若无缺失则采用国内高速源，若发现版本落后/缺失则无缝切换官方源，彻底避免版本不匹配报错。
-            </div>
+            <div style={hintStyle}>{t('settings.autoHint')}</div>
           </div>
         </div>
 
-        {/* 2. npm 官方源 */}
+        {/* 2. npm official registry */}
         <div style={optionItemStyle(isCurrent('npmjs'))} onClick={() => writable && handleSelectRegistry('npmjs')}>
           <input
             type="radio"
@@ -275,19 +632,20 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
           />
           <div style={{ flex: 1 }}>
             <div style={labelStyle}>
-              npm 官方源
+              {t('settings.npmjsTitle')}
               <span style={{ marginLeft: 6, fontSize: '11px', color: '#475569', fontFamily: 'monospace' }}>
                 https://registry.npmjs.org/
               </span>
             </div>
-            <div style={hintStyle}>
-              版本发布第一时间即时可用，绝对权威且无镜像同步延迟；国内网络请求可能偶有轻微波动。
-            </div>
+            <div style={hintStyle}>{t('settings.npmjsHint')}</div>
           </div>
         </div>
 
-        {/* 3. 国内镜像源 npmmirror (DSH 同款) */}
-        <div style={optionItemStyle(isCurrent('npmmirror'))} onClick={() => writable && handleSelectRegistry('npmmirror')}>
+        {/* 3. Domestic mirror npmmirror (same as DSH) */}
+        <div
+          style={optionItemStyle(isCurrent('npmmirror'))}
+          onClick={() => writable && handleSelectRegistry('npmmirror')}
+        >
           <input
             type="radio"
             name="dsh-plugin-registry"
@@ -298,19 +656,17 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
           />
           <div style={{ flex: 1 }}>
             <div style={labelStyle}>
-              国内源 npmmirror（与 DSH 客户端自带源一致）
+              {t('settings.npmmirrorTitle')}
               <span style={{ marginLeft: 6, fontSize: '11px', color: '#475569', fontFamily: 'monospace' }}>
                 https://registry.npmmirror.com/
               </span>
             </div>
-            <div style={hintStyle}>
-              中国大陆地区下载与解析极速。注意：镜像节点为周期同步，小众插件新版本可能存在数小时或数天的同步延迟。本插件不会主动向镜像发起同步请求。
-            </div>
+            <div style={hintStyle}>{t('settings.npmmirrorHint')}</div>
           </div>
         </div>
 
-        {/* 4. 用户自定义源 */}
-        {settings.customRegistries.map((cust) => {
+        {/* 4. User-defined registries */}
+        {settings.customRegistries.map(cust => {
           const norm = normalizeRegistryUrl(cust.url) || cust.url;
           const active = isCurrent(norm);
           return (
@@ -325,24 +681,30 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
               />
               <div style={{ flex: 1 }}>
                 <div style={labelStyle}>
-                  {cust.name || '自定义源'}
+                  {cust.name || t('settings.customFallbackName')}
                   <span style={{ marginLeft: 6, fontSize: '11px', color: '#475569', fontFamily: 'monospace' }}>
                     {cust.url}
                   </span>
                 </div>
-                <div style={hintStyle}>自定义源地址</div>
+                <div style={hintStyle}>{t('settings.customHint')}</div>
               </div>
               {writable && (
                 <button
                   type="button"
-                  style={{ ...btnStyle, color: '#dc2626', borderColor: '#fca5a5', padding: '2px 6px', fontSize: '11px' }}
-                  onClick={(e) => {
+                  style={{
+                    ...btnStyle,
+                    color: '#dc2626',
+                    borderColor: '#fca5a5',
+                    padding: '2px 6px',
+                    fontSize: '11px'
+                  }}
+                  onClick={e => {
                     e.stopPropagation();
                     handleDeleteCustom(cust.url);
                   }}
-                  title="删除此自定义源"
+                  title={t('settings.deleteTitle')}
                 >
-                  删除
+                  {t('settings.delete')}
                 </button>
               )}
             </div>
@@ -350,26 +712,33 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
         })}
       </div>
 
-      {/* 添加自定义源区域 */}
+      {/* Add a custom registry */}
       {writable && (
-        <div style={{ marginBottom: '14px', padding: '10px 12px', background: 'var(--dsw-alias-bg-subtle, #f8fafc)', borderRadius: '8px' }}>
+        <div
+          style={{
+            marginBottom: '14px',
+            padding: '10px 12px',
+            background: 'var(--dsw-alias-bg-subtle, #f8fafc)',
+            borderRadius: '8px'
+          }}
+        >
           {!isAddingCustom ? (
             <button
               type="button"
               style={{ ...btnStyle, display: 'inline-flex', alignItems: 'center', gap: '4px' }}
               onClick={() => setIsAddingCustom(true)}
             >
-              <span>+</span> 添加自定义更新源
+              {t('settings.addCustom')}
             </button>
           ) : (
             <div>
-              <div style={{ fontWeight: 600, fontSize: '12px', marginBottom: '8px' }}>添加自定义源</div>
+              <div style={{ fontWeight: 600, fontSize: '12px', marginBottom: '8px' }}>{t('settings.addCustomTitle')}</div>
               <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
                 <input
                   type="text"
-                  placeholder="源备注名称 (如: 腾讯云镜像)"
+                  placeholder={t('settings.namePlaceholder')}
                   value={newCustomName}
-                  onChange={(e) => setNewCustomName(e.target.value)}
+                  onChange={e => setNewCustomName(e.target.value)}
                   style={{
                     padding: '4px 8px',
                     fontSize: '12px',
@@ -380,9 +749,9 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
                 />
                 <input
                   type="text"
-                  placeholder="源 URL 地址 (如: https://mirrors.cloud.tencent.com/npm/)"
+                  placeholder={t('settings.urlPlaceholder')}
                   value={newCustomUrl}
-                  onChange={(e) => setNewCustomUrl(e.target.value)}
+                  onChange={e => setNewCustomUrl(e.target.value)}
                   style={{
                     padding: '4px 8px',
                     fontSize: '12px',
@@ -393,24 +762,31 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
                   }}
                 />
               </div>
-              {customError && <div style={{ color: '#dc2626', fontSize: '11px', marginBottom: '6px' }}>{customError}</div>}
+              {customErrorKey && (
+                <div style={{ color: '#dc2626', fontSize: '11px', marginBottom: '6px' }}>{t(customErrorKey)}</div>
+              )}
               <div style={{ display: 'flex', gap: '6px' }}>
                 <button
                   type="button"
-                  style={{ ...btnStyle, background: 'var(--dsw-alias-primary, #2563eb)', color: '#ffffff', borderColor: '#2563eb' }}
+                  style={{
+                    ...btnStyle,
+                    background: 'var(--dsw-alias-primary, #2563eb)',
+                    color: '#ffffff',
+                    borderColor: '#2563eb'
+                  }}
                   onClick={handleAddCustom}
                 >
-                  保存并使用
+                  {t('settings.saveAndUse')}
                 </button>
                 <button
                   type="button"
                   style={btnStyle}
                   onClick={() => {
                     setIsAddingCustom(false);
-                    setCustomError('');
+                    setCustomErrorKey('');
                   }}
                 >
-                  取消
+                  {t('settings.cancel')}
                 </button>
               </div>
             </div>
@@ -418,8 +794,16 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
         </div>
       )}
 
-      {/* 故障自动回退开关 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', paddingTop: '8px', borderTop: '1px solid var(--dsw-alias-border-l2, #f1f5f9)' }}>
+      {/* Automatic fallback on install failure */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          paddingTop: '8px',
+          borderTop: '1px solid var(--dsw-alias-border-l2, #f1f5f9)'
+        }}
+      >
         <input
           type="checkbox"
           id="fallbackToOfficialCheckbox"
@@ -428,8 +812,15 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
           disabled={!writable}
           style={{ cursor: writable ? 'pointer' : 'default' }}
         />
-        <label htmlFor="fallbackToOfficialCheckbox" style={{ fontSize: '12px', cursor: writable ? 'pointer' : 'default', color: 'var(--dsw-alias-label-primary, #1e293b)' }}>
-          当国内源或自定义源安装失败（如遇到版本未同步或 404）时，自动改用 npm 官方源重试一次（推荐开启）
+        <label
+          htmlFor="fallbackToOfficialCheckbox"
+          style={{
+            fontSize: '12px',
+            cursor: writable ? 'pointer' : 'default',
+            color: 'var(--dsw-alias-label-primary, #1e293b)'
+          }}
+        >
+          {t('settings.fallbackLabel')}
         </label>
       </div>
     </div>
@@ -440,149 +831,612 @@ export const RegistrySettingsCard: React.FC<{ form?: any; onClose?: () => void }
 // Updater Action Button (Injected into plugin detail actions header)
 // =====================================================================================
 
-export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = ({ subject, form }) => {
+type UpdaterStatus = 'idle' | 'checking' | 'has_update' | 'up_to_date' | 'updating' | 'success' | 'error';
+
+interface UpdateProgressUi {
+  jobId: string;
+  phase: UpdatePhase;
+  percent?: number;
+  logTail?: string;
+  messageKey?: string;
+  cancelling: boolean;
+}
+
+interface UpdateSuccessInfo {
+  version?: string;
+  commitOnly?: boolean;
+  branch?: string;
+  installedCommit?: string;
+  registryUsed?: string;
+  registryLabel?: string;
+  fellBack?: boolean;
+  selfUpdate?: boolean;
+}
+
+interface UpdateFailureInfo extends ErrorTextInfo {
+  rollback?: DoUpdateResult['rollback'];
+  registryUsed?: string;
+  registryLabel?: string;
+  fellBack?: boolean;
+  output?: string;
+  installedCommit?: string;
+  cancelled?: boolean;
+}
+
+interface UpdaterActionButtonProps extends SlotActionProps {
+  form?: any;
+  /** Translator injected by apply(); falls back to the bundled Chinese dictionary. */
+  t?: Translator;
+  /** DSH locale service, used only to re-render on language switches. */
+  locale?: LocaleServiceLike;
+}
+
+export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({
+  subject,
+  form,
+  t: providedT,
+  locale
+}) => {
+  useLocaleRevision(locale);
+  const t = providedT ?? FALLBACK_TRANSLATOR;
+
   const pkg = subject?.pkg;
-  const packageName = pkg?.name;
-  const currentVersion = pkg?.version || '0.0.0';
+  const packageName = typeof pkg?.name === 'string' ? pkg.name : '';
+  const clientVersion = pkg?.version || '0.0.0';
 
-  const [status, setStatus] = useState<'idle' | 'checking' | 'has_update' | 'up_to_date' | 'updating' | 'success' | 'error'>('idle');
-  const [latestVersion, setLatestVersion] = useState<string>('');
-  const [errorMsg, setErrorMsg] = useState<string>('');
+  // Only user-installed bundles: official plugins use DSH's own update entry, and uninstalled
+  // bundles have nothing to update. Hooks above stay unconditional so the hook order is stable.
+  const renderable = subject?.kind === 'bundle' && !!packageName && pkg?.installed !== false && !isOfficialPackage(pkg);
+
+  const { settings: configSettings } = useConfigFormState(form);
+  const customRegistries = configSettings.customRegistries;
+
+  const [status, setStatus] = useState<UpdaterStatus>('idle');
+  const [checkResult, setCheckResult] = useState<CheckUpdateResult | null>(null);
+  const [checkError, setCheckError] = useState<ErrorTextInfo | null>(null);
+  const [errorSource, setErrorSource] = useState<'check' | 'update'>('check');
+  const [progress, setProgress] = useState<UpdateProgressUi | null>(null);
+  const [progressError, setProgressError] = useState<{ key: string; params?: TranslateParams } | null>(null);
+  const [successInfo, setSuccessInfo] = useState<UpdateSuccessInfo | null>(null);
+  const [failureInfo, setFailureInfo] = useState<UpdateFailureInfo | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+
   const checkingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const pollTokenRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+  const updateAvailableRef = useRef(false);
+  /** What the running job was asked to install: commit-only jobs have no target version. */
+  const pendingTargetRef = useRef<{ commitOnly: boolean; version?: string; branch?: string }>({ commitOnly: false });
 
-  // Only user-installed bundles: official plugins use DSH's own update entry, and uninstalled bundles have nothing to update.
-  if (subject?.kind !== 'bundle' || !packageName || pkg?.installed === false || isOfficialPackage(pkg)) {
-    return null;
-  }
+  const effectiveCurrentVersion = checkResult?.currentVersion || clientVersion;
+  const remoteVersion = checkResult?.latestVersion || '';
+  const versionChanged = !!remoteVersion && remoteVersion !== effectiveCurrentVersion;
+  const commitOnlyUpdate = !!checkResult?.commitAhead && !versionChanged;
+  const hasUpdate = status === 'has_update';
+  const latestVersion = checkResult?.latestVersion || '';
+  // Keep "is an update still available" available to callbacks without re-creating them per render.
+  updateAvailableRef.current = !!(checkResult?.hasUpdate || checkResult?.commitAhead);
 
-  // Check update logic
-  const doCheck = useCallback(async (force = false) => {
-    if (checkingRef.current) return;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      pollTokenRef.current += 1;
+      try {
+        abortRef.current?.abort();
+      } catch {
+        // Ignore abort errors during teardown.
+      }
+    };
+  }, []);
 
-    if (!force) {
-      const cached = checkCache.get(packageName);
-      // Never replay a failed check: the button must show the retry state instead of "up to date".
-      if (cached && cached.result.ok && Date.now() - cached.time < CACHE_TTL_MS) {
-        if (cached.result.hasUpdate) {
-          setStatus('has_update');
-          setLatestVersion(cached.result.latestVersion || '');
-        } else {
-          setStatus('up_to_date');
+  const stopPolling = useCallback(() => {
+    pollTokenRef.current += 1;
+    try {
+      abortRef.current?.abort();
+    } catch {
+      // Ignore abort errors.
+    }
+    abortRef.current = null;
+  }, []);
+
+  // ---- Check flow ------------------------------------------------------------------
+
+  const doCheck = useCallback(
+    async (force = false) => {
+      if (!renderable || checkingRef.current) return;
+
+      if (!force) {
+        const cached = checkCache.get(packageName);
+        // Never replay a failed check: the button must show the retry state instead of "up to date".
+        if (cached && cached.result.ok && Date.now() - cached.time < CACHE_TTL_MS) {
+          setCheckResult(cached.result);
+          setCheckError(null);
+          setSuccessInfo(null);
+          setFailureInfo(null);
+          setStatus(cached.result.hasUpdate || cached.result.commitAhead ? 'has_update' : 'up_to_date');
+          return;
         }
+      }
+
+      checkingRef.current = true;
+      setStatus('checking');
+      setCheckError(null);
+      setErrorSource('check');
+      setSuccessInfo(null);
+      setFailureInfo(null);
+
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = setTimeout(() => {
+        try {
+          controller?.abort();
+        } catch {
+          // Ignore abort errors.
+        }
+      }, REQUEST_TIMEOUT_MS);
+      try {
+        const res = await fetch(CHECK_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ packageName, currentVersion: clientVersion }),
+          signal: controller?.signal
+        });
+
+        const payload = (await res.json().catch(() => null)) as CheckUpdateResult | null;
+        if (!payload || typeof payload !== 'object') throw new Error(`HTTP ${res.status}`);
+        const data = payload;
+        if (!res.ok && data.ok) throw new Error(`HTTP ${res.status}`);
+        if (!mountedRef.current) return;
+
+        if (data.ok) {
+          checkCache.set(packageName, { time: Date.now(), result: data });
+          setCheckResult(data);
+          if (data.hasUpdate || data.commitAhead) {
+            setStatus('has_update');
+          } else {
+            setStatus('up_to_date');
+          }
+        } else {
+          setCheckResult(null);
+          setStatus('error');
+          setErrorSource('check');
+          setCheckError({
+            errorCode: typeof data.errorCode === 'string' ? data.errorCode : undefined,
+            fallbackText: typeof data.error === 'string' ? data.error : undefined
+          });
+        }
+      } catch (error: any) {
+        if (!mountedRef.current) return;
+        setCheckResult(null);
+        setStatus('error');
+        setErrorSource('check');
+        setCheckError(describeRequestError(error));
+      } finally {
+        clearTimeout(timer);
+        checkingRef.current = false;
+      }
+    },
+    [packageName, clientVersion, renderable]
+  );
+
+  // Trigger a check when the plugin detail opens (and when the translated cache is bypassed on retry).
+  useEffect(() => {
+    if (!renderable) return;
+    void doCheck();
+  }, [packageName, clientVersion, doCheck, renderable]);
+
+  // ---- Final result handling -------------------------------------------------------
+
+  const finishSuccess = useCallback(
+    (result: DoUpdateResult | undefined, options?: { suppressVersion?: boolean }) => {
+      if (!mountedRef.current) return;
+      checkCache.delete(packageName); // Force a fresh check next time
+      setStatus('success');
+      setProgress(null);
+      setProgressError(null);
+      setFailureInfo(null);
+      setErrorSource('check');
+      const pending = pendingTargetRef.current;
+      setSuccessInfo({
+        version: options?.suppressVersion
+          ? undefined
+          : result?.targetVersion || (pending.commitOnly ? undefined : pending.version),
+        commitOnly: pending.commitOnly,
+        branch: pending.branch,
+        installedCommit: result?.installedCommit,
+        registryUsed: result?.registryUsed,
+        registryLabel: result?.registryLabel,
+        fellBack: result?.fellBack,
+        selfUpdate: result?.selfUpdate
+      });
+    },
+    [packageName]
+  );
+
+  const finishFailure = useCallback((info: UpdateFailureInfo) => {
+    if (!mountedRef.current) return;
+    setProgress(null);
+    setProgressError(null);
+    setSuccessInfo(null);
+    setFailureInfo(info);
+  }, []);
+
+  /** Apply a terminal DoUpdateResult (shared by the polling path and the old synchronous API). */
+  const finishWithResult = useCallback(
+    (result: DoUpdateResult | undefined, fallback: { errorCode?: string; fallbackText?: string; cancelled?: boolean }) => {
+      if (result && result.ok) {
+        finishSuccess(result);
         return;
       }
-    }
-
-    checkingRef.current = true;
-    setStatus('checking');
-    setErrorMsg('');
-
-    try {
-      const res = await fetch('/api/dsh-plugins-update/check', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ packageName, currentVersion })
-      });
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+      if (fallback.cancelled) {
+        setStatus(updateAvailableRef.current ? 'has_update' : 'idle');
+        finishFailure({ errorCode: fallback.errorCode || ERROR_CODES.cancelled, cancelled: true });
+        return;
       }
-
-      const data = (await res.json()) as CheckUpdateResult;
-
-      if (data.ok) {
-        checkCache.set(packageName, { time: Date.now(), result: data });
-        if (data.hasUpdate) {
-          setStatus('has_update');
-          setLatestVersion(data.latestVersion || '');
-        } else {
-          setStatus('up_to_date');
-          setLatestVersion(data.latestVersion || currentVersion);
-        }
-      } else {
-        setStatus('error');
-        setErrorMsg(data.error || '检查失败');
-      }
-    } catch (e: any) {
       setStatus('error');
-      setErrorMsg(e?.message || '网络异常');
-    } finally {
-      checkingRef.current = false;
-    }
-  }, [packageName, currentVersion]);
+      setErrorSource('update');
+      finishFailure({
+        errorCode: result?.errorCode || fallback.errorCode,
+        fallbackText: result?.error || fallback.fallbackText,
+        rollback: result?.rollback,
+        registryUsed: result?.registryUsed,
+        registryLabel: result?.registryLabel,
+        fellBack: result?.fellBack,
+        output: result?.output,
+        installedCommit: result?.installedCommit
+      });
+    },
+    [finishSuccess, finishFailure]
+  );
 
-  // Trigger check when plugin detail opens
-  useEffect(() => {
-    doCheck();
-  }, [packageName, currentVersion, doCheck]);
+  // ---- Async job polling -----------------------------------------------------------
 
-  // Execute update logic
+  const startPolling = useCallback(
+    (jobId: string) => {
+      const token = ++pollTokenRef.current;
+      const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+      const poll = async () => {
+        while (mountedRef.current && token === pollTokenRef.current) {
+          await sleep(POLL_INTERVAL_MS);
+          if (!mountedRef.current || token !== pollTokenRef.current) return;
+
+          const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+          abortRef.current = controller;
+          const timer = setTimeout(() => {
+            try {
+              controller?.abort();
+            } catch {
+              // Ignore abort errors.
+            }
+          }, POLL_TIMEOUT_MS);
+
+          let state: UpdateJobState | null = null;
+          try {
+            const res = await fetch(`${PROGRESS_PATH}?jobId=${encodeURIComponent(jobId)}`, {
+              method: 'GET',
+              headers: { accept: 'application/json' },
+              signal: controller?.signal
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            state = (await res.json()) as UpdateJobState;
+          } catch (error: any) {
+            clearTimeout(timer);
+            if (!mountedRef.current || token !== pollTokenRef.current) return;
+            const message = typeof error?.message === 'string' ? error.message : '';
+            setProgress(null);
+            setProgressError(
+              message ? { key: 'progress.pollFailed', params: { error: message } } : { key: 'error.network' }
+            );
+            setStatus('error');
+            setErrorSource('update');
+            return;
+          }
+          clearTimeout(timer);
+          if (!mountedRef.current || token !== pollTokenRef.current) return;
+
+          if (!state || typeof state !== 'object') {
+            setProgress(null);
+            setProgressError({ key: 'error.unknown' });
+            setStatus('error');
+            setErrorSource('update');
+            return;
+          }
+
+          const phase = state.phase;
+          if (phase === 'done' || phase === 'failed' || phase === 'cancelled') {
+            // The job map is in-memory on the backend, so a self-update reload drops the finished
+            // job and makes the next progress request answer `job-not-found`. For our own package
+            // that only happens after a successful self update: report success, not an error.
+            if (
+              state.ok === false &&
+              state.errorCode === ERROR_CODES.jobNotFound &&
+              packageName === SELF_PACKAGE_NAME
+            ) {
+              finishSuccess(
+                { ok: true, packageName, selfUpdate: true },
+                { suppressVersion: true }
+              );
+              return;
+            }
+            finishWithResult(phase === 'cancelled' ? undefined : state.result, {
+              errorCode: state.errorCode,
+              fallbackText: state.error,
+              cancelled: phase === 'cancelled'
+            });
+            return;
+          }
+
+          const nextPercent = typeof state.percent === 'number' && Number.isFinite(state.percent)
+            ? Math.max(0, Math.min(100, state.percent))
+            : undefined;
+          setProgress(prev => ({
+            jobId,
+            phase: phase || prev?.phase || 'installing',
+            percent: nextPercent ?? prev?.percent,
+            logTail: typeof state?.logTail === 'string' ? state.logTail : prev?.logTail,
+            messageKey: typeof state?.messageKey === 'string' ? state.messageKey : undefined,
+            cancelling: prev?.cancelling || false
+          }));
+        }
+      };
+
+      void poll();
+    },
+    [finishWithResult]
+  );
+
+  // ---- Start an update -------------------------------------------------------------
+
   const handleUpdate = async () => {
     if (status === 'updating') return;
 
-    const confirmed = window.confirm(`确认要将插件「${packageName}」更新至最新版本 ${latestVersion || ''} 吗？`);
+    const targetVersion = versionChanged ? latestVersion : undefined;
+    const commitOnly = commitOnlyUpdate;
+    const confirmed =
+      typeof window === 'undefined' || typeof window.confirm !== 'function'
+        ? true
+        : window.confirm(
+            commitOnly
+              ? t('confirm.updateCommit', { packageName })
+              : t('confirm.update', { packageName, version: latestVersion || effectiveCurrentVersion })
+          );
     if (!confirmed) return;
 
+    stopPolling();
+    pendingTargetRef.current = {
+      commitOnly,
+      version: commitOnly ? undefined : latestVersion || undefined,
+      branch: checkResult?.branch
+    };
     setStatus('updating');
-    setErrorMsg('');
+    setCheckError(null);
+    setSuccessInfo(null);
+    setFailureInfo(null);
+    setProgressError(null);
+    setProgress({ jobId: '', phase: 'queued', cancelling: false });
 
     try {
-      const res = await fetch('/api/dsh-plugins-update/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ packageName, targetVersion: latestVersion })
-      });
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      abortRef.current = controller;
+      const timer = setTimeout(() => {
+        try {
+          controller?.abort();
+        } catch {
+          // Ignore abort errors.
+        }
+      }, REQUEST_TIMEOUT_MS);
 
-      const data = (await res.json()) as DoUpdateResult;
-      if (data.ok) {
-        setStatus('success');
-        checkCache.delete(packageName); // Clear cache
-        const usedMsg = data.registryLabel || data.registryUsed ? `\n（本次更新使用源：${data.registryLabel || data.registryUsed}${data.fellBack ? '，触发故障自动回退' : ''}）` : '';
-        const reloadMsg = data.selfUpdate
-          ? '本次更新的是本插件自身，请完全退出并重新启动 DSH 以加载新版本（仅刷新窗口可能不够）。'
-          : '请刷新当前窗口或重启 DSH 以加载新版本。';
-        alert(`🎉 插件「${packageName}」更新成功！${usedMsg}\n\n${reloadMsg}`);
-      } else {
-        setStatus('error');
-        setErrorMsg(data.error || '更新失败');
-        const usedMsg = data.registryLabel || data.registryUsed ? `使用源：${data.registryLabel || data.registryUsed}\n` : '';
-        alert(`❌ 插件更新失败：\n${data.error || '未知错误'}\n${usedMsg}\n详细输出：\n${data.output || ''}`);
+      let payload: any;
+      try {
+        const body: { packageName: string; targetVersion?: string } = { packageName };
+        // A commit-only GitHub update must not pin the tag of the already installed version;
+        // the backend installs the default branch head when targetVersion is omitted.
+        if (!commitOnly && targetVersion) body.targetVersion = targetVersion;
+        const res = await fetch(UPDATE_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller?.signal
+        });
+        if (!res.ok) {
+          payload = await res.json().catch(() => null);
+          const failure: any = new Error(
+            payload && typeof payload.error === 'string' ? payload.error : `HTTP ${res.status}`
+          );
+          if (payload && typeof payload.errorCode === 'string') failure.errorCode = payload.errorCode;
+          throw failure;
+        }
+        payload = await res.json().catch(() => null);
+      } finally {
+        clearTimeout(timer);
+        if (abortRef.current === controller) abortRef.current = null;
       }
-    } catch (e: any) {
+      if (!mountedRef.current) return;
+
+      if (!payload || typeof payload !== 'object') throw new Error('Invalid response');
+
+      if (payload.ok === false) {
+        setStatus('error');
+        setErrorSource('update');
+        setProgress(null);
+        finishFailure({
+          errorCode: typeof payload.errorCode === 'string' ? payload.errorCode : undefined,
+          fallbackText: typeof payload.error === 'string' ? payload.error : undefined
+        });
+        return;
+      }
+
+      const jobId = typeof payload.jobId === 'string' ? payload.jobId : '';
+      if (!jobId) {
+        // Backward compatibility: an older backend answers the update synchronously.
+        finishWithResult(payload as DoUpdateResult, {});
+        return;
+      }
+
+      setProgress({ jobId, phase: 'queued', cancelling: false });
+      startPolling(jobId);
+    } catch (error: any) {
+      if (!mountedRef.current) return;
+      setProgress(null);
       setStatus('error');
-      setErrorMsg(e?.message || '请求失败');
-      alert(`❌ 更新请求出错：${e?.message || '网络连接异常'}`);
+      setErrorSource('update');
+      const thrownCode = typeof error?.errorCode === 'string' ? error.errorCode : undefined;
+      finishFailure(
+        thrownCode
+          ? {
+              errorCode: thrownCode,
+              fallbackText: typeof error?.message === 'string' ? error.message : undefined
+            }
+          : describeRequestError(error)
+      );
     }
   };
 
+  // ---- Cancel a running job --------------------------------------------------------
+
+  const handleCancelUpdate = async () => {
+    const jobId = progress?.jobId;
+    if (!jobId || progress?.cancelling) return;
+
+    setProgress(prev => (prev ? { ...prev, cancelling: true } : prev));
+    setProgressError(null);
+
+    try {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = setTimeout(() => {
+        try {
+          controller?.abort();
+        } catch {
+          // Ignore abort errors.
+        }
+      }, CANCEL_TIMEOUT_MS);
+      let res: Response;
+      try {
+        res = await fetch(CANCEL_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jobId }),
+          signal: controller?.signal
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      const payload = (await res.json().catch(() => null)) as any;
+      if (!res.ok || (payload && typeof payload === 'object' && payload.ok === false)) {
+        const errorCode = payload && typeof payload.errorCode === 'string' ? payload.errorCode : '';
+        // Already finished / no longer tracked: a harmless no-op. Polling decides the final state.
+        if (errorCode === ERROR_CODES.unknown || errorCode === ERROR_CODES.jobNotFound) return;
+        const message =
+          payload && typeof payload.error === 'string' ? payload.error : `HTTP ${res.status}`;
+        throw new Error(message);
+      }
+      // Accepted: keep polling until the backend reports the cancelled phase.
+    } catch (error: any) {
+      if (!mountedRef.current) return;
+      setProgress(prev => (prev ? { ...prev, cancelling: false } : prev));
+      const message = typeof error?.message === 'string' ? error.message : t('error.network');
+      setProgressError({ key: 'progress.cancelFailed', params: { error: message } });
+    }
+  };
+
+  // ---- Rendering helpers -----------------------------------------------------------
+
+  const shortLatestCommit = shortCommit(checkResult?.latestCommit);
+  const shortInstalledCommit = shortCommit(checkResult?.installedCommit);
+
+  const hintParts: string[] = [];
+  if (checkResult?.isGithub) {
+    if (checkResult.branch) hintParts.push(t('check.branch', { branch: checkResult.branch }));
+    if (shortLatestCommit) hintParts.push(t('check.commit', { commit: shortLatestCommit }));
+    if (checkResult.tag) hintParts.push(t('check.tag', { tag: checkResult.tag }));
+    if (shortInstalledCommit) hintParts.push(t('check.installedCommit', { commit: shortInstalledCommit }));
+  }
+  const checkHint = hintParts.join(' · ');
+
+  const updateTitle = (() => {
+    const lines: string[] = [
+      commitOnlyUpdate
+        ? t('action.updateCommitTitle')
+        : t('action.updateTitle', { version: latestVersion || effectiveCurrentVersion })
+    ];
+    if (checkResult?.isGithub) {
+      if (checkResult.branch) lines.push(t('check.branch', { branch: checkResult.branch }));
+      if (shortLatestCommit) lines.push(t('check.commit', { commit: shortLatestCommit }));
+      if (shortInstalledCommit) lines.push(t('check.installedCommit', { commit: shortInstalledCommit }));
+    }
+    if (checkResult?.tag) lines.push(t('check.tag', { tag: checkResult.tag }));
+    if (checkResult?.pinAvailable === false) lines.push(t('check.pinUnavailable'));
+    return lines.join('\n');
+  })();
+
   // SVG Icons
   const RefreshIcon = () => (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: 5 }}>
-      <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-      <path d="M3 3v5h5"/>
-      <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
-      <path d="M16 16h5v5"/>
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ marginRight: 5 }}
+    >
+      <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
+      <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+      <path d="M16 16h5v5" />
     </svg>
   );
 
   const ArrowUpIcon = () => (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: 5 }}>
-      <path d="M12 19V5"/>
-      <path d="m5 12 7-7 7 7"/>
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ marginRight: 5 }}
+    >
+      <path d="M12 19V5" />
+      <path d="m5 12 7-7 7 7" />
     </svg>
   );
 
   const CheckIcon = () => (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: 5 }}>
-      <polyline points="20 6 9 17 4 12"/>
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ marginRight: 5 }}
+    >
+      <polyline points="20 6 9 17 4 12" />
     </svg>
   );
 
   const GearIcon = () => (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="12" r="3"/>
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
     </svg>
   );
 
@@ -612,6 +1466,67 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
     color: 'var(--dsw-alias-label-secondary, #64748b)'
   };
 
+  const hintLineStyle: React.CSSProperties = {
+    fontSize: '11px',
+    color: 'var(--dsw-alias-label-secondary, #64748b)',
+    marginTop: '2px',
+    lineHeight: 1.4,
+    maxWidth: '340px',
+    whiteSpace: 'normal'
+  };
+
+  const panelStyle: React.CSSProperties = {
+    marginTop: '6px',
+    marginLeft: '0',
+    padding: '8px 10px',
+    borderRadius: '8px',
+    border: '1px solid var(--dsw-alias-border-l2, #e2e8f0)',
+    background: 'var(--dsw-alias-bg-subtle, #f8fafc)',
+    minWidth: '240px',
+    maxWidth: '340px',
+    boxSizing: 'border-box',
+    fontSize: '12px',
+    lineHeight: 1.5
+  };
+
+  const progressTrackStyle: React.CSSProperties = {
+    marginTop: '6px',
+    height: '5px',
+    borderRadius: '3px',
+    background: 'rgba(37, 99, 235, 0.15)',
+    overflow: 'hidden'
+  };
+
+  const progressFillStyle = (percent: number): React.CSSProperties => ({
+    height: '100%',
+    width: `${percent}%`,
+    background: 'var(--dsw-alias-primary, #2563eb)',
+    transition: 'width 0.2s ease-in-out'
+  });
+
+  const logStyle: React.CSSProperties = {
+    margin: '6px 0 0',
+    padding: '6px 8px',
+    maxHeight: '120px',
+    overflow: 'auto',
+    fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+    fontSize: '11px',
+    lineHeight: 1.45,
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+    background: 'rgba(15, 23, 42, 0.04)',
+    borderRadius: '4px',
+    color: 'var(--dsw-alias-label-secondary, #475569)'
+  };
+
+  const smallButtonStyle: React.CSSProperties = {
+    ...baseButtonStyle,
+    padding: '1px 8px',
+    fontSize: '11px',
+    lineHeight: '17px',
+    marginLeft: 'auto'
+  };
+
   const renderMainButton = () => {
     if (status === 'has_update') {
       return (
@@ -625,10 +1540,12 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
             boxShadow: '0 1px 2px rgba(234, 88, 12, 0.15)'
           }}
           onClick={handleUpdate}
-          title={`点击更新此插件至最新版本 v${latestVersion}`}
+          title={updateTitle}
         >
           <ArrowUpIcon />
-          更新至 v{latestVersion}
+          {commitOnlyUpdate
+            ? t('action.updateToCommit')
+            : t('action.updateTo', { version: latestVersion || effectiveCurrentVersion })}
         </button>
       );
     }
@@ -647,7 +1564,7 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
           }}
         >
           <RefreshIcon />
-          正在更新...
+          {t('action.updating')}
         </button>
       );
     }
@@ -664,7 +1581,7 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
           }}
         >
           <RefreshIcon />
-          检查中...
+          {t('action.checking')}
         </button>
       );
     }
@@ -680,10 +1597,10 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
             color: '#15803d'
           }}
           onClick={() => doCheck(true)}
-          title="更新成功！点击重新检测"
+          title={t('action.successTitle')}
         >
           <CheckIcon />
-          已更新 (待重载)
+          {t('action.success')}
         </button>
       );
     }
@@ -697,15 +1614,39 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
             color: 'var(--dsw-alias-label-secondary, #64748b)'
           }}
           onClick={() => doCheck(true)}
-          title={`当前已是最新版本 (${currentVersion})。点击可重新检查`}
+          title={t('action.upToDateTitle', { version: effectiveCurrentVersion })}
         >
           <CheckIcon />
-          已是最新
+          {t('action.upToDate')}
         </button>
       );
     }
 
-    // Idle or Error
+    if (status === 'error' && errorSource === 'update') {
+      const failureText = failureInfo
+        ? localizeErrorInfo(t, failureInfo)
+        : progressError
+          ? t(progressError.key, progressError.params)
+          : t('error.unknown');
+      return (
+        <button
+          type="button"
+          style={{
+            ...baseButtonStyle,
+            borderColor: '#fca5a5',
+            color: '#b91c1c'
+          }}
+          onClick={() => (checkResult?.hasUpdate || checkResult?.commitAhead ? handleUpdate() : doCheck(true))}
+          title={t('action.updateFailedTitle', { error: failureText })}
+        >
+          <RefreshIcon />
+          {t('action.updateFailedRetry')}
+        </button>
+      );
+    }
+
+    // Idle or check error
+    const checkErrorText = checkError ? localizeErrorInfo(t, checkError) : '';
     return (
       <button
         type="button"
@@ -714,53 +1655,220 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
           ...(status === 'error' ? { borderColor: '#fca5a5', color: '#b91c1c' } : {})
         }}
         onClick={() => doCheck(true)}
-        title={errorMsg ? `检查更新失败: ${errorMsg}，点击重试` : '检查该插件是否有新版本'}
+        title={
+          status === 'error'
+            ? t('action.checkFailedTitle', { error: checkErrorText })
+            : t('action.checkTitle')
+        }
       >
         <RefreshIcon />
-        {status === 'error' ? '检查失败(重试)' : '检查更新'}
+        {status === 'error' ? t('action.checkFailedRetry') : t('action.checkUpdate')}
       </button>
     );
   };
 
-  return (
-    <div style={{ display: 'inline-flex', alignItems: 'center' }}>
-      {renderMainButton()}
-      <button
-        type="button"
-        style={gearButtonStyle}
-        onClick={() => setShowSettingsModal(true)}
-        title="设置插件默认更新源 / 自定义源"
-      >
-        <GearIcon />
-      </button>
+  if (!renderable) return null;
 
-      {/* Settings Modal (pops up anywhere when gear is clicked) */}
-      {showSettingsModal && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            backgroundColor: 'rgba(0, 0, 0, 0.45)',
-            zIndex: 9999,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            backdropFilter: 'blur(2px)'
-          }}
-          onClick={() => setShowSettingsModal(false)}
+  const successRegistry =
+    localizedRegistryLabel(t, successInfo?.registryUsed, customRegistries) ?? successInfo?.registryLabel;
+  const failureRegistry =
+    localizedRegistryLabel(t, failureInfo?.registryUsed, customRegistries) ?? failureInfo?.registryLabel;
+  const progressPercent = progress?.percent;
+  const progressPhaseText = progress
+    ? phaseLabel(t, progress.messageKey, progress.phase)
+    : t('progress.starting');
+
+  return (
+    <div style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+      <div style={{ display: 'inline-flex', alignItems: 'center' }}>
+        {renderMainButton()}
+        <button
+          type="button"
+          style={gearButtonStyle}
+          onClick={() => setShowSettingsModal(true)}
+          title={t('action.gearTitle')}
         >
+          <GearIcon />
+        </button>
+
+        {/* Settings Modal (pops up anywhere when gear is clicked) */}
+        {showSettingsModal && (
           <div
             style={{
-              width: '560px',
-              maxWidth: '92vw',
-              maxHeight: '90vh',
-              overflowY: 'auto',
-              boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)'
+              position: 'fixed',
+              inset: 0,
+              backgroundColor: 'rgba(0, 0, 0, 0.45)',
+              zIndex: 9999,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              backdropFilter: 'blur(2px)'
             }}
-            onClick={(e) => e.stopPropagation()}
+            onClick={() => setShowSettingsModal(false)}
           >
-            <RegistrySettingsCard form={form} onClose={() => setShowSettingsModal(false)} />
+            <div
+              style={{
+                width: '560px',
+                maxWidth: '92vw',
+                maxHeight: '90vh',
+                overflowY: 'auto',
+                boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)'
+              }}
+              onClick={e => e.stopPropagation()}
+            >
+              <RegistrySettingsCard
+                form={form}
+                t={t}
+                locale={locale}
+                onClose={() => setShowSettingsModal(false)}
+              />
+            </div>
           </div>
+        )}
+      </div>
+
+      {/* Secondary line: GitHub branch / tag / commit info for a pending update */}
+      {hasUpdate && checkHint && <div style={hintLineStyle}>{checkHint}</div>}
+
+      {/* Failed check: compact localized reason under the button */}
+      {status === 'error' && errorSource === 'check' && checkError && (
+        <div style={{ ...hintLineStyle, color: '#b91c1c' }}>{localizeErrorInfo(t, checkError)}</div>
+      )}
+
+      {/* Progress panel for the running install job */}
+      {status === 'updating' && (
+        <div style={panelStyle}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{ fontWeight: 600, fontSize: '12px' }}>{progressPhaseText}</span>
+            {typeof progressPercent === 'number' && (
+              <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #64748b)' }}>
+                {Math.round(progressPercent)}%
+              </span>
+            )}
+            {progress?.jobId && (
+              <button
+                type="button"
+                style={smallButtonStyle}
+                onClick={handleCancelUpdate}
+                disabled={progress.cancelling}
+              >
+                {progress.cancelling ? t('progress.cancelling') : t('progress.cancel')}
+              </button>
+            )}
+          </div>
+
+          {typeof progressPercent === 'number' && (
+            <div style={progressTrackStyle}>
+              <div style={progressFillStyle(progressPercent)} />
+            </div>
+          )}
+
+          {progress?.logTail && (
+            <details>
+              <summary
+                style={{
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                  color: 'var(--dsw-alias-label-secondary, #64748b)',
+                  marginTop: '6px'
+                }}
+              >
+                {t('progress.logTitle')}
+              </summary>
+              <pre style={logStyle}>{progress.logTail}</pre>
+            </details>
+          )}
+
+          {progressError && (
+            <div style={{ fontSize: '11px', color: '#b91c1c', marginTop: '4px' }}>
+              {t(progressError.key, progressError.params)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Polling/cancel errors after the progress panel has gone away (or without a failure result) */}
+      {progressError && status !== 'updating' && (
+        <div style={{ ...hintLineStyle, color: '#b91c1c' }}>{t(progressError.key, progressError.params)}</div>
+      )}
+
+      {/* Success result panel */}
+      {successInfo && status === 'success' && (
+        <div
+          style={{
+            ...panelStyle,
+            borderColor: 'rgba(22, 163, 74, 0.4)',
+            background: 'rgba(220, 252, 231, 0.45)'
+          }}
+        >
+          <div style={{ fontWeight: 600, color: '#15803d' }}>
+            {t('update.success', { packageName })}
+          </div>
+          {successInfo.version && <div>{t('update.successVersion', { version: successInfo.version })}</div>}
+          {!successInfo.version && successInfo.branch && (
+            <div>{t('check.branch', { branch: successInfo.branch })}</div>
+          )}
+          {!successInfo.version && successInfo.installedCommit && (
+            <div>{t('update.installedCommit', { commit: shortCommit(successInfo.installedCommit) })}</div>
+          )}
+          {successRegistry && (
+            <div>
+              {t(successInfo.fellBack ? 'update.registryUsedFellBack' : 'update.registryUsed', {
+                registry: successRegistry
+              })}
+            </div>
+          )}
+          <div style={{ marginTop: '2px' }}>
+            {successInfo.selfUpdate ? t('update.selfUpdateRestart') : t('update.reloadHint')}
+          </div>
+        </div>
+      )}
+
+      {/* Failure result panel */}
+      {failureInfo && !failureInfo.cancelled && status === 'error' && (
+        <div
+          style={{
+            ...panelStyle,
+            borderColor: '#fca5a5',
+            background: 'rgba(254, 226, 226, 0.5)'
+          }}
+        >
+          <div style={{ fontWeight: 600, color: '#b91c1c' }}>{t('update.failed')}</div>
+          <div>{localizeErrorInfo(t, failureInfo)}</div>
+          {failureInfo.rollback === 'restored' && <div>{t('update.rollbackRestored')}</div>}
+          {failureInfo.rollback === 'failed' && <div>{t('update.rollbackFailed')}</div>}
+          {failureRegistry && (
+            <div>
+              {t(failureInfo.fellBack ? 'update.registryUsedFellBack' : 'update.registryUsed', {
+                registry: failureRegistry
+              })}
+            </div>
+          )}
+          {failureInfo.installedCommit && (
+            <div>{t('update.installedCommit', { commit: shortCommit(failureInfo.installedCommit) })}</div>
+          )}
+          {failureInfo.output && (
+            <details>
+              <summary
+                style={{
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                  color: 'var(--dsw-alias-label-secondary, #64748b)',
+                  marginTop: '6px'
+                }}
+              >
+                {t('update.outputTitle')}
+              </summary>
+              <pre style={logStyle}>{failureInfo.output}</pre>
+            </details>
+          )}
+        </div>
+      )}
+
+      {/* Cancelled notice: back to the update button, so the user can retry */}
+      {failureInfo?.cancelled && status !== 'error' && (
+        <div style={{ ...hintLineStyle, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>
+          {t('update.cancelled')}
         </div>
       )}
     </div>
@@ -772,6 +1880,11 @@ export const UpdaterActionButton: React.FC<SlotActionProps & { form?: any }> = (
 // =====================================================================================
 
 export function apply(ctx: any) {
+  // DSH locale service: optional (older DSH versions have none) — always access it defensively.
+  const locale = getLocaleService(ctx);
+  const t = createTranslator(locale);
+  registerLocaleDictionaries(ctx, locale);
+
   let formInstance: any;
 
   const getForm = () => {
@@ -791,7 +1904,8 @@ export function apply(ctx: any) {
           id: 'dsh-plugins-update.action-button',
           order: -10 // Place before uninstall and enable switch
         },
-        (props: SlotActionProps) => React.createElement(UpdaterActionButton, { ...props, form: getForm() })
+        (props: SlotActionProps) =>
+          React.createElement(UpdaterActionButton, { ...props, form: getForm(), t, locale })
       )
     );
 
@@ -803,7 +1917,7 @@ export function apply(ctx: any) {
             name: 'plugins.bundle.config',
             key: 'dsh-plugins-update'
           },
-          () => React.createElement(RegistrySettingsCard, { form: f || getForm() })
+          () => React.createElement(RegistrySettingsCard, { form: f || getForm(), t, locale })
         )
       );
     };

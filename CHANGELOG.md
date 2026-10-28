@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-10-28
+
+### Added
+- GitHub-aware updates: resolve the repository default branch, pin releases to matching `vX.Y.Z` tags, and detect commit-level updates even when `package.json` version did not change.
+- Live update progress: asynchronous install jobs expose phase, rough percentage and an install-log tail; the UI shows a progress panel with a cancel button, and installs can be cancelled and rolled back.
+- Post-install verification and automatic rollback: a snapshot of `package.json` + `pnpm-lock.yaml` is restored when an install fails, is cancelled, or fails version/commit verification.
+- Configurable install timeout (`installTimeoutSeconds`, default 120s, 30-900) and `GITHUB_TOKEN`/`GH_TOKEN` support for private repositories (metadata reads + git credential env for installs).
+- Retry/backoff, ETag caching and environment proxy support (`HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`) for all GitHub/npm metadata requests.
+- Bilingual UI: zh/en dictionaries registered through the DSH locale service, live language switching in the updater button and registry settings card, and machine-readable API error codes localized by the client. Config schema descriptions are bilingual.
+
+### Changed
+- Registry completeness checks now read the resolved dependency set from `pnpm-lock.yaml` instead of only direct dependencies.
+- Semver comparison now implements full prerelease precedence (alpha/beta/rc) and ignores build metadata.
+
 ## [0.1.3] - 2026-10-27
 
 ### Fixed

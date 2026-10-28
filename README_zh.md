@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
-  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.1.3-brightgreen.svg" alt="Release" /></a>
+  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.1.4-brightgreen.svg" alt="Release" /></a>
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update"><img src="https://img.shields.io/badge/DeepSeek%20Harness-v0.2+-orange.svg" alt="DeepSeek Harness" /></a>
 </p>
 
@@ -28,7 +28,12 @@
   * **发现新版本**：醒目高亮显示 `⬆️ 更新至 vX.X.X` 按钮，一键升级；
   * **已是最新**：显示 `✓ 已是最新`，支持点击重新检测；
   * **正在更新**：显示 `正在更新...` Loading 状态并锁定操作；
-  * **更新完成**：弹窗提示成功并引导重载生效。
+  * **更新完成**：进度面板展示成功结果，并引导重载/重启生效。
+* **GitHub 深度支持**：自动解析仓库默认分支；优先按版本标签（如 `vX.Y.Z`）固定更新版本；即使仓库只提交代码、未升版本号，也能检测到「有新提交」并更新到最新提交。
+* **安全可回滚**：安装前快照 profile 清单与锁文件，安装后校验磁盘版本/提交；失败、取消或校验不通过时自动回滚到更新前状态。
+* **实时进度与取消**：更新过程中展示阶段、百分比与安装日志尾部，可随时取消；安装超时可配置（`installTimeoutSeconds`）。
+* **网络容错**：请求自动重试/退避、ETag 缓存、支持 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` 代理；私有仓库可通过 `GITHUB_TOKEN` / `GH_TOKEN` 读取元数据。
+* **中英双语界面**：全部 UI 文案接入 DSH 语言服务，跟随「设置 → 通用 → 语言」实时切换，无需重载页面。
 * **灵活的多源切换与自定义源**：
   * **自动模式（推荐）**：并发探测测速，并智能检查国内镜像包版本完整度，缺包时无缝切换官方源；
   * **npm 官方源**：直连官方，首发可用，绝无镜像同步滞后；
@@ -81,6 +86,16 @@ pnpm run build
 构建产物将自动生成到 `lib/` 目录中：
 * `lib/client.js`：注入到 DSH 渲染进程的前端 Slot 动作组件；
 * `lib/index.js`：运行于 DSH 宿主环境的后端更新服务。
+
+---
+
+## ⚠️ 已知限制
+
+* **GitHub 更新**：以仓库默认分支的 `package.json#version` 为检测依据；有对应 `vX.Y.Z` 标签时固定到该标签，否则安装默认分支最新提交（界面会提示）。未升版本号但确有新提交时，会显示「更新至最新提交」。
+* **私有仓库**：检查更新需配置 `GITHUB_TOKEN` / `GH_TOKEN`；安装阶段还需本机 git 凭据可用。
+* **代理**：读取 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` 环境变量；不读取系统代理设置界面。
+* **安装超时**：默认 120 秒，可在插件配置 `installTimeoutSeconds` 中调整（30–900 秒）。
+* **官方插件**：本插件不提供官方 DSH 插件的更新入口，请使用 DSH 自带的「更新」按钮。
 
 ---
 
