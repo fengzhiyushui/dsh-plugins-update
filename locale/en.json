@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Plugin Updater",
-    "description": "One-click updater for third-party DeepSeek Harness plugins, with GitHub tag/commit awareness, verified rollback-safe installs, live progress and a bilingual UI."
+    "title": "dsh-plugins-update",
+    "description": "Check for and install updates for third-party DeepSeek Harness plugins. Supports npm official, npmmirror and custom registries."
   }
 }

@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-10-29
+
+### Changed
+- Simplified the updater to the core flow: check version, one update button, post-install verification.
+- Removed the asynchronous job/progress/cancel system, progress panel, install log, update history and related UI.
+- Removed the existing gear button and settings modal; the native `plugins.bundle.config` card is now the only settings surface.
+- Update confirmation now uses DSH's native `Modal` and `Button` from `@deepseek-ai/dsh-client-ui-primitives`.
+- Removed `auto` registry mode, registry probing and package-completeness checks.
+- Kept npm official, npmmirror and custom registry list, plus optional fallback to npm official.
+- GitHub support reduced to reading `package.json#version` from the default branch; no tag/commit tracking.
+- Restored compact zh/en dictionaries through the DSH locale service; the update button and settings card follow the DSH language setting.\n- Kept the plugin display name fixed to `dsh-plugins-update` in both Chinese and English.
+
+### Fixed
+- Fixed the progress endpoint HTTP 400 caused by a GET route without `requestBody: 'buffered'`; the progress endpoint is now removed entirely.
+- Fixed false update failures: a transport error is now reconciled against the installed version on disk.
+- Fixed stale update prompts by removing the package-name-only check cache.
+- Fixed the icon metadata by declaring it in `package.json`.
+
+### Removed
+- Progress percentage, install log tail, cancel update and async job state.
+- GitHub tag pinning, commit-level detection, private repository tokens, proxy/ETag support.
+- Rollback commit verification and update history persistence.
 ## [0.1.4] - 2026-10-29
 
 ### Added
