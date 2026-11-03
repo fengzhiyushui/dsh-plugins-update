@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import Schema from '@deepseek-ai/schemastery';
 import {
+  CHECK_ALL_PATH,
   CHECK_PATH,
   DOMESTIC_REGISTRY,
   ERROR_CODES,
@@ -11,6 +12,7 @@ import {
   UPDATE_PATH,
   normalizeRegistryUrl,
   registryLabel,
+  type CheckAllResult,
   type CheckUpdateResult,
   type CustomRegistry,
   type DoUpdateResult,
@@ -209,18 +211,60 @@ function resolveProfileDir(packageName?: string): { dir: string; profileName: st
   return candidates.find(candidate => candidate.profileName === 'desktop') ?? candidates[0];
 }
 
-async function readBundleInfo(ctx: any, packageName: string): Promise<BundleInfo | undefined> {
+async function readAllBundles(ctx: any): Promise<BundleInfo[]> {
   for (const service of ['pluginManager', 'plugin-manager']) {
     try {
       const manager = ctx?.get?.(service);
       if (typeof manager?.listBundles !== 'function') continue;
       const bundles = await manager.listBundles();
-      if (!Array.isArray(bundles)) continue;
-      const bundle = bundles.find((item: any) => item && item.name === packageName);
-      if (bundle) return bundle as BundleInfo;
+      if (Array.isArray(bundles)) return bundles as BundleInfo[];
     } catch {}
   }
-  return undefined;
+  return [];
+}
+
+async function readBundleInfo(ctx: any, packageName: string): Promise<BundleInfo | undefined> {
+  const bundles = await readAllBundles(ctx);
+  return bundles.find((item: any) => item && item.name === packageName);
+}
+
+interface InstalledThirdPartyPackage {
+  packageName: string;
+  dir: string;
+  currentVersion: string;
+  source?: string;
+}
+
+async function listInstalledThirdPartyPackages(ctx: any): Promise<InstalledThirdPartyPackage[]> {
+  const bundles = await readAllBundles(ctx);
+  const bundleMap = new Map<string, BundleInfo>();
+  for (const b of bundles) {
+    if (b && typeof b.name === 'string') bundleMap.set(b.name, b);
+  }
+
+  const primaryProfile = resolveProfileDir();
+  const deps = readProfileDependencies(primaryProfile.dir);
+  const candidateNames = new Set<string>([...Object.keys(deps), ...bundleMap.keys()]);
+
+  const result: InstalledThirdPartyPackage[] = [];
+  for (const rawName of candidateNames) {
+    const packageName = readPackageName(rawName);
+    if (!packageName || isOfficialPackageName(packageName)) continue;
+    const bundle = bundleMap.get(packageName);
+    if (bundle?.official === true || bundle?.installed === false) continue;
+
+    const { dir } = resolveProfileDir(packageName);
+    const currentVersion = readInstalledVersion(dir, packageName);
+    if (!currentVersion) continue;
+
+    result.push({
+      packageName,
+      dir,
+      currentVersion,
+      source: bundle?.source
+    });
+  }
+  return result;
 }
 
 function bundleGuardError(packageName: string, bundle: BundleInfo | undefined): { error: string; errorCode: ErrorCode } | undefined {
@@ -745,8 +789,9 @@ export function apply(ctx: any, config: any) {
   };
 
   const runningProfiles = new Set<string>();
+  let inFlightCheckAll: Promise<Record<string, string>> | null = null;
 
-  // 1. Check for a newer version.
+  // 1. Check for a newer version of a single package.
   ctx.effect(
     () =>
       registerFetch({
@@ -799,6 +844,88 @@ export function apply(ctx: any, config: any) {
         }
       }),
     'dsh-plugins-update: check route'
+  );
+
+  // 1b. Batch check all installed third-party packages on startup (skipping already-known unapplied updates).
+  ctx.effect(
+    () =>
+      registerFetch({
+        path: CHECK_ALL_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (req: Request) => {
+          try {
+            const body = await parseJsonBody(req);
+            const force = body?.force === true;
+            const rawKnown: Record<string, unknown> =
+              body?.knownUpdates && typeof body.knownUpdates === 'object' ? body.knownUpdates : {};
+
+            const runBatch = async (): Promise<Record<string, string>> => {
+              const installed = await listInstalledThirdPartyPackages(ctx);
+              const settings = readSettings(config);
+              const updatable: Record<string, string> = {};
+              const toProbe: InstalledThirdPartyPackage[] = [];
+
+              for (const item of installed) {
+                const knownVer = !force ? readTargetVersion(rawKnown[item.packageName]) : undefined;
+                if (typeof knownVer === 'string' && compareSemver(knownVer, item.currentVersion) > 0) {
+                  // Already known to have an unapplied update; skip remote probe.
+                  updatable[item.packageName] = knownVer;
+                } else {
+                  toProbe.push(item);
+                }
+              }
+
+              const concurrency = 4;
+              let cursor = 0;
+              const workers = Array.from({ length: Math.min(concurrency, toProbe.length) }, async () => {
+                while (cursor < toProbe.length) {
+                  const current = toProbe[cursor++];
+                  if (!current) break;
+                  try {
+                    const { info } = await resolveRemotePackage(
+                      current.packageName,
+                      current.dir,
+                      settings,
+                      current.source
+                    );
+                    if (compareSemver(info.version, current.currentVersion) > 0) {
+                      updatable[current.packageName] = info.version;
+                    }
+                  } catch {
+                    // Ignore single-package network errors during background startup probe.
+                  }
+                }
+              });
+
+              await Promise.all(workers);
+              return updatable;
+            };
+
+            let task: Promise<Record<string, string>>;
+            if (!force && inFlightCheckAll) {
+              task = inFlightCheckAll;
+            } else {
+              task = runBatch().finally(() => {
+                if (inFlightCheckAll === task) inFlightCheckAll = null;
+              });
+              inFlightCheckAll = task;
+            }
+
+            const updatable = await task;
+            const result: CheckAllResult = { ok: true, updatable };
+            return jsonResponse(result);
+          } catch (error: any) {
+            const errorCode = error instanceof RemoteError ? error.errorCode : ERROR_CODES.unknown;
+            return errorResponse(
+              { updatable: {} },
+              errorCode,
+              redactSecrets(error?.message || '批量检查更新失败')
+            );
+          }
+        }
+      }),
+    'dsh-plugins-update: check-all route'
   );
 
   // 2. Run one synchronous update. No progress job and no polling.

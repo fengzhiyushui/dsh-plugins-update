@@ -8,6 +8,7 @@ export const LOCALE_NAMESPACE = 'dsh-plugins-update';
 
 /** HTTP paths served by the backend half. */
 export const CHECK_PATH = '/api/dsh-plugins-update/check';
+export const CHECK_ALL_PATH = '/api/dsh-plugins-update/check-all';
 export const UPDATE_PATH = '/api/dsh-plugins-update/update';
 
 /** Machine-readable error codes. */
@@ -58,6 +59,18 @@ export interface CheckUpdateResult {
   source?: string;
   isGithub?: boolean;
   registry?: string;
+  error?: string;
+  errorCode?: ErrorCode | string;
+}
+
+export interface CheckAllParams {
+  knownUpdates?: Record<string, string>;
+  force?: boolean;
+}
+
+export interface CheckAllResult {
+  ok: boolean;
+  updatable: Record<string, string>;
   error?: string;
   errorCode?: ErrorCode | string;
 }

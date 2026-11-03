@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Compact zh/en dictionaries for the updater UI.
  * Keys are flat; the client binds them through the DSH locale service.
  */
@@ -12,6 +12,9 @@ export const zh = {
   'action.success': '已更新',
   'action.retry': '重试',
   'action.updateFailed': '更新失败(重试)',
+
+  'badge.updateAvailable': '可更新',
+  'badge.sidebarTip': '{count} 个插件可更新',
 
   'confirm.title': '更新插件',
   'confirm.body': '确认将插件「{packageName}」更新至最新版本 v{version} 吗？',
@@ -73,6 +76,9 @@ export const en: Record<MessageKey, string> = {
   'action.success': 'Updated',
   'action.retry': 'Retry',
   'action.updateFailed': 'Update failed (retry)',
+
+  'badge.updateAvailable': 'Update available',
+  'badge.sidebarTip': '{count} plugin(s) have updates',
 
   'confirm.title': 'Update plugin',
   'confirm.body': 'Update plugin "{packageName}" to the latest version v{version}?',

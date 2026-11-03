@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-11-03
+
+### Added
+- Proactive update reminders via `shell.overlay` and `/api/dsh-plugins-update/check-all`: displays a DSH-native `Tag` (`可更新` / `Update available`) next to the enable switch on installed third-party plugin rows and a total updatable count badge on the sidebar `Plugins` button.
+- Persistent unapplied update reminders (`localStorage`) with startup probe deduplication: plugins already known to have a pending update skip redundant network requests on restart until updated or when the registry setting is changed.
+- Dual-path backend package enumeration (`ctx.installer` with direct disk `package.json` / `node_modules` fallback) and exception-isolated DOM mounting for safe degradation across DSH updates.
+
+### Changed
+- Entering a plugin's detail page always performs a live version check to detect newer cross-version releases (e.g. skipping an earlier update and upgrading directly to the latest release), with automatic fallback to the cached update version on transient network timeouts.
+
 ## [0.2.0] - 2026-10-29
 
 ### Changed

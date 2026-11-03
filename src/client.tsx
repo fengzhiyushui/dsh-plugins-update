@@ -1,6 +1,8 @@
-﻿import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Button, Modal } from '@deepseek-ai/dsh-client-ui-primitives';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Button, Modal, Tag } from '@deepseek-ai/dsh-client-ui-primitives';
 import {
+  CHECK_ALL_PATH,
   CHECK_PATH,
   DOMESTIC_REGISTRY,
   ERROR_CODES,
@@ -8,6 +10,7 @@ import {
   OFFICIAL_REGISTRY,
   UPDATE_PATH,
   normalizeRegistryUrl,
+  type CheckAllResult,
   type CheckUpdateResult,
   type CustomRegistry,
   type DoUpdateResult,
@@ -17,6 +20,7 @@ import {
 import { en, zh } from './locales.js';
 
 const CHECK_TIMEOUT_MS = 12_000;
+const BATCH_CHECK_TIMEOUT_MS = 25_000;
 const UPDATE_TIMEOUT_MS = 190_000;
 const SELF_PACKAGE_NAME = 'dsh-plugins-update';
 
@@ -167,6 +171,177 @@ function versionGte(installed: string | undefined, target: string | undefined): 
   return true;
 }
 
+// --- Persistent updatable plugins store & startup batch probe -------------------------
+
+const UPDATABLE_STORAGE_KEY = 'dsh-plugins-update:updatable-v1';
+const UPDATED_SESSION_KEY = 'dsh-plugins-update:updated-in-session-v1';
+
+const updatablePlugins = new Map<string, string>();
+const updatedInSession = new Map<string, string>();
+const updatableListeners = new Set<() => void>();
+let hasRunInitialBatchCheck = false;
+let batchCheckAbortController: AbortController | null = null;
+
+function loadStorageMap(storage: Storage | undefined, key: string, target: Map<string, string>): void {
+  try {
+    const raw = storage?.getItem(key);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof k === 'string' && typeof v === 'string' && k && v) {
+          target.set(k, v);
+        }
+      }
+    }
+  } catch {}
+}
+
+function saveStorageMap(storage: Storage | undefined, key: string, source: Map<string, string>): void {
+  try {
+    const obj: Record<string, string> = {};
+    for (const [k, v] of source.entries()) obj[k] = v;
+    storage?.setItem(key, JSON.stringify(obj));
+  } catch {}
+}
+
+try {
+  loadStorageMap(window.sessionStorage, UPDATABLE_STORAGE_KEY, updatablePlugins);
+  loadStorageMap(window.localStorage, UPDATABLE_STORAGE_KEY, updatablePlugins);
+  loadStorageMap(window.sessionStorage, UPDATED_SESSION_KEY, updatedInSession);
+} catch {}
+
+function persistUpdatablePlugins(): void {
+  try {
+    saveStorageMap(window.localStorage, UPDATABLE_STORAGE_KEY, updatablePlugins);
+  } catch {}
+}
+
+function notifyUpdatableChanged(): void {
+  for (const listener of updatableListeners) {
+    try {
+      listener();
+    } catch {}
+  }
+}
+
+function markPluginUpdatable(packageName: string, latestVersion: string): void {
+  const name = packageName.trim();
+  const ver = latestVersion.trim().replace(/^[v^~]/, '');
+  if (!name || !ver || name.startsWith('@deepseek-ai/')) return;
+  const alreadyUpdatedTo = updatedInSession.get(name);
+  if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) return;
+  if (updatablePlugins.get(name) === ver) {
+    notifyUpdatableChanged();
+    return;
+  }
+  updatablePlugins.set(name, ver);
+  persistUpdatablePlugins();
+  notifyUpdatableChanged();
+}
+
+function clearPluginUpdatable(packageName: string, updatedToVersion?: string): void {
+  const name = packageName.trim();
+  if (!name) return;
+  if (updatedToVersion) {
+    const cleanVer = updatedToVersion.trim().replace(/^[v^~]/, '');
+    if (cleanVer) {
+      updatedInSession.set(name, cleanVer);
+      try {
+        saveStorageMap(window.sessionStorage, UPDATED_SESSION_KEY, updatedInSession);
+      } catch {}
+    }
+  }
+  if (updatablePlugins.delete(name)) {
+    persistUpdatablePlugins();
+    notifyUpdatableChanged();
+  }
+}
+
+function runBatchCheck(force = false): void {
+  if (!force && hasRunInitialBatchCheck) return;
+  hasRunInitialBatchCheck = true;
+
+  if (batchCheckAbortController) {
+    if (!force) return;
+    batchCheckAbortController.abort();
+  }
+
+  const controller = new AbortController();
+  batchCheckAbortController = controller;
+  const timer = window.setTimeout(() => controller.abort(), BATCH_CHECK_TIMEOUT_MS);
+
+  const knownUpdates: Record<string, string> = {};
+  for (const [k, v] of updatablePlugins.entries()) {
+    knownUpdates[k] = v;
+  }
+
+  fetch(CHECK_ALL_PATH, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ knownUpdates, force }),
+    signal: controller.signal
+  })
+    .then(res => res.json().catch(() => null))
+    .then((payload: CheckAllResult | null) => {
+      if (batchCheckAbortController !== controller) return;
+      if (!payload || typeof payload !== 'object' || payload.ok === false) return;
+      if (!payload.updatable || typeof payload.updatable !== 'object') return;
+
+      const nextMap = new Map<string, string>();
+      for (const [rawName, rawVer] of Object.entries(payload.updatable)) {
+        if (typeof rawName !== 'string' || typeof rawVer !== 'string') continue;
+        const name = rawName.trim();
+        const ver = rawVer.trim().replace(/^[v^~]/, '');
+        if (!name || !ver || name.startsWith('@deepseek-ai/')) continue;
+        const alreadyUpdatedTo = updatedInSession.get(name);
+        if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) continue;
+        nextMap.set(name, ver);
+      }
+
+      let changed = nextMap.size !== updatablePlugins.size;
+      if (!changed) {
+        for (const [k, v] of nextMap.entries()) {
+          if (updatablePlugins.get(k) !== v) {
+            changed = true;
+            break;
+          }
+        }
+      }
+
+      if (changed) {
+        updatablePlugins.clear();
+        for (const [k, v] of nextMap.entries()) {
+          updatablePlugins.set(k, v);
+        }
+        persistUpdatablePlugins();
+        notifyUpdatableChanged();
+      } else {
+        persistUpdatablePlugins();
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      window.clearTimeout(timer);
+      if (batchCheckAbortController === controller) {
+        batchCheckAbortController = null;
+      }
+    });
+}
+
+function useUpdatableSnapshot(): [string, string][] {
+  const [entries, setEntries] = useState<[string, string][]>(() => Array.from(updatablePlugins.entries()));
+  useEffect(() => {
+    const sync = () => setEntries(Array.from(updatablePlugins.entries()));
+    updatableListeners.add(sync);
+    sync();
+    return () => {
+      updatableListeners.delete(sync);
+    };
+  }, []);
+  return entries;
+}
+
 function useConfigFormState(form: any): {
   settings: PluginSettings;
   writable: boolean;
@@ -267,7 +442,10 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
 
   const select = async (value: string) => {
     if (!writable) return;
-    if (await updateField('registry', value)) showNotice('settings.notice.registryUpdated');
+    if (await updateField('registry', value)) {
+      showNotice('settings.notice.registryUpdated');
+      runBatchCheck(true);
+    }
   };
 
   const addCustom = async () => {
@@ -295,13 +473,17 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
     setUrl('');
     setAdding(false);
     showNotice('settings.notice.customAdded');
+    runBatchCheck(true);
   };
 
   const removeCustom = async (target: string) => {
     const normalized = normalizeRegistryUrl(target);
     const next = settings.customRegistries.filter(item => normalizeRegistryUrl(item.url) !== normalized);
     await updateField('customRegistries', next);
-    if (normalizeRegistryUrl(settings.registry) === normalized) await updateField('registry', 'npmjs');
+    if (normalizeRegistryUrl(settings.registry) === normalized) {
+      await updateField('registry', 'npmjs');
+      runBatchCheck(true);
+    }
     showNotice('settings.notice.customRemoved');
   };
 
@@ -438,6 +620,24 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     setStatus('checking');
     setMessage(null);
 
+    const tryFallbackCachedUpdate = (): CheckUpdateResult | null => {
+      const cachedVer = updatablePlugins.get(packageName);
+      if (cachedVer && !versionGte(clientVersion, cachedVer)) {
+        const fallbackResult: CheckUpdateResult = {
+          ok: true,
+          packageName,
+          currentVersion: clientVersion,
+          latestVersion: cachedVer,
+          hasUpdate: true
+        };
+        setCheckResult(fallbackResult);
+        setStatus('has_update');
+        setMessage(null);
+        return fallbackResult;
+      }
+      return null;
+    };
+
     try {
       const response = await fetch(CHECK_PATH, {
         method: 'POST',
@@ -449,16 +649,30 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       if (token !== tokenRef.current || !mountedRef.current) return null;
       if (!payload || typeof payload !== 'object') throw new Error(`HTTP ${response.status}`);
       if (payload.ok === false) {
+        if (payload.errorCode === ERROR_CODES.notInstalled || payload.errorCode === ERROR_CODES.officialPlugin) {
+          clearPluginUpdatable(packageName);
+        } else if (payload.errorCode === ERROR_CODES.offline || payload.errorCode === ERROR_CODES.timeout) {
+          const fallback = tryFallbackCachedUpdate();
+          if (fallback) return fallback;
+        }
         setCheckResult(null);
         setStatus('error');
         setMessage({ key: '', params: { text: errorText(t, payload.errorCode, payload.error) } });
         return payload;
       }
       setCheckResult(payload);
-      setStatus(payload.hasUpdate ? 'has_update' : 'up_to_date');
+      if (payload.hasUpdate && payload.latestVersion) {
+        markPluginUpdatable(packageName, payload.latestVersion);
+        setStatus('has_update');
+      } else {
+        clearPluginUpdatable(packageName, payload.currentVersion || clientVersion);
+        setStatus('up_to_date');
+      }
       return payload;
     } catch (error: any) {
       if (token !== tokenRef.current || !mountedRef.current) return null;
+      const fallback = tryFallbackCachedUpdate();
+      if (fallback) return fallback;
       setCheckResult(null);
       setStatus('error');
       setMessage({ key: error?.name === 'AbortError' ? 'check.timeout' : 'check.network' });
@@ -503,6 +717,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       }
       const version = payload.targetVersion || targetVersion || clientVersion;
       successVersionRef.current = version;
+      clearPluginUpdatable(packageName, version);
       setStatus('success');
       setMessage({
         key: packageName === SELF_PACKAGE_NAME ? 'update.selfUpdate' : 'update.success',
@@ -514,6 +729,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       if (checked && versionGte(checked.currentVersion, targetVersion)) {
         const version = checked.currentVersion || targetVersion || clientVersion;
         successVersionRef.current = version;
+        clearPluginUpdatable(packageName, version);
         setStatus('success');
         setMessage({
           key: packageName === SELF_PACKAGE_NAME ? 'update.selfUpdate' : 'update.success',
@@ -602,6 +818,261 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
   );
 };
 
+// --- Proactive & persistent update reminders (Sidebar count & Installed list badges) -
+
+const SIDEBAR_BADGE_ATTR = 'data-dsh-updater-sidebar-badge';
+const ROW_BADGE_ATTR = 'data-dsh-updater-row-badge';
+
+function resolvePluginsPanelLabel(slots: any): string | null {
+  try {
+    const entries =
+      typeof slots?.entriesOfSlot === 'function'
+        ? slots.entriesOfSlot('sidebar.panellist')
+        : typeof slots?.entries === 'function'
+          ? slots.entries('sidebar.panellist')
+          : null;
+    if (Array.isArray(entries)) {
+      const pluginsEntry = entries.find((item: any) => item?.options?.id === 'plugins');
+      const rawLabel = pluginsEntry?.options?.label;
+      const resolved = typeof rawLabel === 'function' ? rawLabel() : rawLabel;
+      if (typeof resolved === 'string' && resolved.trim()) return resolved.trim();
+    }
+  } catch {}
+  return null;
+}
+
+function findSidebarPluginsButton(slots: any): HTMLElement | null {
+  try {
+    const dynamicLabel = resolvePluginsPanelLabel(slots);
+    const candidateLabels = Array.from(new Set([dynamicLabel, '插件', 'Plugins'].filter(Boolean) as string[]));
+
+    for (const label of candidateLabels) {
+      const escaped = typeof CSS !== 'undefined' && typeof CSS.escape === 'function' ? CSS.escape(label) : label;
+      const btn = document.querySelector<HTMLElement>(`button[aria-label="${escaped}"]`);
+      if (btn && !btn.closest('[data-plugin-panel]')) return btn;
+    }
+
+    const buttons = document.querySelectorAll<HTMLElement>('button');
+    for (const btn of buttons) {
+      if (btn.closest('[data-plugin-panel]')) continue;
+      for (const child of Array.from(btn.children)) {
+        if (child.tagName === 'SPAN' && candidateLabels.includes((child.textContent || '').trim())) {
+          return btn;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+interface UpdateRemindersOverlayProps {
+  slots: any;
+  t: Translator;
+  locale?: LocaleServiceLike;
+}
+
+interface RowMountTarget {
+  packageName: string;
+  latestVersion: string;
+  host: HTMLElement;
+  card: HTMLLIElement;
+}
+
+const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, t, locale }) => {
+  useLocaleRevision(locale);
+  const updatableEntries = useUpdatableSnapshot();
+
+  const [sidebarHost, setSidebarHost] = useState<HTMLElement | null>(null);
+  const [rowTargets, setRowTargets] = useState<RowMountTarget[]>([]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      runBatchCheck(false);
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  const syncDomTargets = useCallback(() => {
+    try {
+      // 1. Sync Sidebar "Plugins" count badge host (Image 4)
+      const pluginsBtn = findSidebarPluginsButton(slots);
+      if (pluginsBtn) {
+        let host = pluginsBtn.querySelector<HTMLElement>(`span[${SIDEBAR_BADGE_ATTR}="true"]`);
+        if (!host) {
+          host = document.createElement('span');
+          host.setAttribute(SIDEBAR_BADGE_ATTR, 'true');
+          pluginsBtn.appendChild(host);
+        }
+        const isCollapsed = pluginsBtn.clientWidth > 0 && pluginsBtn.clientWidth <= 48;
+        if (updatablePlugins.size > 0) {
+          if (isCollapsed) {
+            if (window.getComputedStyle(pluginsBtn).position === 'static') {
+              pluginsBtn.style.position = 'relative';
+            }
+            host.style.cssText =
+              'position: absolute; top: 2px; right: 2px; display: inline-flex; align-items: center; pointer-events: none; transform: scale(0.8); transform-origin: top right;';
+          } else {
+            host.style.cssText =
+              'margin-left: auto; display: inline-flex; align-items: center; flex: none; pointer-events: none;';
+          }
+        } else {
+          host.style.cssText = 'display: none;';
+        }
+        setSidebarHost(prev => (prev === host ? prev : host));
+      } else {
+        setSidebarHost(prev => (prev === null ? null : null));
+      }
+
+      // 2. Sync Installed Plugins list row badges at right-arrow position (Image 3)
+      const cards = Array.from(document.querySelectorAll<HTMLLIElement>('li[data-plugin-package]'));
+      if (cards.length > 0 && !document.querySelector('[data-plugin-detail]')) {
+        const installedSet = new Set<string>();
+        for (const card of cards) {
+          const name = card.getAttribute('data-plugin-package');
+          if (name) installedSet.add(name);
+        }
+        // If the main installed list is rendered, prune any package that was uninstalled
+        if (installedSet.has(SELF_PACKAGE_NAME)) {
+          for (const [trackedPkg] of updatablePlugins.entries()) {
+            if (!installedSet.has(trackedPkg)) {
+              clearPluginUpdatable(trackedPkg);
+            }
+          }
+        }
+      }
+
+      const nextRowTargets: RowMountTarget[] = [];
+      for (const card of cards) {
+        const pkgName = card.getAttribute('data-plugin-package') || '';
+        if (!pkgName) continue;
+        const latestVersion = updatablePlugins.get(pkgName);
+        let host = card.querySelector<HTMLElement>(`span[${ROW_BADGE_ATTR}="${pkgName}"]`);
+
+        if (latestVersion) {
+          if (!host) {
+            host = document.createElement('span');
+            host.setAttribute(ROW_BADGE_ATTR, pkgName);
+            host.style.cssText = 'display: inline-flex; align-items: center; flex: none; cursor: pointer;';
+            const switchEl = card.querySelector<HTMLElement>('[role="switch"]');
+            if (switchEl && switchEl.parentElement) {
+              switchEl.parentElement.insertBefore(host, switchEl);
+            } else {
+              const fallbackEnd = card.firstElementChild?.lastElementChild || card;
+              fallbackEnd.insertBefore(host, fallbackEnd.firstChild);
+            }
+          }
+          nextRowTargets.push({
+            packageName: pkgName,
+            latestVersion,
+            host,
+            card
+          });
+        } else if (host) {
+          host.remove();
+        }
+      }
+
+      setRowTargets(prev => {
+        if (
+          prev.length === nextRowTargets.length &&
+          prev.every(
+            (item, i) =>
+              item.packageName === nextRowTargets[i].packageName &&
+              item.latestVersion === nextRowTargets[i].latestVersion &&
+              item.host === nextRowTargets[i].host
+          )
+        ) {
+          return prev;
+        }
+        return nextRowTargets;
+      });
+    } catch {}
+  }, [slots]);
+
+  useEffect(() => {
+    syncDomTargets();
+  }, [syncDomTargets, updatableEntries]);
+
+  useEffect(() => {
+    let rafId = 0;
+    const scheduleSync = () => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        syncDomTargets();
+      });
+    };
+
+    const observer = new MutationObserver(mutations => {
+      for (const m of mutations) {
+        const targetEl = m.target instanceof Element ? m.target : null;
+        if (
+          targetEl &&
+          (targetEl.hasAttribute(SIDEBAR_BADGE_ATTR) ||
+            targetEl.hasAttribute(ROW_BADGE_ATTR) ||
+            targetEl.closest(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}]`))
+        ) {
+          continue;
+        }
+        scheduleSync();
+        break;
+      }
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+
+    window.addEventListener('resize', scheduleSync);
+    syncDomTargets();
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', scheduleSync);
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, [syncDomTargets]);
+
+  useEffect(() => {
+    return () => {
+      document.querySelectorAll(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}]`).forEach(el => el.remove());
+    };
+  }, []);
+
+  const count = updatableEntries.length;
+
+  return (
+    <>
+      {sidebarHost &&
+        count > 0 &&
+        createPortal(
+          <span title={t('badge.sidebarTip', { count })} style={{ display: 'inline-flex', alignItems: 'center' }}>
+            <Tag tone="info">{String(count)}</Tag>
+          </span>,
+          sidebarHost
+        )}
+      {rowTargets.map(({ packageName, latestVersion, host, card }) =>
+        createPortal(
+          <span
+            key={packageName}
+            title={`v${latestVersion}`}
+            onClick={event => {
+              event.stopPropagation();
+              const openBtn = card.querySelector<HTMLElement>('button:not([role="switch"])');
+              openBtn?.click();
+            }}
+            style={{ display: 'inline-flex', alignItems: 'center' }}
+          >
+            <Tag tone="info">{t('badge.updateAvailable')}</Tag>
+          </span>,
+          host
+        )
+      )}
+    </>
+  );
+};
+
 // --- Client entry ---------------------------------------------------------------------
 
 export function apply(ctx: any) {
@@ -616,7 +1087,19 @@ export function apply(ctx: any) {
     return formInstance;
   };
 
-  if (!ctx.slots?.inject || !ctx.slots?.register) return;
+  const slots = ctx.slots;
+  if (!slots?.inject || !slots?.register) return;
+
+  slots.inject('shell.overlay', () =>
+    slots.register(
+      {
+        name: 'shell.overlay',
+        id: 'dsh-plugins-update.reminders-overlay',
+        order: 50
+      },
+      (props: any) => React.createElement(UpdateRemindersOverlay, { ...props, slots, t, locale })
+    )
+  );
 
   ctx.slots.inject('plugins.detail.actions', () =>
     ctx.slots.register(
