@@ -1,5 +1,7 @@
 # dsh-plugins-update
 
+> 本项目的大部分功能已被dsh0.2.2-rc.1内置，项目转入归档状态。
+
 <p align="center">
   <img src="icon.svg" width="80" height="80" alt="dsh-plugins-update icon" />
 </p>
