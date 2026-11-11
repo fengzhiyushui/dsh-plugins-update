@@ -5,7 +5,8 @@
 </p>
 
 <p align="center">
-  <b>A minimal one-click updater for third-party DeepSeek Harness (DSH) plugins.</b>
+  <b>A lightweight updater & power-tool companion for third-party DeepSeek Harness (DSH) plugins.</b><br>
+  Proactive Global Reminders · One-Click GitHub Plugin Updates · Smart Native UI Coexistence · Release Age Policy Bypass
 </p>
 
 <p align="center">
@@ -15,27 +16,29 @@
 
 ---
 
-Adds an update button to every third-party plugin detail page in DSH, with proactive update reminders on the sidebar and installed plugin list.
+A minimal and powerful companion for DeepSeek Harness third-party plugins. Fully integrated with DSH 0.2.2+ native plugin management, filling critical native gaps with **proactive global sidebar badges**, **exclusive one-click updates for GitHub repositories**, and **supply chain release-age policy bypass**, all powered by a sub-second HTTP detection engine.
 
 ## Features
 
-- Injected into the native `plugins.detail.actions` slot;
-- Proactive startup update reminders: displays an `Update available` tag on updatable rows in the installed plugin list and a total count badge on the sidebar `Plugins` entry;
-- Smart probe deduplication: unapplied update reminders persist across restarts without re-probing known updatable plugins on startup, while opening a plugin's detail page always performs a live check (with cached fallback on offline/timeout) to catch newer cross-version releases;
-- Checks npm packages and minimal GitHub sources for newer versions;
-- One-click update with post-install disk version verification;
-- Registry configuration: npm official, npmmirror and custom registries;
-- Optional fallback to the npm official registry;
-- Uses DSH's native `Modal` and `Tag` components;
-- Update button, reminder badges, and settings card follow the DSH language setting.
+- **Exclusive GitHub Plugin Update Support**: Solves DSH native's limitation where non-registry Git plugins cannot be updated in-place, enabling one-click upgrades to the latest commit;
+- **Proactive Global Reminders**: Runs lightning-fast startup/background probes to display a numeric badge on the sidebar `Plugins` icon and native-style `Update available` tags on plugin rows;
+- **Smart Coexistence & Conflict Prevention**:
+  - Automatically hides redundant action buttons on standard npm plugin pages when up to date, yielding full prominence to DSH native version cards;
+  - Offers a clean `⚡ Fast Update` option when an update is available without visual clutter;
+- **Release Age Policy Bypass**: Automatically catches and bypasses pnpm supply chain restrictions (`minimumReleaseAge`), letting users install brand-new releases immediately;
+- **Sub-Second Concurrent Detection**: Direct async HTTP fetching over global CDN and domestic mirrors, eliminating the heavy overhead of spawning multiple `pnpm view` subprocesses;
+- **Multi-Registry & Fallback**: Supports npm official, npmmirror, and custom registries with automatic fallback to npm official upon mirror failure;
+- **Native Design System & Bilingual (i18n)**: UI components built entirely with DSH native primitives (`Modal`, `Button`, `Tag`), adapting seamlessly to English and Chinese locales.
 
-Not included: progress percentage, install logs, cancellation, update history, GitHub tag/commit tracking.
+## Comparison with DSH Native
 
-## Compatibility & Protection Mechanisms
-
-- **Dual-Path Backend Detection**: Startup batch checks read DSH's runtime `installer` service first and automatically fall back to scanning `package.json` and `node_modules/*/package.json` on disk, ensuring update detection remains unaffected by DSH internal API changes.
-- **Semantic Anchoring & Silent Degradation**: Sidebar count badges and plugin row tags anchor on semantic attributes (`li[data-plugin-package]`, WAI-ARIA `[role="switch"]`, and `sidebar.panellist` metadata) rather than hashed CSS class names, and all DOM operations are isolated inside `try / catch` boundaries. If a future DSH major update restructures the outer layout, badges degrade silently without impacting conversations, page rendering, or the detail-page update button.
-- **Cross-Version & Offline Fallback**: If a plugin skips an intermediate release (e.g. `0.1` -> `0.2`), entering its detail page triggers a live version probe to upgrade directly to the newest version (`0.2`), and falls back to the cached update target if a transient network timeout occurs.
+| Scenario | DSH 0.2.2 Native | With `dsh-plugins-update` |
+|---|---|---|
+| **GitHub Plugins** | ❌ Refuses updates; requires manual uninstall/reinstall | ✅ **Full one-click updates** directly from the repository |
+| **Proactive Awareness** | ❌ No badges; only checks when opening the panel | ✅ **Sidebar numeric badge** & installed list row tags |
+| **Newly Published Releases** | ❌ Blocked by `minimumReleaseAge` policy window | ✅ **Auto-bypasses policy window** for instant updates |
+| **Detection Speed** | ⚠️ Spawns external `pnpm view` subprocesses repeatedly | ⚡ **Pure lightweight HTTP**, settles in <500ms |
+| **Detail Page UI** | Native version section & update button | Native-first, secondary channel on demand, zero duplicate buttons |
 
 ## Install
 
@@ -43,6 +46,12 @@ In DSH open **Plugins → Add plugin** and enter:
 
 ```text
 fengzhiyushui/dsh-plugins-update
+```
+
+Or by npm package name:
+
+```text
+dsh-plugins-update
 ```
 
 Or use the DSH CLI:
