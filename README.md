@@ -14,6 +14,10 @@
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.2.2-brightgreen.svg" alt="Release" /></a>
 </p>
 
+<p align="center">
+  <b>English</b> | <a href="README_zh.md">简体中文</a>
+</p>
+
 ---
 
 A minimal and powerful companion for DeepSeek Harness third-party plugins. Fully integrated with DSH 0.2.2+ native plugin management, filling critical native gaps with **proactive global sidebar badges**, **exclusive one-click updates for GitHub repositories**, and **supply chain release-age policy bypass**, all powered by a sub-second HTTP detection engine.

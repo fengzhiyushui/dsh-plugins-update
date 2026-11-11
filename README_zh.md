@@ -14,6 +14,10 @@
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.2.2-brightgreen.svg" alt="Release" /></a>
 </p>
 
+<p align="center">
+  <a href="README.md">English</a> | <b>简体中文</b>
+</p>
+
 ---
 
 专为 DeepSeek Harness 设计的轻量级第三方插件更新增强插件。深度兼容 DSH 0.2.2+ 原生插件管理器，补齐原生短板，提供**全局主动角标提醒**、**GitHub 仓库来源插件一键更新**与**发版安全观察期穿透**，同时保持毫秒级极速并发检测与纯净的原生界面体验。
