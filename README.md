@@ -1,7 +1,5 @@
 # dsh-plugins-update
 
-> Most features of this project have been built into dsh 0.2.2-rc.1, and the project is now archived.
-
 <p align="center">
   <img src="icon.svg" width="80" height="80" alt="dsh-plugins-update icon" />
 </p>
