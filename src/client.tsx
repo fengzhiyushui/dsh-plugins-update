@@ -585,6 +585,12 @@ interface UpdaterActionButtonProps extends SlotActionProps {
   locale?: LocaleServiceLike;
 }
 
+function isGithubPackage(pkg: SlotActionProps['subject']['pkg'], checkResult?: CheckUpdateResult | null): boolean {
+  if (checkResult?.isGithub === true) return true;
+  const source = typeof pkg?.source === 'string' ? pkg.source : '';
+  return /github:|github\.com/i.test(source);
+}
+
 export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subject, t, locale }) => {
   useLocaleRevision(locale);
   const pkg = subject?.pkg;
@@ -600,6 +606,8 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
   const tokenRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
   const successVersionRef = useRef<string | null>(null);
+
+  const isGithub = isGithubPackage(pkg, checkResult);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -747,12 +755,73 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
 
   if (!renderable) return null;
 
+  // On standard npm plugins, DSH 0.2.2 native already renders the VersionSection with "已是最新版本" / "重新检查",
+  // so we keep the header clean and avoid duplicate UI when there is no update or while checking.
+  if (!isGithub && (status === 'checking' || status === 'up_to_date')) {
+    return null;
+  }
+
   const latestVersion = checkResult?.latestVersion || '';
+  const messageText = message ? (message.key ? t(message.key, message.params) : String(message.params?.text || '')) : '';
+
+  // Render for npm packages with an update available:
+  // Render an unobtrusive outline button for fast/instant update (bypassing minimumReleaseAge),
+  // which co-exists harmoniously with DSH native's primary update button without visual conflict.
+  if (!isGithub) {
+    return (
+      <div style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+        {status === 'has_update' && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setConfirmOpen(true)}
+            title={t('action.fastUpdateTip')}
+          >
+            {t('action.fastUpdate', { version: latestVersion })}
+          </Button>
+        )}
+        {status === 'updating' && (
+          <span style={{ fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>{t('action.updating')}</span>
+        )}
+        {status === 'success' && (
+          <span style={{ fontSize: 12, color: '#15803d' }}>{messageText || t('action.success')}</span>
+        )}
+        {status === 'error' && (
+          <Button variant="outline" size="sm" onClick={() => void fetchCheck()}>
+            {t('action.retry')}
+          </Button>
+        )}
+        {messageText && status !== 'success' && (
+          <div style={{ fontSize: 12, color: status === 'error' ? '#b91c1c' : '#15803d', maxWidth: 360 }}>{messageText}</div>
+        )}
+        <Modal
+          open={confirmOpen}
+          onClose={() => setConfirmOpen(false)}
+          title={t('confirm.title')}
+          closeLabel={t('confirm.close')}
+          description={t('confirm.body', { packageName, version: latestVersion })}
+          footer={
+            <>
+              <Button variant="outline" onClick={() => setConfirmOpen(false)}>
+                {t('confirm.cancel')}
+              </Button>
+              <Button variant="primary" onClick={() => void runUpdate()}>
+                {t('confirm.ok')}
+              </Button>
+            </>
+          }
+        />
+      </div>
+    );
+  }
+
+  // Render for GitHub packages:
+  // DSH native does NOT support updating GitHub packages, so our plugin is the primary update interface.
   const buttonLabel =
     status === 'checking'
       ? t('action.checking')
       : status === 'has_update'
-        ? t('action.updateTo', { version: latestVersion })
+        ? t('action.githubUpdate', { version: latestVersion })
         : status === 'updating'
           ? t('action.updating')
           : status === 'success'
@@ -771,28 +840,16 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     void fetchCheck();
   };
 
-  // The empty key marks a server-provided fallback string stored in params.text.
-  const messageText = message ? (message.key ? t(message.key, message.params) : String(message.params?.text || '')) : '';
-
   return (
     <div style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
-      <button
-        type="button"
+      <Button
+        variant={status === 'has_update' ? 'primary' : 'outline'}
+        size="sm"
         onClick={onButtonClick}
         disabled={status === 'checking' || status === 'updating'}
-        style={{
-          padding: '6px 14px',
-          borderRadius: 6,
-          border: '1px solid var(--dsw-alias-border-l1, #cbd5e1)',
-          background: status === 'has_update' ? '#2563eb' : 'var(--dsw-alias-bg-elevated, #ffffff)',
-          color: status === 'has_update' ? '#fff' : 'var(--dsw-alias-label-primary, #1e293b)',
-          cursor: status === 'checking' || status === 'updating' ? 'default' : 'pointer',
-          fontWeight: 500,
-          fontSize: 13
-        }}
       >
         {buttonLabel}
-      </button>
+      </Button>
       {messageText && (
         <div style={{ fontSize: 12, color: status === 'error' ? '#b91c1c' : '#15803d', maxWidth: 360 }}>{messageText}</div>
       )}
@@ -948,7 +1005,15 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         const latestVersion = updatablePlugins.get(pkgName);
         let host = card.querySelector<HTMLElement>(`span[${ROW_BADGE_ATTR}="${pkgName}"]`);
 
-        if (latestVersion) {
+        // Avoid duplicate tags if DSH native already displayed its own "可更新" (statusUpdateAvailable) Tag
+        const hasNativeUpdateTag = Array.from(card.querySelectorAll('[data-dsw-tag], span')).some(
+          el =>
+            el.textContent?.trim() === t('badge.updateAvailable') &&
+            !el.hasAttribute(ROW_BADGE_ATTR) &&
+            !el.closest(`[${ROW_BADGE_ATTR}]`)
+        );
+
+        if (latestVersion && !hasNativeUpdateTag) {
           if (!host) {
             host = document.createElement('span');
             host.setAttribute(ROW_BADGE_ATTR, pkgName);

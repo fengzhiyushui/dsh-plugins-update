@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-11-11
+
+### Added
+- Smart complementary integration with DSH 0.2.2 native plugin manager:
+  - Exclusive full update support for GitHub-sourced plugins (which DSH native does not support).
+  - Fast instant update option (`⚡ 极速更新` / `⚡ Fast Update`) on npm plugins to bypass pnpm release age policy (`minimumReleaseAge`) restrictions.
+  - Native Tag deduplication in the installed plugin list: seamlessly yields to DSH native's update tags when present.
+
+### Changed
+- Replaced custom HTML buttons with native DSH primitives (`Button` from `@deepseek-ai/dsh-client-ui-primitives`).
+- Eliminated redundant buttons on standard npm plugin detail pages when up to date or checking, avoiding UI clashes with DSH native version sections.
+
 ## [0.2.1] - 2026-11-03
 
 ### Added

@@ -1,5 +1,5 @@
 import * as esbuild from 'esbuild';
-import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf8'));
@@ -63,6 +63,8 @@ ${clientCode}
   try {
     console.log('📝 Generating TypeScript declarations...');
     execSync('npx tsc --emitDeclarationOnly', { stdio: 'inherit' });
+    rmSync('lib/locales.d.ts', { force: true });
+    rmSync('lib/dsh-primitives.d.ts', { force: true });
     console.log('✅ Generated type declarations');
   } catch (err) {
     console.warn('⚠️ TypeScript declaration generation skipped or failed:', err.message);
