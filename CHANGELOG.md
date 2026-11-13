@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-11-13
+
+### Added
+- Added the `alwaysShowDetailButton` configuration toggle (`始终在插件详情页显示「极速更新」按钮` / `Always show the Fast Update button on plugin detail pages`, defaulting to `false`), persisted via plugin config and synced to detail-page actions.
+- Added a hard `pnpm exec tsc --noEmit` typecheck gate before build in `.github/workflows/ci.yml`.
+- Added conditional best-effort `node_modules` offline alignment (`pnpm install --frozen-lockfile --prefer-offline --ignore-scripts`) during failure/verification rollback when the installed version drifted from the restored manifest.
+
+### Changed
+- Adopted native-first detail-page layering (Plan A): standard npm plugins on the official `npmjs` registry yield detail-page updates to DSH native by default, while GitHub-sourced plugins, `npmmirror`/custom registries, and explicit opt-in via `alwaysShowDetailButton` retain the single-step `⚡ Fast Update` channel.
+- Upgraded `fetchGithubPackageJson` from sequential fallback to true `Promise.any` concurrent CDN racing (`cdn.jsdelivr.net` vs `raw.githubusercontent.com`), aborting slower requests immediately via shared `AbortController`.
+- Unified `parseSemver`, `compareSemver`, and `versionGte` (including full prerelease precedence) in shared `src/types.ts` across frontend and backend.
+- Disabled pnpm update-notifier, fund, and audit checks (`--config.update-notifier=false`, env flags) in child install/rollback processes.
+- Updated `README.md` and `README_zh.md` with DSH `0.2.2-rc.1` native update notice, full plugin introduction, and local test version note (`0.2.2-rc.1`).
+
+### Fixed
+- Fixed missing `"可更新"` / `Update available` row badges in the installed plugin list: anchored badge portals into the plugin title row instead of `.bundleToggle`, prevented `hasNativeUpdateTag` from matching our own rendered badge, and ignored our own badge DOM mutations in `MutationObserver`.
+- Fixed GitHub post-install verification race when an upstream repository bumps its version between check and install (`compareSemver(installedVersion, targetVersion) >= 0`), reporting the actual installed version.
+- Reset detail-page action state immediately when switching `packageName`, cleared stale badge entries as soon as `clientVersion >= cachedVersion`, and surfaced `rollback: failed` status clearly in error notices.
+
 ## [0.2.2] - 2026-11-11
 
 ### Added

@@ -10,6 +10,7 @@ import {
   OFFICIAL_REGISTRY,
   UPDATE_PATH,
   normalizeRegistryUrl,
+  versionGte,
   type CheckAllResult,
   type CheckUpdateResult,
   type CustomRegistry,
@@ -27,7 +28,8 @@ const SELF_PACKAGE_NAME = 'dsh-plugins-update';
 const DEFAULT_SETTINGS: PluginSettings = {
   registry: 'npmjs',
   customRegistries: [],
-  fallbackToOfficial: true
+  fallbackToOfficial: true,
+  alwaysShowDetailButton: false
 };
 
 type TranslateParams = Record<string, string | number>;
@@ -161,20 +163,85 @@ function isOfficialPackage(pkg: SlotActionProps['subject']['pkg']): boolean {
   return pkg?.official === true || (typeof pkg?.name === 'string' && pkg.name.startsWith('@deepseek-ai/'));
 }
 
-function versionGte(installed: string | undefined, target: string | undefined): boolean {
-  if (!installed || !target) return false;
-  const a = installed.trim().replace(/^[v^~]/, '').split('-')[0].split('.').map(Number);
-  const b = target.trim().replace(/^[v^~]/, '').split('-')[0].split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
-  }
-  return true;
-}
-
 // --- Persistent updatable plugins store & startup batch probe -------------------------
 
 const UPDATABLE_STORAGE_KEY = 'dsh-plugins-update:updatable-v1';
 const UPDATED_SESSION_KEY = 'dsh-plugins-update:updated-in-session-v1';
+const UI_PREFS_STORAGE_KEY = 'dsh-plugins-update:ui-prefs-v1';
+
+interface UiPrefs {
+  registryUrl: string;
+  alwaysShowDetailButton: boolean;
+}
+
+const uiPrefs: UiPrefs = {
+  registryUrl: OFFICIAL_REGISTRY,
+  alwaysShowDetailButton: false
+};
+const uiPrefsListeners = new Set<() => void>();
+
+function loadUiPrefs(): void {
+  try {
+    const raw = window.localStorage?.getItem(UI_PREFS_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      const normalized = normalizeRegistryUrl(parsed.registryUrl);
+      if (normalized) uiPrefs.registryUrl = normalized;
+      if (typeof parsed.alwaysShowDetailButton === 'boolean') {
+        uiPrefs.alwaysShowDetailButton = parsed.alwaysShowDetailButton;
+      }
+    }
+  } catch {}
+}
+
+loadUiPrefs();
+
+function notifyUiPrefsChanged(): void {
+  try {
+    window.localStorage?.setItem(UI_PREFS_STORAGE_KEY, JSON.stringify(uiPrefs));
+  } catch {}
+  for (const listener of uiPrefsListeners) {
+    try {
+      listener();
+    } catch {}
+  }
+}
+
+function registryChoiceToUrl(registry: string | undefined): string {
+  if (!registry || registry === 'npmjs') return OFFICIAL_REGISTRY;
+  if (registry === 'npmmirror') return DOMESTIC_REGISTRY;
+  return normalizeRegistryUrl(registry) ?? OFFICIAL_REGISTRY;
+}
+
+function syncUiPrefs(next: { registryUrl?: string; alwaysShowDetailButton?: boolean }): void {
+  let changed = false;
+  if (next.registryUrl !== undefined) {
+    const normalized = normalizeRegistryUrl(next.registryUrl);
+    if (normalized && normalized !== uiPrefs.registryUrl) {
+      uiPrefs.registryUrl = normalized;
+      changed = true;
+    }
+  }
+  if (typeof next.alwaysShowDetailButton === 'boolean' && next.alwaysShowDetailButton !== uiPrefs.alwaysShowDetailButton) {
+    uiPrefs.alwaysShowDetailButton = next.alwaysShowDetailButton;
+    changed = true;
+  }
+  if (changed) notifyUiPrefsChanged();
+}
+
+function useUiPrefs(): UiPrefs {
+  const [snapshot, setSnapshot] = useState<UiPrefs>(() => ({ ...uiPrefs }));
+  useEffect(() => {
+    const sync = () => setSnapshot({ ...uiPrefs });
+    uiPrefsListeners.add(sync);
+    sync();
+    return () => {
+      uiPrefsListeners.delete(sync);
+    };
+  }, []);
+  return snapshot;
+}
 
 const updatablePlugins = new Map<string, string>();
 const updatedInSession = new Map<string, string>();
@@ -286,6 +353,10 @@ function runBatchCheck(force = false): void {
     .then((payload: CheckAllResult | null) => {
       if (batchCheckAbortController !== controller) return;
       if (!payload || typeof payload !== 'object' || payload.ok === false) return;
+      syncUiPrefs({
+        registryUrl: payload.registry,
+        alwaysShowDetailButton: payload.alwaysShowDetailButton
+      });
       if (!payload.updatable || typeof payload.updatable !== 'object') return;
 
       const nextMap = new Map<string, string>();
@@ -365,14 +436,34 @@ function useConfigFormState(form: any): {
       ? raw.customRegistries.filter((item: any) => item && typeof item.url === 'string')
       : DEFAULT_SETTINGS.customRegistries,
     fallbackToOfficial:
-      typeof raw?.fallbackToOfficial === 'boolean' ? raw.fallbackToOfficial : DEFAULT_SETTINGS.fallbackToOfficial
+      typeof raw?.fallbackToOfficial === 'boolean' ? raw.fallbackToOfficial : DEFAULT_SETTINGS.fallbackToOfficial,
+    alwaysShowDetailButton:
+      typeof raw?.alwaysShowDetailButton === 'boolean'
+        ? raw.alwaysShowDetailButton
+        : DEFAULT_SETTINGS.alwaysShowDetailButton
   };
+
+  useEffect(() => {
+    if (!raw || typeof raw !== 'object') return;
+    syncUiPrefs({
+      registryUrl: registryChoiceToUrl(settings.registry),
+      alwaysShowDetailButton: settings.alwaysShowDetailButton
+    });
+  }, [settings.registry, settings.alwaysShowDetailButton, raw]);
 
   const updateField = useCallback(
     async (field: keyof PluginSettings, value: any): Promise<boolean> => {
       if (!form?.set) return false;
       try {
-        return (await form.set(field, value)) !== false;
+        const ok = (await form.set(field, value)) !== false;
+        if (ok) {
+          if (field === 'registry' && typeof value === 'string') {
+            syncUiPrefs({ registryUrl: registryChoiceToUrl(value) });
+          } else if (field === 'alwaysShowDetailButton' && typeof value === 'boolean') {
+            syncUiPrefs({ alwaysShowDetailButton: value });
+          }
+        }
+        return ok;
       } catch {
         return false;
       }
@@ -568,6 +659,20 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
         />
         {t('settings.fallback')}
       </label>
+
+      <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 12, fontSize: 12, color: 'var(--dsw-alias-label-primary, #1e293b)', cursor: writable ? 'pointer' : 'default' }}>
+        <input
+          type="checkbox"
+          checked={settings.alwaysShowDetailButton}
+          disabled={!writable}
+          onChange={() => void updateField('alwaysShowDetailButton', !settings.alwaysShowDetailButton)}
+          style={{ marginTop: 3 }}
+        />
+        <div>
+          <div style={{ fontWeight: 500 }}>{t('settings.alwaysShowDetail')}</div>
+          <div style={hintStyle}>{t('settings.alwaysShowDetailHint')}</div>
+        </div>
+      </label>
     </div>
   );
 };
@@ -593,6 +698,7 @@ function isGithubPackage(pkg: SlotActionProps['subject']['pkg'], checkResult?: C
 
 export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subject, t, locale }) => {
   useLocaleRevision(locale);
+  const currentUiPrefs = useUiPrefs();
   const pkg = subject?.pkg;
   const packageName = typeof pkg?.name === 'string' ? pkg.name : '';
   const clientVersion = pkg?.version || '0.0.0';
@@ -617,6 +723,21 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       abortRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    successVersionRef.current = null;
+    setCheckResult(null);
+    setMessage(null);
+    setConfirmOpen(false);
+  }, [packageName]);
+
+  useEffect(() => {
+    if (!packageName || !clientVersion) return;
+    const cachedVer = updatablePlugins.get(packageName);
+    if (cachedVer && versionGte(clientVersion, cachedVer)) {
+      clearPluginUpdatable(packageName, clientVersion);
+    }
+  }, [packageName, clientVersion]);
 
   const fetchCheck = useCallback(async (): Promise<CheckUpdateResult | null> => {
     if (!renderable) return null;
@@ -668,6 +789,10 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
         setMessage({ key: '', params: { text: errorText(t, payload.errorCode, payload.error) } });
         return payload;
       }
+      syncUiPrefs({
+        registryUrl: payload.registry,
+        alwaysShowDetailButton: payload.alwaysShowDetailButton
+      });
       setCheckResult(payload);
       if (payload.hasUpdate && payload.latestVersion) {
         markPluginUpdatable(packageName, payload.latestVersion);
@@ -720,7 +845,12 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       if (!payload || typeof payload !== 'object') throw new Error(`HTTP ${response.status}`);
       if (payload.ok === false) {
         setStatus('error');
-        setMessage({ key: '', params: { text: errorText(t, payload.errorCode, payload.error) } });
+        const baseError = errorText(t, payload.errorCode, payload.error);
+        const fullError =
+          payload.rollback === 'failed' && payload.errorCode !== ERROR_CODES.rollbackFailed
+            ? `${baseError} (${t('error.rollbackFailed')})`
+            : baseError;
+        setMessage({ key: '', params: { text: fullError } });
         return;
       }
       const version = payload.targetVersion || targetVersion || clientVersion;
@@ -755,8 +885,18 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
 
   if (!renderable) return null;
 
-  // On standard npm plugins, DSH 0.2.2 native already renders the VersionSection with "已是最新版本" / "重新检查",
-  // so we keep the header clean and avoid duplicate UI when there is no update or while checking.
+  const effectiveRegistry =
+    normalizeRegistryUrl(checkResult?.registry || currentUiPrefs.registryUrl) ?? OFFICIAL_REGISTRY;
+  const usingNonOfficialRegistry = effectiveRegistry !== OFFICIAL_REGISTRY;
+  const effectiveAlwaysShow = checkResult?.alwaysShowDetailButton ?? currentUiPrefs.alwaysShowDetailButton;
+
+  // Plan A layering: yield standard official npm detail pages to DSH native unless the user
+  // configured a mirror/custom registry or explicitly turned on the Always Show toggle.
+  if (!isGithub && !usingNonOfficialRegistry && !effectiveAlwaysShow) {
+    return null;
+  }
+
+  // When npm secondary action is enabled, keep the header clean unless an update/action is active.
   if (!isGithub && (status === 'checking' || status === 'up_to_date')) {
     return null;
   }
@@ -879,6 +1019,81 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
 
 const SIDEBAR_BADGE_ATTR = 'data-dsh-updater-sidebar-badge';
 const ROW_BADGE_ATTR = 'data-dsh-updater-row-badge';
+const NATIVE_UPDATE_LABELS = new Set(['可更新', 'Update available']);
+
+function hasNativeUpdateTag(card: HTMLElement, t: Translator): boolean {
+  const expectedLocal = t('badge.updateAvailable');
+  const candidates = card.querySelectorAll<HTMLElement>('[data-dsw-tag], [data-tone], span');
+  for (const el of Array.from(candidates)) {
+    if (
+      el.hasAttribute(ROW_BADGE_ATTR) ||
+      el.closest(`[${ROW_BADGE_ATTR}]`) ||
+      el.querySelector(`[${ROW_BADGE_ATTR}]`)
+    ) {
+      continue;
+    }
+    const isLeafOrTagged =
+      el.children.length === 0 || el.hasAttribute('data-tone') || el.hasAttribute('data-dsw-tag');
+    if (!isLeafOrTagged) continue;
+    const text = el.textContent?.trim();
+    if (!text) continue;
+    if (text === expectedLocal || NATIVE_UPDATE_LABELS.has(text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function mountRowBadgeHost(card: HTMLLIElement, pkgName: string): HTMLElement {
+  const host = document.createElement('span');
+  host.setAttribute(ROW_BADGE_ATTR, pkgName);
+  host.style.cssText = 'display: inline-flex; align-items: center; flex: none; cursor: pointer;';
+  // DSH PackageCard renders native status tags (Beta / Update available) inside the titleRow beside cardTitle.
+  const titleBtn = card.querySelector<HTMLElement>('button:not([role="switch"])');
+  if (titleBtn?.parentElement && titleBtn.parentElement !== card) {
+    titleBtn.parentElement.appendChild(host);
+    return host;
+  }
+  // Fallback: place before the outer toggle wrapper inside cardEnd, never inside .bundleToggle span itself.
+  const switchEl = card.querySelector<HTMLElement>('[role="switch"]');
+  const toggleWrapper = switchEl?.closest('span');
+  const cardEnd = toggleWrapper?.parentElement || switchEl?.parentElement;
+  if (toggleWrapper && cardEnd && toggleWrapper !== switchEl) {
+    cardEnd.insertBefore(host, toggleWrapper);
+  } else if (switchEl && switchEl.parentElement) {
+    switchEl.parentElement.insertBefore(host, switchEl);
+  } else {
+    const fallbackEnd = card.firstElementChild?.lastElementChild || card;
+    fallbackEnd.insertBefore(host, fallbackEnd.firstChild);
+  }
+  return host;
+}
+
+function isOwnBadgeMutation(mutation: MutationRecord): boolean {
+  const targetEl = mutation.target instanceof Element ? mutation.target : null;
+  if (
+    targetEl &&
+    (targetEl.hasAttribute(SIDEBAR_BADGE_ATTR) ||
+      targetEl.hasAttribute(ROW_BADGE_ATTR) ||
+      targetEl.closest(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}]`))
+  ) {
+    return true;
+  }
+  if (mutation.type === 'childList') {
+    const nodes = [...Array.from(mutation.addedNodes), ...Array.from(mutation.removedNodes)];
+    if (
+      nodes.length > 0 &&
+      nodes.every(
+        node =>
+          node instanceof Element &&
+          (node.hasAttribute(SIDEBAR_BADGE_ATTR) || node.hasAttribute(ROW_BADGE_ATTR))
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function resolvePluginsPanelLabel(slots: any): string | null {
   try {
@@ -1003,28 +1218,16 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         const pkgName = card.getAttribute('data-plugin-package') || '';
         if (!pkgName) continue;
         const latestVersion = updatablePlugins.get(pkgName);
-        let host = card.querySelector<HTMLElement>(`span[${ROW_BADGE_ATTR}="${pkgName}"]`);
+        const escapedPkg =
+          typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+            ? CSS.escape(pkgName)
+            : pkgName.replace(/["\\]/g, '\\$&');
+        let host = card.querySelector<HTMLElement>(`span[${ROW_BADGE_ATTR}="${escapedPkg}"]`);
 
         // Avoid duplicate tags if DSH native already displayed its own "可更新" (statusUpdateAvailable) Tag
-        const hasNativeUpdateTag = Array.from(card.querySelectorAll('[data-dsw-tag], span')).some(
-          el =>
-            el.textContent?.trim() === t('badge.updateAvailable') &&
-            !el.hasAttribute(ROW_BADGE_ATTR) &&
-            !el.closest(`[${ROW_BADGE_ATTR}]`)
-        );
-
-        if (latestVersion && !hasNativeUpdateTag) {
+        if (latestVersion && !hasNativeUpdateTag(card, t)) {
           if (!host) {
-            host = document.createElement('span');
-            host.setAttribute(ROW_BADGE_ATTR, pkgName);
-            host.style.cssText = 'display: inline-flex; align-items: center; flex: none; cursor: pointer;';
-            const switchEl = card.querySelector<HTMLElement>('[role="switch"]');
-            if (switchEl && switchEl.parentElement) {
-              switchEl.parentElement.insertBefore(host, switchEl);
-            } else {
-              const fallbackEnd = card.firstElementChild?.lastElementChild || card;
-              fallbackEnd.insertBefore(host, fallbackEnd.firstChild);
-            }
+            host = mountRowBadgeHost(card as HTMLLIElement, pkgName);
           }
           nextRowTargets.push({
             packageName: pkgName,
@@ -1052,7 +1255,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         return nextRowTargets;
       });
     } catch {}
-  }, [slots]);
+  }, [slots, t]);
 
   useEffect(() => {
     syncDomTargets();
@@ -1070,13 +1273,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
     const observer = new MutationObserver(mutations => {
       for (const m of mutations) {
-        const targetEl = m.target instanceof Element ? m.target : null;
-        if (
-          targetEl &&
-          (targetEl.hasAttribute(SIDEBAR_BADGE_ATTR) ||
-            targetEl.hasAttribute(ROW_BADGE_ATTR) ||
-            targetEl.closest(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}]`))
-        ) {
+        if (isOwnBadgeMutation(m)) {
           continue;
         }
         scheduleSync();

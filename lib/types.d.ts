@@ -34,6 +34,7 @@ export interface PluginSettings {
     registry: RegistryChoice;
     customRegistries: CustomRegistry[];
     fallbackToOfficial: boolean;
+    alwaysShowDetailButton: boolean;
 }
 export interface CheckUpdateParams {
     packageName: string;
@@ -50,6 +51,7 @@ export interface CheckUpdateResult {
     source?: string;
     isGithub?: boolean;
     registry?: string;
+    alwaysShowDetailButton?: boolean;
     error?: string;
     errorCode?: ErrorCode | string;
 }
@@ -60,6 +62,8 @@ export interface CheckAllParams {
 export interface CheckAllResult {
     ok: boolean;
     updatable: Record<string, string>;
+    registry?: string;
+    alwaysShowDetailButton?: boolean;
     error?: string;
     errorCode?: ErrorCode | string;
 }
@@ -103,3 +107,10 @@ export interface SlotActionProps {
 export declare function normalizeRegistryUrl(url: string | undefined | null): string | null;
 /** Human-readable label for a registry URL. */
 export declare function registryLabel(url: string, customs?: CustomRegistry[]): string;
+export interface ParsedSemver {
+    core: number[];
+    prerelease: string[];
+}
+export declare function parseSemver(input: string): ParsedSemver | null;
+export declare function compareSemver(left: string, right: string): number;
+export declare function versionGte(installed: string | undefined, target: string | undefined): boolean;

@@ -10,6 +10,7 @@ import {
   ERROR_CODES,
   OFFICIAL_REGISTRY,
   UPDATE_PATH,
+  compareSemver,
   normalizeRegistryUrl,
   registryLabel,
   type CheckAllResult,
@@ -27,6 +28,7 @@ const OWN_PACKAGE_NAME = 'dsh-plugins-update';
 const PACKAGE_NAME_PATTERN = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 const TARGET_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const INSTALL_TIMEOUT_MS = 180_000;
+const ROLLBACK_TIMEOUT_MS = 60_000;
 const CHECK_TIMEOUT_MS = 15_000;
 const OUTPUT_LIMIT = 8_000;
 
@@ -55,6 +57,11 @@ export const Config: Schema<any> = Schema.object({
     Schema.boolean()
       .default(true)
       .description('非官方源安装失败时，自动改用 npm 官方源重试一次 / Retry once on npm official after a non-official registry fails')
+  ),
+  alwaysShowDetailButton: live(
+    Schema.boolean()
+      .default(false)
+      .description('始终在插件详情页显示「极速更新」按钮 / Always show the Fast Update button on plugin detail pages')
   )
 });
 
@@ -84,7 +91,8 @@ function readSettings(config: any): PluginSettings {
   return {
     registry: typeof registryRaw === 'string' && registryRaw.trim() ? registryRaw.trim() : 'npmjs',
     customRegistries,
-    fallbackToOfficial: readField<boolean>(config?.fallbackToOfficial, true)
+    fallbackToOfficial: readField<boolean>(config?.fallbackToOfficial, true),
+    alwaysShowDetailButton: readField<boolean>(config?.alwaysShowDetailButton, false)
   };
 }
 
@@ -111,55 +119,6 @@ function readTargetVersion(value: unknown): string | undefined | null {
 
 function isOfficialPackageName(packageName: string): boolean {
   return packageName.startsWith('@deepseek-ai/');
-}
-
-// --- semver ---------------------------------------------------------------------------
-
-interface ParsedSemver {
-  core: number[];
-  prerelease: string[];
-}
-
-function parseSemver(input: string): ParsedSemver | null {
-  const match = String(input || '')
-    .trim()
-    .replace(/^[v^~]/, '')
-    .match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
-  if (!match) return null;
-  return {
-    core: [Number(match[1]), Number(match[2]), Number(match[3])],
-    prerelease: match[4] ? match[4].split('.') : []
-  };
-}
-
-function compareSemver(left: string, right: string): number {
-  const a = parseSemver(left);
-  const b = parseSemver(right);
-  if (!a || !b) return left === right ? 0 : left > right ? 1 : -1;
-  for (let i = 0; i < 3; i++) {
-    if (a.core[i] !== b.core[i]) return a.core[i] > b.core[i] ? 1 : -1;
-  }
-  if (a.prerelease.length === 0 && b.prerelease.length === 0) return 0;
-  if (a.prerelease.length === 0) return 1;
-  if (b.prerelease.length === 0) return -1;
-  const length = Math.max(a.prerelease.length, b.prerelease.length);
-  for (let i = 0; i < length; i++) {
-    const x = a.prerelease[i];
-    const y = b.prerelease[i];
-    if (x === undefined) return -1;
-    if (y === undefined) return 1;
-    const nx = /^\d+$/.test(x);
-    const ny = /^\d+$/.test(y);
-    if (nx && ny) {
-      const diff = Number(x) - Number(y);
-      if (diff !== 0) return diff > 0 ? 1 : -1;
-    } else if (nx !== ny) {
-      return nx ? -1 : 1;
-    } else if (x !== y) {
-      return x > y ? 1 : -1;
-    }
-  }
-  return 0;
 }
 
 // --- profile / package ----------------------------------------------------------------
@@ -355,9 +314,10 @@ function encodePackageName(packageName: string): string {
   return encodeURIComponent(packageName).replace(/^%40/i, '@');
 }
 
-async function fetchJson(url: string, timeoutMs = CHECK_TIMEOUT_MS): Promise<any> {
+async function fetchJson(url: string, timeoutMs = CHECK_TIMEOUT_MS, externalSignal?: AbortSignal): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
   try {
     const parsed = new URL(url);
     const headers: Record<string, string> = {
@@ -370,12 +330,13 @@ async function fetchJson(url: string, timeoutMs = CHECK_TIMEOUT_MS): Promise<any
       parsed.username = '';
       parsed.password = '';
     }
-    const response = await fetch(parsed.href, { headers, signal: controller.signal });
+    const response = await fetch(parsed.href, { headers, signal });
     if (!response.ok) throw new RemoteError(ERROR_CODES.offline, `HTTP ${response.status}`);
     return await response.json();
   } catch (error: any) {
     if (error instanceof RemoteError) throw error;
-    if (error?.name === 'AbortError') throw new RemoteError(ERROR_CODES.timeout, '检查更新超时');
+    if (controller.signal.aborted) throw new RemoteError(ERROR_CODES.timeout, '检查更新超时');
+    if (externalSignal?.aborted || error?.name === 'AbortError') throw error;
     throw new RemoteError(ERROR_CODES.offline, redactSecrets(error?.message || '网络请求失败'));
   } finally {
     clearTimeout(timer);
@@ -405,28 +366,32 @@ async function fetchNpmLatest(packageName: string, registry: string): Promise<Re
 
 async function fetchGithubPackageJson(owner: string, repo: string): Promise<RemotePackageInfo> {
   const urls = [
-    `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/package.json`,
-    `https://cdn.jsdelivr.net/gh/${owner}/${repo}@HEAD/package.json`
+    `https://cdn.jsdelivr.net/gh/${owner}/${repo}@HEAD/package.json`,
+    `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/package.json`
   ];
-  let lastError: any;
-  for (const url of urls) {
-    try {
-      const data = await fetchJson(url);
-      if (typeof data?.version !== 'string' || !data.version.trim()) {
-        throw new RemoteError(ERROR_CODES.offline, 'GitHub 仓库 package.json 缺少版本号');
-      }
-      return {
-        version: data.version.trim(),
-        description: typeof data?.description === 'string' ? data.description : undefined,
-        isGithub: true
-      };
-    } catch (error) {
-      lastError = error;
+  const controller = new AbortController();
+  const attempts = urls.map(async url => {
+    const data = await fetchJson(url, CHECK_TIMEOUT_MS, controller.signal);
+    if (typeof data?.version !== 'string' || !data.version.trim()) {
+      throw new RemoteError(ERROR_CODES.offline, 'GitHub 仓库 package.json 缺少版本号');
     }
+    return {
+      version: data.version.trim(),
+      description: typeof data?.description === 'string' ? data.description : undefined,
+      isGithub: true
+    };
+  });
+  try {
+    return await Promise.any(attempts);
+  } catch (error: any) {
+    const errors: any[] = Array.isArray(error?.errors) ? error.errors : [];
+    const remote =
+      errors.find(e => e instanceof RemoteError && e.errorCode !== ERROR_CODES.timeout) ??
+      errors.find(e => e instanceof RemoteError);
+    throw remote ?? new RemoteError(ERROR_CODES.offline, '无法读取 GitHub 仓库版本信息');
+  } finally {
+    controller.abort();
   }
-  throw lastError instanceof RemoteError
-    ? lastError
-    : new RemoteError(ERROR_CODES.offline, '无法读取 GitHub 仓库版本信息');
 }
 
 async function resolveRemotePackage(
@@ -484,16 +449,23 @@ function buildInstallCommand(
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ELECTRON_RUN_AS_NODE: '1',
-    npm_config_registry: registry
+    npm_config_registry: registry,
+    npm_config_update_notifier: 'false',
+    pnpm_config_update_notifier: 'false',
+    npm_config_fund: 'false',
+    npm_config_audit: 'false'
   };
   delete env.GITHUB_TOKEN;
   delete env.GH_TOKEN;
-  const policyArgs = policyBypass ? ['--config.minimum-release-age=0'] : [];
+  const extraArgs = [
+    '--config.update-notifier=false',
+    ...(policyBypass ? ['--config.minimum-release-age=0'] : [])
+  ];
   const cliJs = desktopCliCandidates().find(candidate => existsSync(candidate));
   if (cliJs) {
     return {
       command: process.execPath,
-      args: ['--expose-internals', cliJs, 'plugin', '--profile', profileName, 'add', spec, `--registry=${registry}`, ...policyArgs],
+      args: ['--expose-internals', cliJs, 'plugin', '--profile', profileName, 'add', spec, `--registry=${registry}`, ...extraArgs],
       env
     };
   }
@@ -501,7 +473,7 @@ function buildInstallCommand(
   if (pnpmJs) {
     return {
       command: process.execPath,
-      args: ['--expose-internals', pnpmJs, 'add', spec, `--registry=${registry}`, ...policyArgs],
+      args: ['--expose-internals', pnpmJs, 'add', spec, `--registry=${registry}`, ...extraArgs],
       env
     };
   }
@@ -536,10 +508,13 @@ function killChildTree(child: any): void {
   } catch {}
 }
 
-function spawnInstall(profileDir: string, profileName: string, spec: string, registry: string, policyBypass = false): Promise<InstallAttempt> {
-  const plan = buildInstallCommand(profileName, spec, registry, policyBypass);
-  if ('error' in plan) return Promise.resolve({ ok: false, output: '', error: plan.error, timedOut: false });
-
+function spawnCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number
+): Promise<InstallAttempt> {
   return new Promise(resolve => {
     let output = '';
     let settled = false;
@@ -561,38 +536,41 @@ function spawnInstall(profileDir: string, profileName: string, spec: string, reg
 
     let child: any;
     try {
-      child = spawn(plan.command, plan.args, {
-        cwd: profileDir,
+      child = spawn(command, args, {
+        cwd,
         shell: false,
         windowsHide: true,
-        env: plan.env
+        env
       });
     } catch (error: any) {
-      finish(false, redactSecrets(error?.message || '无法启动安装进程'));
+      finish(false, redactSecrets(error?.message || '无法启动进程'));
       return;
     }
 
     child.stdout?.on('data', append);
     child.stderr?.on('data', append);
-    child.on('error', (error: any) => finish(false, redactSecrets(error?.message || '安装进程错误')));
+    child.on('error', (error: any) => finish(false, redactSecrets(error?.message || '进程执行错误')));
     child.on('close', (code: number | null) => {
-      if (timedOut) return finish(false, `安装命令超时（${Math.round(INSTALL_TIMEOUT_MS / 1000)} 秒）`);
+      if (timedOut) return finish(false, `命令超时（${Math.round(timeoutMs / 1000)} 秒）`);
       if (code === 0) return finish(true);
-      finish(false, redactSecrets(`安装进程退出码 ${code ?? 'unknown'}`));
+      finish(false, redactSecrets(`进程退出码 ${code ?? 'unknown'}`));
     });
 
     timer = setTimeout(() => {
       if (settled) return;
       timedOut = true;
       killChildTree(child);
-      forceTimer = setTimeout(
-        () => finish(false, `安装命令超时（${Math.round(INSTALL_TIMEOUT_MS / 1000)} 秒）`),
-        10_000
-      );
+      forceTimer = setTimeout(() => finish(false, `命令超时（${Math.round(timeoutMs / 1000)} 秒）`), 10_000);
       forceTimer.unref?.();
-    }, INSTALL_TIMEOUT_MS);
+    }, timeoutMs);
     timer.unref?.();
   });
+}
+
+function spawnInstall(profileDir: string, profileName: string, spec: string, registry: string, policyBypass = false): Promise<InstallAttempt> {
+  const plan = buildInstallCommand(profileName, spec, registry, policyBypass);
+  if ('error' in plan) return Promise.resolve({ ok: false, output: '', error: plan.error, timedOut: false });
+  return spawnCommand(plan.command, plan.args, profileDir, plan.env, INSTALL_TIMEOUT_MS);
 }
 
 function isSupplyChainPolicyFailure(output: string): boolean {
@@ -625,6 +603,55 @@ function restoreSnapshot(profileDir: string, snapshot: Snapshot): boolean {
   }
 }
 
+async function alignNodeModulesAfterRollback(profileDir: string): Promise<'aligned' | 'skipped' | 'failed'> {
+  const pnpmJs = pnpmCandidates().find(candidate => existsSync(candidate));
+  if (!pnpmJs) return 'skipped';
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ELECTRON_RUN_AS_NODE: '1',
+    npm_config_update_notifier: 'false',
+    pnpm_config_update_notifier: 'false',
+    npm_config_fund: 'false',
+    npm_config_audit: 'false'
+  };
+  delete env.GITHUB_TOKEN;
+  delete env.GH_TOKEN;
+  const result = await spawnCommand(
+    process.execPath,
+    [
+      '--expose-internals',
+      pnpmJs,
+      'install',
+      '--frozen-lockfile',
+      '--prefer-offline',
+      '--ignore-scripts',
+      '--config.update-notifier=false',
+      '--config.minimum-release-age=0'
+    ],
+    profileDir,
+    env,
+    ROLLBACK_TIMEOUT_MS
+  );
+  return result.ok ? 'aligned' : 'failed';
+}
+
+async function rollbackAfterFailure(
+  profileDir: string,
+  packageName: string,
+  previousVersion: string | undefined,
+  snapshot: Snapshot,
+  forceAlign: boolean
+): Promise<'restored' | 'failed'> {
+  const restored = restoreSnapshot(profileDir, snapshot);
+  if (!restored) return 'failed';
+  // Skip expensive pnpm alignment unless verification failed or node_modules was mutated before failure.
+  const versionAfterRestore = readInstalledVersion(profileDir, packageName);
+  const drifted = forceAlign || (Boolean(previousVersion) && versionAfterRestore !== previousVersion);
+  if (!drifted) return 'restored';
+  const alignment = await alignNodeModulesAfterRollback(profileDir);
+  return alignment === 'failed' ? 'failed' : 'restored';
+}
+
 async function performUpdate(
   ctx: any,
   config: any,
@@ -642,10 +669,8 @@ async function performUpdate(
   const currentVersion = readInstalledVersion(profileDir, packageName);
   let targetVersion = params.targetVersion;
   let spec = '';
-  let expectedGithub = false;
 
   if (origin.isGithub && origin.github) {
-    expectedGithub = true;
     if (!targetVersion) {
       const remote = await fetchGithubPackageJson(origin.github.owner, origin.github.repo);
       targetVersion = remote.version;
@@ -685,7 +710,7 @@ async function performUpdate(
   }
 
   if (!attempt.ok) {
-    const restored = restoreSnapshot(profileDir, snapshot);
+    const rollback = await rollbackAfterFailure(profileDir, packageName, currentVersion, snapshot, false);
     return {
       ok: false,
       packageName,
@@ -694,7 +719,7 @@ async function performUpdate(
       registryUsed: safeRegistryUrl(registryUsed),
       registryLabel: registryLabel(registryUsed, settings.customRegistries),
       fellBack,
-      rollback: restored ? 'restored' : 'failed',
+      rollback,
       error: attempt.timedOut ? '更新超时，已中止安装' : attempt.error || '安装失败',
       errorCode: attempt.timedOut ? ERROR_CODES.timeout : ERROR_CODES.installFailed,
       output: attempt.output
@@ -702,11 +727,9 @@ async function performUpdate(
   }
 
   const installedVersion = readInstalledVersion(profileDir, packageName);
-  const verified =
-    installedVersion !== undefined &&
-    (expectedGithub ? installedVersion === targetVersion : compareSemver(installedVersion, targetVersion) >= 0);
+  const verified = installedVersion !== undefined && compareSemver(installedVersion, targetVersion) >= 0;
   if (!verified) {
-    const restored = restoreSnapshot(profileDir, snapshot);
+    const rollback = await rollbackAfterFailure(profileDir, packageName, currentVersion, snapshot, true);
     return {
       ok: false,
       packageName,
@@ -715,7 +738,7 @@ async function performUpdate(
       registryUsed: safeRegistryUrl(registryUsed),
       registryLabel: registryLabel(registryUsed, settings.customRegistries),
       fellBack,
-      rollback: restored ? 'restored' : 'failed',
+      rollback,
       error: `安装后校验未通过：期望 ${targetVersion}，实际 ${installedVersion || '未知'}`,
       errorCode: ERROR_CODES.verificationFailed,
       output: attempt.output
@@ -735,7 +758,7 @@ async function performUpdate(
   return {
     ok: true,
     packageName,
-    targetVersion,
+    targetVersion: installedVersion,
     source: origin.declaredSpec,
     registryUsed: safeRegistryUrl(registryUsed),
     registryLabel: registryLabel(registryUsed, settings.customRegistries),
@@ -815,10 +838,11 @@ export function apply(ctx: any, config: any) {
             if (blocked) return errorResponse({ packageName, hasUpdate: false }, blocked.errorCode, blocked.error);
             const { dir } = resolveProfileDir(packageName);
             const currentVersion = readInstalledVersion(dir, packageName) || body?.currentVersion || '0.0.0';
+            const settings = readSettings(config);
             const { info, origin, registry } = await resolveRemotePackage(
               packageName,
               dir,
-              readSettings(config),
+              settings,
               typeof body?.source === 'string' ? body.source : bundle?.source
             );
             const result: CheckUpdateResult = {
@@ -830,7 +854,8 @@ export function apply(ctx: any, config: any) {
               description: info.description,
               source: origin.declaredSpec || bundle?.source,
               isGithub: info.isGithub,
-              registry: safeRegistryUrl(registry)
+              registry: safeRegistryUrl(registry),
+              alwaysShowDetailButton: settings.alwaysShowDetailButton
             };
             return jsonResponse(result);
           } catch (error: any) {
@@ -913,7 +938,13 @@ export function apply(ctx: any, config: any) {
             }
 
             const updatable = await task;
-            const result: CheckAllResult = { ok: true, updatable };
+            const settings = readSettings(config);
+            const result: CheckAllResult = {
+              ok: true,
+              updatable,
+              registry: safeRegistryUrl(selectedRegistry(settings)),
+              alwaysShowDetailButton: settings.alwaysShowDetailButton
+            };
             return jsonResponse(result);
           } catch (error: any) {
             const errorCode = error instanceof RemoteError ? error.errorCode : ERROR_CODES.unknown;

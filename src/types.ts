@@ -41,6 +41,7 @@ export interface PluginSettings {
   registry: RegistryChoice;
   customRegistries: CustomRegistry[];
   fallbackToOfficial: boolean;
+  alwaysShowDetailButton: boolean;
 }
 
 export interface CheckUpdateParams {
@@ -59,6 +60,7 @@ export interface CheckUpdateResult {
   source?: string;
   isGithub?: boolean;
   registry?: string;
+  alwaysShowDetailButton?: boolean;
   error?: string;
   errorCode?: ErrorCode | string;
 }
@@ -71,6 +73,8 @@ export interface CheckAllParams {
 export interface CheckAllResult {
   ok: boolean;
   updatable: Record<string, string>;
+  registry?: string;
+  alwaysShowDetailButton?: boolean;
   error?: string;
   errorCode?: ErrorCode | string;
 }
@@ -145,4 +149,56 @@ export function registryLabel(url: string, customs: CustomRegistry[] = []): stri
   } catch {
     return normalized;
   }
+}
+
+export interface ParsedSemver {
+  core: number[];
+  prerelease: string[];
+}
+
+export function parseSemver(input: string): ParsedSemver | null {
+  const match = String(input || '')
+    .trim()
+    .replace(/^[v^~]/, '')
+    .match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
+  if (!match) return null;
+  return {
+    core: [Number(match[1]), Number(match[2]), Number(match[3])],
+    prerelease: match[4] ? match[4].split('.') : []
+  };
+}
+
+export function compareSemver(left: string, right: string): number {
+  const a = parseSemver(left);
+  const b = parseSemver(right);
+  if (!a || !b) return left === right ? 0 : left > right ? 1 : -1;
+  for (let i = 0; i < 3; i++) {
+    if (a.core[i] !== b.core[i]) return a.core[i] > b.core[i] ? 1 : -1;
+  }
+  if (a.prerelease.length === 0 && b.prerelease.length === 0) return 0;
+  if (a.prerelease.length === 0) return 1;
+  if (b.prerelease.length === 0) return -1;
+  const length = Math.max(a.prerelease.length, b.prerelease.length);
+  for (let i = 0; i < length; i++) {
+    const x = a.prerelease[i];
+    const y = b.prerelease[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) {
+      const diff = Number(x) - Number(y);
+      if (diff !== 0) return diff > 0 ? 1 : -1;
+    } else if (nx !== ny) {
+      return nx ? -1 : 1;
+    } else if (x !== y) {
+      return x > y ? 1 : -1;
+    }
+  }
+  return 0;
+}
+
+export function versionGte(installed: string | undefined, target: string | undefined): boolean {
+  if (!installed || !target) return false;
+  return compareSemver(installed, target) >= 0;
 }
