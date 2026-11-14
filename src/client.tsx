@@ -325,12 +325,12 @@ function clearPluginUpdatable(packageName: string, updatedToVersion?: string): v
   }
 }
 
-function runBatchCheck(force = false): void {
-  if (!force && hasRunInitialBatchCheck) return;
+function runBatchCheck(force = false, reconcileOnly = false): void {
+  if (!force && !reconcileOnly && hasRunInitialBatchCheck) return;
   hasRunInitialBatchCheck = true;
 
   if (batchCheckAbortController) {
-    if (!force) return;
+    if (!force && !reconcileOnly) return;
     batchCheckAbortController.abort();
   }
 
@@ -1156,6 +1156,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
   const [sidebarHost, setSidebarHost] = useState<HTMLElement | null>(null);
   const [rowTargets, setRowTargets] = useState<RowMountTarget[]>([]);
+  const lastNativeDoneRef = useRef(false);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1177,15 +1178,19 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         }
         const isCollapsed = pluginsBtn.clientWidth > 0 && pluginsBtn.clientWidth <= 48;
         if (updatablePlugins.size > 0) {
+          if (window.getComputedStyle(pluginsBtn).position === 'static') {
+            pluginsBtn.style.position = 'relative';
+          }
           if (isCollapsed) {
-            if (window.getComputedStyle(pluginsBtn).position === 'static') {
-              pluginsBtn.style.position = 'relative';
-            }
             host.style.cssText =
               'position: absolute; top: 2px; right: 2px; display: inline-flex; align-items: center; pointer-events: none; transform: scale(0.8); transform-origin: top right;';
           } else {
+            const panelEntry = pluginsBtn.closest('nav > div') || pluginsBtn.parentElement;
+            const hasUnpinBtn = Boolean(
+              panelEntry && Array.from(panelEntry.querySelectorAll('button')).some(btn => btn !== pluginsBtn)
+            );
             host.style.cssText =
-              'margin-left: auto; display: inline-flex; align-items: center; flex: none; pointer-events: none;';
+              `position: absolute; top: 50%; right: ${hasUnpinBtn ? '32px' : '10px'}; transform: translateY(-50%); display: inline-flex; align-items: center; pointer-events: none;`;
           }
         } else {
           host.style.cssText = 'display: none;';
@@ -1254,6 +1259,13 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         }
         return nextRowTargets;
       });
+
+      // 3. Reconcile badge cache when DSH's native UpdateDialog / InstallDialog settles on "done"
+      const nativeDone = Boolean(document.querySelector('[data-plugin-update="done"], [data-install-phase="done"]'));
+      if (nativeDone && !lastNativeDoneRef.current) {
+        runBatchCheck(false, true);
+      }
+      lastNativeDoneRef.current = nativeDone;
     } catch {}
   }, [slots, t]);
 
@@ -1283,7 +1295,9 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
     observer.observe(document.body, {
       childList: true,
-      subtree: true
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-plugin-update', 'data-install-phase']
     });
 
     window.addEventListener('resize', scheduleSync);

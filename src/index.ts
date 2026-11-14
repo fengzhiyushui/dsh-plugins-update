@@ -130,6 +130,7 @@ interface BundleInfo {
   availability?: string;
   source?: string;
   removable?: boolean;
+  update?: 'registry' | 'git';
 }
 
 function profileCandidates(): Array<{ dir: string; profileName: string }> {
@@ -249,29 +250,83 @@ function readInstalledVersion(profileDir: string, packageName: string): string |
   }
 }
 
-function parseGithubSource(value?: string): { owner: string; repo: string } | null {
+interface GithubOrigin {
+  owner: string;
+  repo: string;
+  ref?: string;
+  pinnedCommit?: string;
+  subpath?: string;
+}
+
+function parseGithubSource(value?: string): GithubOrigin | null {
   if (typeof value !== 'string') return null;
-  const cleaned = value
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const hashIndex = trimmed.indexOf('#');
+  const rawBase = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed;
+  const rawFragment = hashIndex >= 0 ? trimmed.slice(hashIndex + 1).trim() : '';
+
+  const cleaned = rawBase
     .trim()
     .replace(/^git\+/, '')
-    .replace(/#.*$/, '')
     .replace(/\.git$/i, '')
     .replace(/\/+$/, '');
   if (!cleaned) return null;
+
+  let owner = '';
+  let repo = '';
   const match = cleaned.match(
     /(?:github:|^https?:\/\/github\.com\/|^git@github\.com:|^git:\/\/github\.com\/|^ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)/i
   );
-  if (match) return { owner: match[1], repo: match[2] };
-  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(cleaned)) {
-    const [owner, repo] = cleaned.split('/');
-    return { owner, repo };
+  if (match) {
+    owner = match[1];
+    repo = match[2];
+  } else if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(cleaned)) {
+    [owner, repo] = cleaned.split('/');
+  } else {
+    return null;
   }
-  return null;
+
+  let ref: string | undefined;
+  let pinnedCommit: string | undefined;
+  let subpath: string | undefined;
+
+  if (rawFragment) {
+    const parts = rawFragment
+      .split('&')
+      .map(s => s.trim())
+      .filter(Boolean);
+    for (const part of parts) {
+      if (part.startsWith('path:')) {
+        const normalizedPath = part
+          .slice('path:'.length)
+          .trim()
+          .replace(/\\/g, '/')
+          .split('/')
+          .filter(seg => seg && seg !== '.' && seg !== '..')
+          .join('/');
+        if (normalizedPath) subpath = normalizedPath;
+      } else if (/^[0-9a-f]{40}$/i.test(part)) {
+        pinnedCommit = part.toLowerCase();
+      } else if (!part.includes(':') && !part.includes('..') && /^[A-Za-z0-9._/-]+$/.test(part)) {
+        ref = part;
+      }
+    }
+  }
+
+  return {
+    owner,
+    repo,
+    ...(ref ? { ref } : {}),
+    ...(pinnedCommit ? { pinnedCommit } : {}),
+    ...(subpath ? { subpath } : {})
+  };
 }
 
 interface PackageOrigin {
   isGithub: boolean;
-  github?: { owner: string; repo: string };
+  github?: GithubOrigin;
   declaredSpec?: string;
 }
 
@@ -364,10 +419,20 @@ async function fetchNpmLatest(packageName: string, registry: string): Promise<Re
   };
 }
 
-async function fetchGithubPackageJson(owner: string, repo: string): Promise<RemotePackageInfo> {
+function encodeRefSegments(value: string): string {
+  return value
+    .split('/')
+    .map(seg => encodeURIComponent(seg))
+    .join('/');
+}
+
+async function fetchGithubPackageJson(github: GithubOrigin): Promise<RemotePackageInfo> {
+  const { owner, repo, ref, subpath } = github;
+  const targetRef = encodeRefSegments(ref || 'HEAD');
+  const pkgPath = subpath ? `${encodeRefSegments(subpath)}/package.json` : 'package.json';
   const urls = [
-    `https://cdn.jsdelivr.net/gh/${owner}/${repo}@HEAD/package.json`,
-    `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/package.json`
+    `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${targetRef}/${pkgPath}`,
+    `https://raw.githubusercontent.com/${owner}/${repo}/${targetRef}/${pkgPath}`
   ];
   const controller = new AbortController();
   const attempts = urls.map(async url => {
@@ -402,7 +467,7 @@ async function resolveRemotePackage(
 ): Promise<{ info: RemotePackageInfo; origin: PackageOrigin; registry: string }> {
   const origin = resolvePackageOrigin(profileDir, packageName, source);
   if (origin.isGithub && origin.github) {
-    const info = await fetchGithubPackageJson(origin.github.owner, origin.github.repo);
+    const info = await fetchGithubPackageJson(origin.github);
     return { info, origin, registry: selectedRegistry(settings) };
   }
   const registry = selectedRegistry(settings);
@@ -436,6 +501,8 @@ function pnpmCandidates(): string[] {
     candidates.push(join(execDir, rel));
     candidates.push(join(execDir, '..', rel));
   }
+  const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
+  candidates.push(join(dshHome, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'));
   if (process.env.LOCALAPPDATA) candidates.push(join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness', rel));
   return candidates;
 }
@@ -672,10 +739,14 @@ async function performUpdate(
 
   if (origin.isGithub && origin.github) {
     if (!targetVersion) {
-      const remote = await fetchGithubPackageJson(origin.github.owner, origin.github.repo);
+      const remote = await fetchGithubPackageJson(origin.github);
       targetVersion = remote.version;
     }
-    spec = `github:${origin.github.owner}/${origin.github.repo}`;
+    const fragmentParts: string[] = [];
+    if (origin.github.ref) fragmentParts.push(origin.github.ref);
+    if (origin.github.subpath) fragmentParts.push(`path:${origin.github.subpath}`);
+    const fragment = fragmentParts.length > 0 ? `#${fragmentParts.join('&')}` : '';
+    spec = `github:${origin.github.owner}/${origin.github.repo}${fragment}`;
   } else {
     const registry = selectedRegistry(settings);
     const remote = targetVersion ? undefined : await fetchNpmLatest(packageName, registry);
@@ -796,23 +867,34 @@ export function apply(ctx: any, config: any) {
   if (typeof registerFetch !== 'function') return;
 
   const refreshAfterInstall = async () => {
-    try {
-      const packages = ctx.get?.('pluginPackages');
-      if (packages?.refresh) await packages.refresh();
-    } catch {}
+    let reconciled = false;
     try {
       const hmr = ctx.get?.('hmr');
       if (hmr?.runExclusive && typeof hmr.reconcileProfile === 'function') {
         await hmr.runExclusive(() => hmr.reconcileProfile([]));
+        reconciled = true;
       }
     } catch {}
+    if (!reconciled) {
+      try {
+        const packages = ctx.get?.('pluginPackages');
+        if (packages?.refresh) await packages.refresh();
+      } catch {}
+    }
     try {
       ctx.emit?.('plugin-manager/changed', { reason: 'install' });
+      const root = ctx.root;
+      if (root && root !== ctx && typeof root.emit === 'function') {
+        root.emit('plugin-manager/changed', { reason: 'install' });
+      }
     } catch {}
   };
 
   const runningProfiles = new Set<string>();
   let inFlightCheckAll: Promise<Record<string, string>> | null = null;
+  ctx.on?.('plugin-manager/changed', () => {
+    inFlightCheckAll = null;
+  });
 
   // 1. Check for a newer version of a single package.
   ctx.effect(

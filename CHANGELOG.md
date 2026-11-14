@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.4] - 2026-11-14
+
+### Added
+- Added GitHub spec fragment parsing (`#ref` branch/tag, 40-char commit SHA, and monorepo `&path:<subdir>`) in `parseGithubSource`, `fetchGithubPackageJson`, and `performUpdate`, checking the target path/ref and preserving `#ref` & `&path:<subdir>` while unpinning commit SHAs on update.
+- Added `$DSH_HOME/dsh-runtimes/dsh-primary-runtime/dependencies/pnpm/bin/pnpm.mjs` runtime discovery to `pnpmCandidates()`.
+- Added `BundleInfo.update` (`'registry' | 'git'`) typing and automatic `inFlightCheckAll` cache invalidation when `plugin-manager/changed` fires.
+- Added automatic badge cache reconciliation (`runBatchCheck(false, true)`) when DSH's native `UpdateDialog` or `InstallDialog` settles (`[data-plugin-update="done"], [data-install-phase="done"]`, observed via `attributeFilter` and `childList`).
+
+### Changed
+- Updated `README.md` and `README_zh.md` compatibility notes, GitHub `#ref`/`&path:<subdir>` details, and native dialog reconciliation documentation for DSH `0.2.2-rc.1 ~ 0.2.2-rc.3`.
+
+### Fixed
+- Fixed `refreshAfterInstall` ordering so `hmr.reconcileProfile([])` runs before fallback `pluginPackages.refresh()`, and emitted `plugin-manager/changed` to both `ctx` and `ctx.root`.
+- Fixed expanded sidebar `Plugins` badge horizontal alignment in DSH `0.2.2-rc.3` (`right: 10px` when no unpin button is present vs `right: 32px` when an unpin button exists, compensating for `.panelEntryWide .panelRow` `padding-right: 38px`).
+
 ## [0.2.3] - 2026-11-13
 
 ### Added
