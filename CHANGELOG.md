@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.5-exp.2] - 2026-11-19 (Experimental)
+
+### Added
+- Added DSH host version detection (`detectHostVersion`) and automatic upgrade detection in `/api/dsh-plugins-update/check-all` to trigger fresh update probes right after DSH upgrades.
+- Added plugin health inspection (`inspectInstalledPluginsHealth`) detecting broken/missing entry files (`entry-missing`), host load errors (`bundle-error`), unavailable bundles (`bundle-unavailable`), and unregistered manifest packages (`unregistered-bundle`), plus the `/api/dsh-plugins-update/diagnose` endpoint.
+- Added the `/api/dsh-plugins-update/rescue` endpoint supporting independent `update`, `reinstall` (repairing missing/corrupted disk files), and `uninstall` (safe removal blocking self-uninstall via `self-uninstall-blocked`), protected by per-profile locks and snapshot rollback.
+- Added global client runtime crash sniffer & detail-page failure attribution (`window` `error` / `unhandledrejection`, click-window attribution, and blank/error-boundary detail page detection).
+- Added three detail-page-independent rescue entrances: installed list row warning badges (`⚠️ Issue / Fix`, opening the Rescue Modal without entering potentially broken detail pages), a floating bottom-right upgrade/rescue banner, and the shared `RescueCenterPanel` (embedded in both `RegistrySettingsCard` and `PluginRescueModal`) with batch update support.
+- Wrapped UI primitives (`SafeButton`, `SafeModal`, `SafeTag`) and slot entrypoints in `SafeErrorBoundary` with native HTML/CSS fallbacks so `dsh-plugins-update` stays resilient across future DSH UI changes.
+
 ## [0.2.4] - 2026-11-14
 
 ### Added

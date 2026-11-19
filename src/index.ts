@@ -6,9 +6,11 @@ import Schema from '@deepseek-ai/schemastery';
 import {
   CHECK_ALL_PATH,
   CHECK_PATH,
+  DIAGNOSE_PATH,
   DOMESTIC_REGISTRY,
   ERROR_CODES,
   OFFICIAL_REGISTRY,
+  RESCUE_PATH,
   UPDATE_PATH,
   compareSemver,
   normalizeRegistryUrl,
@@ -16,9 +18,15 @@ import {
   type CheckAllResult,
   type CheckUpdateResult,
   type CustomRegistry,
+  type DiagnoseResult,
   type DoUpdateResult,
   type ErrorCode,
-  type PluginSettings
+  type PluginHealthIssueKind,
+  type PluginHealthReport,
+  type PluginHealthSummary,
+  type PluginSettings,
+  type RescueAction,
+  type RescueResult
 } from './types.js';
 
 export const name = 'dsh-plugins-update';
@@ -131,6 +139,44 @@ interface BundleInfo {
   source?: string;
   removable?: boolean;
   update?: 'registry' | 'git';
+  enabled?: boolean;
+  error?: any;
+  loadError?: any;
+  reason?: string;
+  status?: string;
+  state?: string;
+  message?: string;
+}
+
+function detectHostVersion(ctx?: any): string | undefined {
+  const envVersion = process.env.DSH_VERSION?.trim();
+  if (envVersion) return envVersion;
+  const ctxVersion = ctx?.host?.version || ctx?.app?.version;
+  if (typeof ctxVersion === 'string' && ctxVersion.trim()) return ctxVersion.trim();
+
+  const execDir = process.execPath ? dirname(process.execPath) : '';
+  const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
+  const candidates: string[] = [];
+  if (execDir) {
+    candidates.push(
+      join(execDir, 'resources', 'app.asar', 'package.json'),
+      join(execDir, '..', 'Resources', 'app.asar', 'package.json'),
+      join(execDir, 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'package.json'),
+      join(execDir, '..', 'Resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'package.json')
+    );
+  }
+  candidates.push(join(dshHome, 'dsh-runtimes', 'dsh-primary-runtime', 'package.json'));
+
+  for (const candidate of candidates) {
+    try {
+      if (!existsSync(candidate)) continue;
+      const pkg = JSON.parse(readFileSync(candidate, 'utf8'));
+      if (typeof pkg?.version === 'string' && pkg.version.trim()) {
+        return pkg.version.trim();
+      }
+    } catch {}
+  }
+  return undefined;
 }
 
 function profileCandidates(): Array<{ dir: string; profileName: string }> {
@@ -191,40 +237,173 @@ async function readBundleInfo(ctx: any, packageName: string): Promise<BundleInfo
 interface InstalledThirdPartyPackage {
   packageName: string;
   dir: string;
+  profileName: string;
   currentVersion: string;
   source?: string;
+  bundle?: BundleInfo;
+  issues: PluginHealthIssueKind[];
+  errorDetail?: string;
 }
 
-async function listInstalledThirdPartyPackages(ctx: any): Promise<InstalledThirdPartyPackage[]> {
+function extractVersionFromSpec(spec: unknown): string {
+  if (typeof spec !== 'string') return '0.0.0';
+  const cleaned = spec.trim().replace(/^[v^~=]+/, '');
+  return TARGET_VERSION_PATTERN.test(cleaned) ? cleaned : '0.0.0';
+}
+
+function collectExportTargets(exp: unknown, out: string[]): void {
+  if (typeof exp === 'string') {
+    if (exp.trim() && !exp.includes('*')) out.push(exp.trim());
+    return;
+  }
+  if (!exp || typeof exp !== 'object') return;
+  const obj = exp as Record<string, unknown>;
+  for (const key of ['default', 'import', 'node', 'browser', 'require']) {
+    if (key in obj) collectExportTargets(obj[key], out);
+  }
+}
+
+function inspectPackageDiskHealth(
+  profileDir: string,
+  packageName: string
+): { entryMissing: boolean; currentVersion?: string; errorDetail?: string } {
+  const pkgDir = join(profileDir, 'node_modules', packageName);
+  const manifestPath = join(pkgDir, 'package.json');
+  if (!existsSync(manifestPath)) {
+    return { entryMissing: true, errorDetail: 'node_modules 中的 package.json 缺失' };
+  }
+  let pkg: any;
+  try {
+    pkg = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  } catch {
+    return { entryMissing: true, errorDetail: 'package.json 解析失败或文件损坏' };
+  }
+  const currentVersion =
+    typeof pkg?.version === 'string' && pkg.version.trim() ? pkg.version.trim() : undefined;
+
+  const entryPaths: string[] = [];
+  if (typeof pkg?.main === 'string' && pkg.main.trim()) {
+    entryPaths.push(pkg.main.trim());
+  }
+  if (typeof pkg?.exports === 'string') {
+    collectExportTargets(pkg.exports, entryPaths);
+  } else if (pkg?.exports && typeof pkg.exports === 'object') {
+    const exportsObj = pkg.exports as Record<string, unknown>;
+    if ('.' in exportsObj) collectExportTargets(exportsObj['.'], entryPaths);
+    if ('./client' in exportsObj) collectExportTargets(exportsObj['./client'], entryPaths);
+  }
+
+  for (const relPath of new Set(entryPaths)) {
+    const cleanRel = relPath.replace(/^\.\//, '');
+    if (!cleanRel) continue;
+    if (!existsSync(join(pkgDir, cleanRel))) {
+      return {
+        entryMissing: true,
+        currentVersion,
+        errorDetail: `缺少入口文件: ${relPath}`
+      };
+    }
+  }
+  return { entryMissing: false, currentVersion };
+}
+
+function extractBundleErrorDetail(bundle: BundleInfo | undefined): string | undefined {
+  if (!bundle) return undefined;
+  const raw = bundle.error ?? bundle.loadError ?? bundle.reason ?? bundle.message;
+  if (!raw) return undefined;
+  const text =
+    typeof raw === 'string'
+      ? raw.trim()
+      : typeof raw?.message === 'string'
+        ? raw.message.trim()
+        : String(raw).trim();
+  if (!text) return undefined;
+  const redacted = redactSecrets(text);
+  return redacted.length > 400 ? `${redacted.slice(0, 400)}...` : redacted;
+}
+
+async function inspectInstalledPluginsHealth(ctx: any): Promise<InstalledThirdPartyPackage[]> {
   const bundles = await readAllBundles(ctx);
   const bundleMap = new Map<string, BundleInfo>();
   for (const b of bundles) {
     if (b && typeof b.name === 'string') bundleMap.set(b.name, b);
   }
 
-  const primaryProfile = resolveProfileDir();
-  const deps = readProfileDependencies(primaryProfile.dir);
-  const candidateNames = new Set<string>([...Object.keys(deps), ...bundleMap.keys()]);
+  const candidateProfiles = profileCandidates();
+  const manifestDepsByPackage = new Map<string, string>();
+  for (const candidate of candidateProfiles) {
+    const deps = readProfileDependencies(candidate.dir);
+    for (const [depName, spec] of Object.entries(deps)) {
+      if (!manifestDepsByPackage.has(depName) && typeof spec === 'string') {
+        manifestDepsByPackage.set(depName, spec);
+      }
+    }
+  }
 
+  const candidateNames = new Set<string>([...manifestDepsByPackage.keys(), ...bundleMap.keys()]);
   const result: InstalledThirdPartyPackage[] = [];
+
   for (const rawName of candidateNames) {
     const packageName = readPackageName(rawName);
     if (!packageName || isOfficialPackageName(packageName)) continue;
     const bundle = bundleMap.get(packageName);
-    if (bundle?.official === true || bundle?.installed === false) continue;
+    if (bundle?.official === true) continue;
 
-    const { dir } = resolveProfileDir(packageName);
-    const currentVersion = readInstalledVersion(dir, packageName);
-    if (!currentVersion) continue;
+    const declaredSpec = manifestDepsByPackage.get(packageName);
+    const inManifest = Boolean(declaredSpec);
+    if (!inManifest && bundle?.installed === false) continue;
+
+    const { dir, profileName } = resolveProfileDir(packageName);
+    const disk = inspectPackageDiskHealth(dir, packageName);
+    if (!inManifest && !disk.currentVersion) continue;
+
+    const issues: PluginHealthIssueKind[] = [];
+    const details: string[] = [];
+
+    if (disk.entryMissing || (inManifest && bundle?.installed === false)) {
+      issues.push('entry-missing');
+      if (disk.errorDetail) details.push(disk.errorDetail);
+      else if (bundle?.installed === false) details.push('已在配置中声明但未正确安装到当前 profile');
+    }
+
+    const bundleErrorDetail = extractBundleErrorDetail(bundle);
+    const hasErrorState =
+      Boolean(bundleErrorDetail) ||
+      bundle?.status === 'error' ||
+      bundle?.state === 'error' ||
+      bundle?.state === 'failed';
+    if (hasErrorState) {
+      issues.push('bundle-error');
+      details.push(bundleErrorDetail || `Bundle state: ${bundle?.status || bundle?.state || 'error'}`);
+    }
+
+    if (typeof bundle?.availability === 'string' && bundle.availability !== 'available') {
+      issues.push('bundle-unavailable');
+      details.push(`可用性异常: ${bundle.availability}`);
+    }
+
+    if (bundles.length > 0 && inManifest && !bundle) {
+      issues.push('unregistered-bundle');
+      details.push('已在 profile package.json 中声明，但 DSH 插件管理器未能加载/注册');
+    }
 
     result.push({
       packageName,
       dir,
-      currentVersion,
-      source: bundle?.source
+      profileName,
+      currentVersion: disk.currentVersion || extractVersionFromSpec(declaredSpec),
+      source: bundle?.source || declaredSpec,
+      bundle,
+      issues: Array.from(new Set(issues)),
+      errorDetail: details.filter(Boolean).join('; ') || undefined
     });
   }
   return result;
+}
+
+function isDeclaredInProfile(packageName: string): boolean {
+  const { dir } = resolveProfileDir(packageName);
+  return Object.prototype.hasOwnProperty.call(readProfileDependencies(dir), packageName);
 }
 
 function bundleGuardError(packageName: string, bundle: BundleInfo | undefined): { error: string; errorCode: ErrorCode } | undefined {
@@ -234,7 +413,7 @@ function bundleGuardError(packageName: string, bundle: BundleInfo | undefined): 
       errorCode: ERROR_CODES.officialPlugin
     };
   }
-  if (bundle?.installed === false) {
+  if (bundle?.installed === false && !isDeclaredInProfile(packageName)) {
     return { error: '该插件未安装到当前 profile，无法更新', errorCode: ERROR_CODES.notInstalled };
   }
   return undefined;
@@ -507,16 +686,11 @@ function pnpmCandidates(): string[] {
   return candidates;
 }
 
-function buildInstallCommand(
-  profileName: string,
-  spec: string,
-  registry: string,
-  policyBypass: boolean
-): { command: string; args: string[]; env: NodeJS.ProcessEnv } | { error: string } {
+function buildChildEnv(registry?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ELECTRON_RUN_AS_NODE: '1',
-    npm_config_registry: registry,
+    ...(registry ? { npm_config_registry: registry } : {}),
     npm_config_update_notifier: 'false',
     pnpm_config_update_notifier: 'false',
     npm_config_fund: 'false',
@@ -524,6 +698,16 @@ function buildInstallCommand(
   };
   delete env.GITHUB_TOKEN;
   delete env.GH_TOKEN;
+  return env;
+}
+
+function buildInstallCommand(
+  profileName: string,
+  spec: string,
+  registry: string,
+  policyBypass: boolean
+): { command: string; args: string[]; env: NodeJS.ProcessEnv } | { error: string } {
+  const env = buildChildEnv(registry);
   const extraArgs = [
     '--config.update-notifier=false',
     ...(policyBypass ? ['--config.minimum-release-age=0'] : [])
@@ -545,6 +729,31 @@ function buildInstallCommand(
     };
   }
   return { error: '找不到 DSH CLI 或 pnpm，无法执行安装' };
+}
+
+function buildRemoveCommand(
+  profileName: string,
+  packageName: string
+): { command: string; args: string[]; env: NodeJS.ProcessEnv } | { error: string } {
+  const env = buildChildEnv();
+  const extraArgs = ['--config.update-notifier=false'];
+  const cliJs = desktopCliCandidates().find(candidate => existsSync(candidate));
+  if (cliJs) {
+    return {
+      command: process.execPath,
+      args: ['--expose-internals', cliJs, 'plugin', '--profile', profileName, 'remove', packageName, ...extraArgs],
+      env
+    };
+  }
+  const pnpmJs = pnpmCandidates().find(candidate => existsSync(candidate));
+  if (pnpmJs) {
+    return {
+      command: process.execPath,
+      args: ['--expose-internals', pnpmJs, 'remove', packageName, ...extraArgs],
+      env
+    };
+  }
+  return { error: '找不到 DSH CLI 或 pnpm，无法执行卸载' };
 }
 
 interface InstallAttempt {
@@ -640,6 +849,12 @@ function spawnInstall(profileDir: string, profileName: string, spec: string, reg
   return spawnCommand(plan.command, plan.args, profileDir, plan.env, INSTALL_TIMEOUT_MS);
 }
 
+function spawnRemove(profileDir: string, profileName: string, packageName: string): Promise<InstallAttempt> {
+  const plan = buildRemoveCommand(profileName, packageName);
+  if ('error' in plan) return Promise.resolve({ ok: false, output: '', error: plan.error, timedOut: false });
+  return spawnCommand(plan.command, plan.args, profileDir, plan.env, INSTALL_TIMEOUT_MS);
+}
+
 function isSupplyChainPolicyFailure(output: string): boolean {
   return /ERR_PNPM_NO_MATURE_MATCHING_VERSION|ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION|minimumReleaseAge/i.test(
     output || ''
@@ -673,16 +888,7 @@ function restoreSnapshot(profileDir: string, snapshot: Snapshot): boolean {
 async function alignNodeModulesAfterRollback(profileDir: string): Promise<'aligned' | 'skipped' | 'failed'> {
   const pnpmJs = pnpmCandidates().find(candidate => existsSync(candidate));
   if (!pnpmJs) return 'skipped';
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    ELECTRON_RUN_AS_NODE: '1',
-    npm_config_update_notifier: 'false',
-    pnpm_config_update_notifier: 'false',
-    npm_config_fund: 'false',
-    npm_config_audit: 'false'
-  };
-  delete env.GITHUB_TOKEN;
-  delete env.GH_TOKEN;
+  const env = buildChildEnv();
   const result = await spawnCommand(
     process.execPath,
     [
@@ -719,6 +925,53 @@ async function rollbackAfterFailure(
   return alignment === 'failed' ? 'failed' : 'restored';
 }
 
+function buildGithubInstallSpec(github: GithubOrigin): string {
+  const fragmentParts: string[] = [];
+  if (github.ref) fragmentParts.push(github.ref);
+  if (github.subpath) fragmentParts.push(`path:${github.subpath}`);
+  const fragment = fragmentParts.length > 0 ? `#${fragmentParts.join('&')}` : '';
+  return `github:${github.owner}/${github.repo}${fragment}`;
+}
+
+async function runInstallWithFallback(
+  profileDir: string,
+  profileName: string,
+  spec: string,
+  settings: PluginSettings,
+  initialPolicyBypass = false
+): Promise<{ attempt: InstallAttempt; registryUsed: string; fellBack: boolean }> {
+  let registryUsed = selectedRegistry(settings);
+  let fellBack = false;
+  let attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, initialPolicyBypass);
+
+  if (!attempt.ok && !attempt.timedOut && !initialPolicyBypass && isSupplyChainPolicyFailure(attempt.output)) {
+    attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, true);
+  }
+  if (
+    !attempt.ok &&
+    !attempt.timedOut &&
+    settings.fallbackToOfficial &&
+    normalizeRegistryUrl(registryUsed) !== OFFICIAL_REGISTRY
+  ) {
+    fellBack = true;
+    registryUsed = OFFICIAL_REGISTRY;
+    attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, initialPolicyBypass);
+    if (!attempt.ok && !attempt.timedOut && !initialPolicyBypass && isSupplyChainPolicyFailure(attempt.output)) {
+      attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, true);
+    }
+  }
+  return { attempt, registryUsed, fellBack };
+}
+
+function triggerPackageRefresh(packageName: string, refresh: () => Promise<void>): Promise<void> {
+  if (packageName === OWN_PACKAGE_NAME) {
+    const timer = setTimeout(() => void refresh(), 1500);
+    timer.unref?.();
+    return Promise.resolve();
+  }
+  return refresh().catch(() => {});
+}
+
 async function performUpdate(
   ctx: any,
   config: any,
@@ -742,11 +995,7 @@ async function performUpdate(
       const remote = await fetchGithubPackageJson(origin.github);
       targetVersion = remote.version;
     }
-    const fragmentParts: string[] = [];
-    if (origin.github.ref) fragmentParts.push(origin.github.ref);
-    if (origin.github.subpath) fragmentParts.push(`path:${origin.github.subpath}`);
-    const fragment = fragmentParts.length > 0 ? `#${fragmentParts.join('&')}` : '';
-    spec = `github:${origin.github.owner}/${origin.github.repo}${fragment}`;
+    spec = buildGithubInstallSpec(origin.github);
   } else {
     const registry = selectedRegistry(settings);
     const remote = targetVersion ? undefined : await fetchNpmLatest(packageName, registry);
@@ -759,26 +1008,7 @@ async function performUpdate(
   }
 
   const snapshot = captureSnapshot(profileDir);
-  let registryUsed = selectedRegistry(settings);
-  let fellBack = false;
-  let attempt = await spawnInstall(profileDir, profileName, spec, registryUsed);
-
-  if (!attempt.ok && !attempt.timedOut && isSupplyChainPolicyFailure(attempt.output)) {
-    attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, true);
-  }
-  if (
-    !attempt.ok &&
-    !attempt.timedOut &&
-    settings.fallbackToOfficial &&
-    normalizeRegistryUrl(registryUsed) !== OFFICIAL_REGISTRY
-  ) {
-    fellBack = true;
-    registryUsed = OFFICIAL_REGISTRY;
-    attempt = await spawnInstall(profileDir, profileName, spec, registryUsed);
-    if (!attempt.ok && !attempt.timedOut && isSupplyChainPolicyFailure(attempt.output)) {
-      attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, true);
-    }
-  }
+  const { attempt, registryUsed, fellBack } = await runInstallWithFallback(profileDir, profileName, spec, settings);
 
   if (!attempt.ok) {
     const rollback = await rollbackAfterFailure(profileDir, packageName, currentVersion, snapshot, false);
@@ -817,14 +1047,7 @@ async function performUpdate(
   }
 
   const selfUpdate = packageName === OWN_PACKAGE_NAME;
-  if (selfUpdate) {
-    const timer = setTimeout(() => void refresh(), 1500);
-    timer.unref?.();
-  } else {
-    try {
-      await refresh();
-    } catch {}
-  }
+  await triggerPackageRefresh(packageName, refresh);
 
   return {
     ok: true,
@@ -835,6 +1058,181 @@ async function performUpdate(
     registryLabel: registryLabel(registryUsed, settings.customRegistries),
     fellBack,
     selfUpdate,
+    rollback: 'not-needed',
+    output: attempt.output
+  };
+}
+
+async function performReinstall(
+  _ctx: any,
+  config: any,
+  params: { packageName: string; targetVersion?: string; source?: string },
+  refresh: () => Promise<void>
+): Promise<RescueResult> {
+  const { packageName } = params;
+  const settings = readSettings(config);
+  const { dir: profileDir, profileName } = resolveProfileDir(packageName);
+  if (!existsSync(join(profileDir, 'package.json'))) {
+    return {
+      ok: false,
+      packageName,
+      action: 'reinstall',
+      error: '找不到可用的 DSH profile 目录',
+      errorCode: ERROR_CODES.profileNotFound
+    };
+  }
+
+  const origin = resolvePackageOrigin(profileDir, packageName, params.source);
+  const currentVersion = readInstalledVersion(profileDir, packageName);
+  let targetVersion = params.targetVersion || currentVersion;
+  let spec = '';
+
+  if (origin.isGithub && origin.github) {
+    if (!targetVersion) {
+      try {
+        const remote = await fetchGithubPackageJson(origin.github);
+        targetVersion = remote.version;
+      } catch {}
+    }
+    spec = buildGithubInstallSpec(origin.github);
+  } else {
+    const registry = selectedRegistry(settings);
+    if (!targetVersion) {
+      try {
+        const remote = await fetchNpmLatest(packageName, registry);
+        targetVersion = remote.version;
+      } catch {}
+    }
+    spec = targetVersion ? `${packageName}@${targetVersion}` : packageName;
+  }
+
+  const snapshot = captureSnapshot(profileDir);
+  const { attempt } = await runInstallWithFallback(profileDir, profileName, spec, settings, true);
+
+  if (!attempt.ok) {
+    const rollback = await rollbackAfterFailure(profileDir, packageName, currentVersion, snapshot, false);
+    return {
+      ok: false,
+      packageName,
+      action: 'reinstall',
+      targetVersion,
+      rollback,
+      error: attempt.timedOut ? '重装超时，已中止操作' : attempt.error || '重装失败',
+      errorCode: attempt.timedOut ? ERROR_CODES.timeout : ERROR_CODES.installFailed,
+      output: attempt.output
+    };
+  }
+
+  const disk = inspectPackageDiskHealth(profileDir, packageName);
+  const installedVersion = disk.currentVersion;
+  const versionOk =
+    installedVersion !== undefined &&
+    (!targetVersion || compareSemver(installedVersion, targetVersion) >= 0);
+  if (disk.entryMissing || !versionOk) {
+    const rollback = await rollbackAfterFailure(profileDir, packageName, currentVersion, snapshot, true);
+    return {
+      ok: false,
+      packageName,
+      action: 'reinstall',
+      targetVersion,
+      rollback,
+      error: disk.entryMissing
+        ? `重装后入口校验仍缺失：${disk.errorDetail || '文件不完整'}`
+        : `重装后版本校验未通过：期望 ${targetVersion || '可用版本'}，实际 ${installedVersion || '未知'}`,
+      errorCode: ERROR_CODES.verificationFailed,
+      output: attempt.output
+    };
+  }
+
+  const selfUpdate = packageName === OWN_PACKAGE_NAME;
+  await triggerPackageRefresh(packageName, refresh);
+
+  return {
+    ok: true,
+    packageName,
+    action: 'reinstall',
+    targetVersion: installedVersion,
+    selfUpdate,
+    rollback: 'not-needed',
+    output: attempt.output
+  };
+}
+
+async function performUninstall(
+  packageName: string,
+  bundle: BundleInfo | undefined,
+  refresh: () => Promise<void>
+): Promise<RescueResult> {
+  if (packageName === OWN_PACKAGE_NAME) {
+    return {
+      ok: false,
+      packageName,
+      action: 'uninstall',
+      error: '不能在急救中心卸载 dsh-plugins-update 自身',
+      errorCode: ERROR_CODES.selfUninstallBlocked
+    };
+  }
+
+  const { dir: profileDir, profileName } = resolveProfileDir(packageName);
+  if (!existsSync(join(profileDir, 'package.json'))) {
+    return {
+      ok: false,
+      packageName,
+      action: 'uninstall',
+      error: '找不到可用的 DSH profile 目录',
+      errorCode: ERROR_CODES.profileNotFound
+    };
+  }
+
+  const inManifest = Object.prototype.hasOwnProperty.call(readProfileDependencies(profileDir), packageName);
+  const inNodeModules = existsSync(join(profileDir, 'node_modules', packageName));
+  if (!inManifest && !inNodeModules && bundle?.installed === false) {
+    return {
+      ok: false,
+      packageName,
+      action: 'uninstall',
+      error: '该插件未安装到当前 profile，无需卸载',
+      errorCode: ERROR_CODES.notInstalled
+    };
+  }
+
+  const currentVersion = readInstalledVersion(profileDir, packageName);
+  const snapshot = captureSnapshot(profileDir);
+  const attempt = await spawnRemove(profileDir, profileName, packageName);
+
+  if (!attempt.ok) {
+    const rollback = await rollbackAfterFailure(profileDir, packageName, currentVersion, snapshot, true);
+    return {
+      ok: false,
+      packageName,
+      action: 'uninstall',
+      rollback,
+      error: attempt.timedOut ? '卸载超时，已中止操作' : attempt.error || '卸载失败',
+      errorCode: attempt.timedOut ? ERROR_CODES.timeout : ERROR_CODES.installFailed,
+      output: attempt.output
+    };
+  }
+
+  const stillInManifest = Object.prototype.hasOwnProperty.call(readProfileDependencies(profileDir), packageName);
+  if (stillInManifest) {
+    const rollback = await rollbackAfterFailure(profileDir, packageName, currentVersion, snapshot, true);
+    return {
+      ok: false,
+      packageName,
+      action: 'uninstall',
+      rollback,
+      error: '卸载后校验未通过：插件仍存在于 profile 配置中',
+      errorCode: ERROR_CODES.verificationFailed,
+      output: attempt.output
+    };
+  }
+
+  await refresh().catch(() => {});
+
+  return {
+    ok: true,
+    packageName,
+    action: 'uninstall',
     rollback: 'not-needed',
     output: attempt.output
   };
@@ -860,6 +1258,11 @@ async function parseJsonBody(req: Request): Promise<Record<string, any>> {
 }
 
 // --- Plugin entry point ---------------------------------------------------------------
+
+interface BatchCheckState {
+  updatable: Record<string, string>;
+  unhealthy: Record<string, PluginHealthSummary>;
+}
 
 export function apply(ctx: any, config: any) {
   const conn = ctx.get('connection');
@@ -891,7 +1294,7 @@ export function apply(ctx: any, config: any) {
   };
 
   const runningProfiles = new Set<string>();
-  let inFlightCheckAll: Promise<Record<string, string>> | null = null;
+  let inFlightCheckAll: Promise<BatchCheckState> | null = null;
   ctx.on?.('plugin-manager/changed', () => {
     inFlightCheckAll = null;
   });
@@ -953,7 +1356,7 @@ export function apply(ctx: any, config: any) {
     'dsh-plugins-update: check route'
   );
 
-  // 1b. Batch check all installed third-party packages on startup (skipping already-known unapplied updates).
+  // 1b. Batch check all installed third-party packages on startup (plus local health & host version).
   ctx.effect(
     () =>
       registerFetch({
@@ -967,16 +1370,25 @@ export function apply(ctx: any, config: any) {
             const rawKnown: Record<string, unknown> =
               body?.knownUpdates && typeof body.knownUpdates === 'object' ? body.knownUpdates : {};
 
-            const runBatch = async (): Promise<Record<string, string>> => {
-              const installed = await listInstalledThirdPartyPackages(ctx);
+            const runBatch = async (): Promise<BatchCheckState> => {
+              const installed = await inspectInstalledPluginsHealth(ctx);
               const settings = readSettings(config);
               const updatable: Record<string, string> = {};
+              const unhealthy: Record<string, PluginHealthSummary> = {};
               const toProbe: InstalledThirdPartyPackage[] = [];
 
               for (const item of installed) {
-                const knownVer = !force ? readTargetVersion(rawKnown[item.packageName]) : undefined;
+                const hasIssues = item.issues.length > 0;
+                if (hasIssues) {
+                  unhealthy[item.packageName] = {
+                    issues: item.issues,
+                    ...(item.errorDetail ? { errorDetail: item.errorDetail } : {}),
+                    currentVersion: item.currentVersion
+                  };
+                }
+                const knownVer = !force && !hasIssues ? readTargetVersion(rawKnown[item.packageName]) : undefined;
                 if (typeof knownVer === 'string' && compareSemver(knownVer, item.currentVersion) > 0) {
-                  // Already known to have an unapplied update; skip remote probe.
+                  // Already known to have an unapplied update (and healthy); skip remote probe.
                   updatable[item.packageName] = knownVer;
                 } else {
                   toProbe.push(item);
@@ -1006,10 +1418,10 @@ export function apply(ctx: any, config: any) {
               });
 
               await Promise.all(workers);
-              return updatable;
+              return { updatable, unhealthy };
             };
 
-            let task: Promise<Record<string, string>>;
+            let task: Promise<BatchCheckState>;
             if (!force && inFlightCheckAll) {
               task = inFlightCheckAll;
             } else {
@@ -1019,11 +1431,13 @@ export function apply(ctx: any, config: any) {
               inFlightCheckAll = task;
             }
 
-            const updatable = await task;
+            const { updatable, unhealthy } = await task;
             const settings = readSettings(config);
             const result: CheckAllResult = {
               ok: true,
               updatable,
+              hostVersion: detectHostVersion(ctx),
+              unhealthy,
               registry: safeRegistryUrl(selectedRegistry(settings)),
               alwaysShowDetailButton: settings.alwaysShowDetailButton
             };
@@ -1039,6 +1453,103 @@ export function apply(ctx: any, config: any) {
         }
       }),
     'dsh-plugins-update: check-all route'
+  );
+
+  // 1c. Diagnose health and available updates for all third-party plugins.
+  ctx.effect(
+    () =>
+      registerFetch({
+        path: DIAGNOSE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (req: Request) => {
+          try {
+            const body = await parseJsonBody(req);
+            const rawCrashes =
+              body?.clientCrashes && typeof body.clientCrashes === 'object' ? (body.clientCrashes as Record<string, unknown>) : {};
+            const clientCrashes = new Map<string, string>();
+            for (const [rawName, rawMsg] of Object.entries(rawCrashes)) {
+              const pkgName = readPackageName(rawName);
+              if (!pkgName || isOfficialPackageName(pkgName) || pkgName === OWN_PACKAGE_NAME) continue;
+              if (typeof rawMsg === 'string' && rawMsg.trim()) {
+                const msg = redactSecrets(rawMsg.trim());
+                clientCrashes.set(pkgName, msg.length > 300 ? `${msg.slice(0, 300)}...` : msg);
+              }
+            }
+
+            const installed = await inspectInstalledPluginsHealth(ctx);
+            const settings = readSettings(config);
+            const reports: PluginHealthReport[] = [];
+
+            let cursor = 0;
+            const concurrency = 4;
+            const workers = Array.from({ length: Math.min(concurrency, installed.length) }, async () => {
+              while (cursor < installed.length) {
+                const item = installed[cursor++];
+                if (!item) break;
+                let latestVersion: string | undefined;
+                let hasUpdate = false;
+                let isGithub: boolean | undefined = parseGithubSource(item.source) ? true : undefined;
+
+                try {
+                  const { info } = await resolveRemotePackage(item.packageName, item.dir, settings, item.source);
+                  latestVersion = info.version;
+                  hasUpdate = compareSemver(info.version, item.currentVersion) > 0;
+                  isGithub = info.isGithub;
+                } catch {}
+
+                const issues = [...item.issues];
+                const details: string[] = item.errorDetail ? [item.errorDetail] : [];
+                const crashMsg = clientCrashes.get(item.packageName);
+                if (crashMsg) {
+                  if (!issues.includes('client-crash')) issues.push('client-crash');
+                  details.push(`前端异常: ${crashMsg}`);
+                }
+
+                reports.push({
+                  packageName: item.packageName,
+                  currentVersion: item.currentVersion,
+                  latestVersion,
+                  hasUpdate,
+                  source: item.source,
+                  isGithub,
+                  enabled: item.bundle?.enabled,
+                  availability: item.bundle?.availability,
+                  healthy: issues.length === 0,
+                  issues,
+                  errorDetail: details.filter(Boolean).join('; ') || undefined
+                });
+              }
+            });
+
+            await Promise.all(workers);
+
+            reports.sort((a, b) => {
+              if (a.healthy !== b.healthy) return a.healthy ? 1 : -1;
+              if (a.hasUpdate !== b.hasUpdate) return a.hasUpdate ? -1 : 1;
+              return a.packageName.localeCompare(b.packageName);
+            });
+
+            const primaryProfile = resolveProfileDir();
+            const result: DiagnoseResult = {
+              ok: true,
+              hostVersion: detectHostVersion(ctx),
+              profileName: primaryProfile.profileName,
+              plugins: reports,
+              registry: safeRegistryUrl(selectedRegistry(settings))
+            };
+            return jsonResponse(result);
+          } catch (error: any) {
+            const errorCode = error instanceof RemoteError ? error.errorCode : ERROR_CODES.unknown;
+            return errorResponse(
+              { plugins: [] },
+              errorCode,
+              redactSecrets(error?.message || '插件健康诊断失败')
+            );
+          }
+        }
+      }),
+    'dsh-plugins-update: diagnose route'
   );
 
   // 2. Run one synchronous update. No progress job and no polling.
@@ -1098,5 +1609,121 @@ export function apply(ctx: any, config: any) {
         }
       }),
     'dsh-plugins-update: update route'
+  );
+
+  // 3. Rescue actions (update / reinstall / safe uninstall) independent of plugin detail pages.
+  ctx.effect(
+    () =>
+      registerFetch({
+        path: RESCUE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (req: Request) => {
+          let packageName = '';
+          let action: RescueAction = 'update';
+          try {
+            const body = await parseJsonBody(req);
+            packageName = readPackageName(body?.packageName) ?? '';
+            const rawAction = body?.action;
+            if (rawAction === 'update' || rawAction === 'reinstall' || rawAction === 'uninstall') {
+              action = rawAction;
+            } else {
+              return errorResponse(
+                { packageName, action },
+                ERROR_CODES.unknown,
+                '不支持的急救操作类型',
+                400
+              );
+            }
+            if (!packageName) {
+              return errorResponse(
+                { packageName: '', action },
+                ERROR_CODES.invalidPackageName,
+                'packageName 必须是合法的 npm 包名',
+                400
+              );
+            }
+            const targetVersion = readTargetVersion(body?.targetVersion);
+            if (targetVersion === null) {
+              return errorResponse(
+                { packageName, action },
+                ERROR_CODES.invalidTargetVersion,
+                'targetVersion 必须是合法的语义化版本',
+                400
+              );
+            }
+
+            const bundle = await readBundleInfo(ctx, packageName);
+            const blocked = bundleGuardError(packageName, bundle);
+            if (blocked) {
+              return errorResponse({ packageName, action }, blocked.errorCode, blocked.error);
+            }
+            if (action === 'uninstall' && packageName === OWN_PACKAGE_NAME) {
+              return errorResponse(
+                { packageName, action },
+                ERROR_CODES.selfUninstallBlocked,
+                '不能在急救中心卸载 dsh-plugins-update 自身'
+              );
+            }
+
+            const { dir } = resolveProfileDir(packageName);
+            if (!existsSync(join(dir, 'package.json'))) {
+              return errorResponse({ packageName, action }, ERROR_CODES.profileNotFound, '找不到可用的 DSH profile 目录');
+            }
+            if (runningProfiles.has(dir)) {
+              return errorResponse(
+                { packageName, action },
+                ERROR_CODES.installInProgress,
+                '另一个插件正在更新或修复，请稍后再试'
+              );
+            }
+
+            runningProfiles.add(dir);
+            try {
+              const source = typeof body?.source === 'string' ? body.source : bundle?.source;
+              if (action === 'update') {
+                const updated = await performUpdate(
+                  ctx,
+                  config,
+                  { packageName, targetVersion, source },
+                  refreshAfterInstall
+                );
+                const result: RescueResult = {
+                  ok: updated.ok,
+                  packageName,
+                  action: 'update',
+                  targetVersion: updated.targetVersion,
+                  selfUpdate: updated.selfUpdate,
+                  rollback: updated.rollback,
+                  error: updated.error,
+                  errorCode: updated.errorCode,
+                  output: updated.output
+                };
+                return jsonResponse(result);
+              }
+              if (action === 'reinstall') {
+                const reinstalled = await performReinstall(
+                  ctx,
+                  config,
+                  { packageName, targetVersion, source },
+                  refreshAfterInstall
+                );
+                return jsonResponse(reinstalled);
+              }
+              const uninstalled = await performUninstall(packageName, bundle, refreshAfterInstall);
+              return jsonResponse(uninstalled);
+            } finally {
+              runningProfiles.delete(dir);
+            }
+          } catch (error: any) {
+            return errorResponse(
+              { packageName, action },
+              error instanceof RemoteError ? error.errorCode : ERROR_CODES.unknown,
+              redactSecrets(error?.message || '急救操作失败')
+            );
+          }
+        }
+      }),
+    'dsh-plugins-update: rescue route'
   );
 }

@@ -4,26 +4,242 @@ import { Button, Modal, Tag } from '@deepseek-ai/dsh-client-ui-primitives';
 import {
   CHECK_ALL_PATH,
   CHECK_PATH,
+  DIAGNOSE_PATH,
   DOMESTIC_REGISTRY,
   ERROR_CODES,
   LOCALE_NAMESPACE,
   OFFICIAL_REGISTRY,
+  RESCUE_PATH,
   UPDATE_PATH,
   normalizeRegistryUrl,
   versionGte,
   type CheckAllResult,
   type CheckUpdateResult,
   type CustomRegistry,
+  type DiagnoseResult,
   type DoUpdateResult,
+  type PluginHealthIssueKind,
+  type PluginHealthReport,
+  type PluginHealthSummary,
   type PluginSettings,
+  type RescueAction,
+  type RescueResult,
   type SlotActionProps
 } from './types.js';
 import { en, zh } from './locales.js';
 
 const CHECK_TIMEOUT_MS = 12_000;
 const BATCH_CHECK_TIMEOUT_MS = 25_000;
+const DIAGNOSE_TIMEOUT_MS = 25_000;
 const UPDATE_TIMEOUT_MS = 190_000;
 const SELF_PACKAGE_NAME = 'dsh-plugins-update';
+
+// --- Self-defense ErrorBoundary & UI primitive fallbacks ----------------------------
+
+function isUsableComponent(comp: unknown): comp is React.ComponentType<any> {
+  return typeof comp === 'function' || (typeof comp === 'object' && comp !== null);
+}
+
+interface SafeErrorBoundaryProps {
+  fallback?: React.ReactNode;
+  children?: React.ReactNode;
+}
+
+class SafeErrorBoundary extends React.Component<SafeErrorBoundaryProps, { hasError: boolean }> {
+  constructor(props: SafeErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError(): { hasError: boolean } {
+    return { hasError: true };
+  }
+
+  componentDidCatch(): void {
+    // Isolate failures inside our own plugin UI so the DSH host page never crashes.
+  }
+
+  render(): React.ReactNode {
+    if (this.state.hasError) {
+      return this.props.fallback ?? null;
+    }
+    return this.props.children;
+  }
+}
+
+const SafeButton: React.FC<any> = ({ variant = 'outline', size = 'md', style, children, disabled, ...rest }) => {
+  const isPrimary = variant === 'primary';
+  const isDanger = variant === 'danger';
+  const isSm = size === 'sm';
+  const fallback = (
+    <button
+      type="button"
+      disabled={disabled}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 4,
+        padding: isSm ? '4px 10px' : '6px 14px',
+        fontSize: isSm ? 12 : 13,
+        fontWeight: 500,
+        borderRadius: 6,
+        border: isPrimary
+          ? '1px solid var(--dsw-alias-primary, #2563eb)'
+          : isDanger
+            ? '1px solid #ef4444'
+            : '1px solid var(--dsw-alias-border-l1, #cbd5e1)',
+        background: isPrimary
+          ? 'var(--dsw-alias-primary, #2563eb)'
+          : isDanger
+            ? '#dc2626'
+            : 'var(--dsw-alias-bg-elevated, #ffffff)',
+        color: isPrimary || isDanger ? '#ffffff' : 'var(--dsw-alias-label-primary, #1e293b)',
+        opacity: disabled ? 0.55 : 1,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        lineHeight: 1.4,
+        ...style
+      }}
+      {...rest}
+    >
+      {children}
+    </button>
+  );
+
+  if (!isUsableComponent(Button)) return fallback;
+  return (
+    <SafeErrorBoundary fallback={fallback}>
+      <Button variant={variant === 'danger' ? 'outline' : variant} size={size} style={style} disabled={disabled} {...rest}>
+        {children}
+      </Button>
+    </SafeErrorBoundary>
+  );
+};
+
+const SafeTag: React.FC<any> = ({ tone = 'info', style, children, ...rest }) => {
+  const palette =
+    tone === 'warning' || tone === 'danger'
+      ? { bg: 'rgba(239, 68, 68, 0.12)', border: 'rgba(239, 68, 68, 0.35)', color: '#dc2626' }
+      : tone === 'success'
+        ? { bg: 'rgba(22, 163, 74, 0.12)', border: 'rgba(22, 163, 74, 0.3)', color: '#15803d' }
+        : { bg: 'rgba(37, 99, 235, 0.1)', border: 'rgba(37, 99, 235, 0.25)', color: 'var(--dsw-alias-primary, #2563eb)' };
+
+  const fallback = (
+    <span
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        padding: '1px 7px',
+        fontSize: 11,
+        fontWeight: 500,
+        borderRadius: 999,
+        border: `1px solid ${palette.border}`,
+        background: palette.bg,
+        color: palette.color,
+        lineHeight: 1.5,
+        whiteSpace: 'nowrap',
+        ...style
+      }}
+      {...rest}
+    >
+      {children}
+    </span>
+  );
+
+  if (!isUsableComponent(Tag) || tone === 'warning' || tone === 'danger') return fallback;
+  return (
+    <SafeErrorBoundary fallback={fallback}>
+      <Tag tone={tone} style={style} {...rest}>
+        {children}
+      </Tag>
+    </SafeErrorBoundary>
+  );
+};
+
+const SafeModal: React.FC<any> = ({ open, onClose, title, description, footer, children, closeLabel }) => {
+  if (!open) return null;
+  const fallback = (
+    <div
+      role="dialog"
+      aria-modal="true"
+      onClick={() => onClose?.()}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 10000,
+        background: 'rgba(15, 23, 42, 0.5)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 16
+      }}
+    >
+      <div
+        onClick={event => event.stopPropagation()}
+        style={{
+          width: '100%',
+          maxWidth: 680,
+          maxHeight: '85vh',
+          overflow: 'auto',
+          borderRadius: 12,
+          padding: 20,
+          background: 'var(--dsw-alias-bg-elevated, #ffffff)',
+          color: 'var(--dsw-alias-label-primary, #1e293b)',
+          border: '1px solid var(--dsw-alias-border-l1, #e2e8f0)',
+          boxShadow: '0 20px 50px rgba(0, 0, 0, 0.25)',
+          boxSizing: 'border-box'
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 8 }}>
+          <div style={{ fontSize: 16, fontWeight: 600 }}>{title}</div>
+          <button
+            type="button"
+            aria-label={closeLabel || 'Close'}
+            onClick={() => onClose?.()}
+            style={{
+              border: 'none',
+              background: 'transparent',
+              color: 'var(--dsw-alias-label-secondary, #64748b)',
+              cursor: 'pointer',
+              fontSize: 18,
+              lineHeight: 1,
+              padding: '2px 6px'
+            }}
+          >
+            ×
+          </button>
+        </div>
+        {description && (
+          <div style={{ fontSize: 13, color: 'var(--dsw-alias-label-secondary, #64748b)', marginBottom: 12 }}>
+            {description}
+          </div>
+        )}
+        {children}
+        {footer && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+            {footer}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  // If custom children (like the large Rescue Center list) are passed, or Modal isn't available, use the fallback container
+  // so complex scrollable lists render reliably across DSH versions.
+  if (children || !isUsableComponent(Modal)) return fallback;
+  return (
+    <SafeErrorBoundary fallback={fallback}>
+      <Modal
+        open={open}
+        onClose={onClose}
+        title={title}
+        closeLabel={closeLabel}
+        description={description}
+        footer={footer}
+      />
+    </SafeErrorBoundary>
+  );
+};
 
 const DEFAULT_SETTINGS: PluginSettings = {
   registry: 'npmjs',
@@ -151,7 +367,8 @@ const ERROR_KEY_BY_CODE: Record<string, string> = {
   [ERROR_CODES.installFailed]: 'error.installFailed',
   [ERROR_CODES.timeout]: 'error.timeout',
   [ERROR_CODES.verificationFailed]: 'error.verificationFailed',
-  [ERROR_CODES.rollbackFailed]: 'error.rollbackFailed'
+  [ERROR_CODES.rollbackFailed]: 'error.rollbackFailed',
+  [ERROR_CODES.selfUninstallBlocked]: 'error.selfUninstallBlocked'
 };
 
 function errorText(t: Translator, errorCode?: string, fallback?: string): string {
@@ -168,6 +385,8 @@ function isOfficialPackage(pkg: SlotActionProps['subject']['pkg']): boolean {
 const UPDATABLE_STORAGE_KEY = 'dsh-plugins-update:updatable-v1';
 const UPDATED_SESSION_KEY = 'dsh-plugins-update:updated-in-session-v1';
 const UI_PREFS_STORAGE_KEY = 'dsh-plugins-update:ui-prefs-v1';
+const LAST_HOST_VERSION_KEY = 'dsh-plugins-update:last-host-version-v1';
+const DISMISSED_RESCUE_KEY = 'dsh-plugins-update:dismissed-rescue-v1';
 
 interface UiPrefs {
   registryUrl: string;
@@ -249,6 +468,190 @@ const updatableListeners = new Set<() => void>();
 let hasRunInitialBatchCheck = false;
 let batchCheckAbortController: AbortController | null = null;
 
+// --- Plugin health, crash sniffer & rescue center global stores -----------------------
+
+interface HostUpgradeState {
+  current?: string;
+  previous?: string;
+  upgraded: boolean;
+}
+
+interface RescueModalState {
+  open: boolean;
+  focusPackage?: string;
+  autoBatch?: boolean;
+}
+
+const unhealthyPlugins = new Map<string, PluginHealthSummary>();
+const crashedPlugins = new Map<string, string>();
+const knownThirdPartyPackages = new Set<string>();
+const rescueListeners = new Set<() => void>();
+let hostUpgradeState: HostUpgradeState = { upgraded: false };
+let rescueModalState: RescueModalState = { open: false };
+let lastClickedPlugin: { name: string; timestamp: number } | null = null;
+let dismissedRescueSignature = '';
+
+try {
+  dismissedRescueSignature = window.localStorage?.getItem(DISMISSED_RESCUE_KEY) || '';
+} catch {}
+
+function notifyRescueChanged(): void {
+  for (const listener of rescueListeners) {
+    try {
+      listener();
+    } catch {}
+  }
+}
+
+function openRescueModal(focusPackage?: string, autoBatch = false): void {
+  rescueModalState = { open: true, focusPackage, autoBatch };
+  notifyRescueChanged();
+}
+
+function closeRescueModal(): void {
+  if (!rescueModalState.open) return;
+  rescueModalState = { open: false };
+  notifyRescueChanged();
+}
+
+function recordClientCrash(packageName: string, detail: string): void {
+  const name = packageName.trim();
+  if (!name || name === SELF_PACKAGE_NAME || name.startsWith('@deepseek-ai/')) return;
+  const cleanDetail = (detail || 'Runtime error').trim().slice(0, 300);
+  if (crashedPlugins.get(name) === cleanDetail) return;
+  crashedPlugins.set(name, cleanDetail);
+  // Ensure a newly detected crash immediately surfaces the banner even if previously dismissed.
+  dismissedRescueSignature = '';
+  try {
+    window.localStorage?.removeItem(DISMISSED_RESCUE_KEY);
+  } catch {}
+  notifyRescueChanged();
+}
+
+function clearPluginHealthState(packageName: string): void {
+  const name = packageName.trim();
+  if (!name) return;
+  const removedUnhealthy = unhealthyPlugins.delete(name);
+  const removedCrash = crashedPlugins.delete(name);
+  if (removedUnhealthy || removedCrash) {
+    notifyRescueChanged();
+  }
+}
+
+function computeRescueSignature(): string {
+  const issueKeys = Array.from(new Set([...unhealthyPlugins.keys(), ...crashedPlugins.keys()])).sort();
+  return JSON.stringify({
+    host: hostUpgradeState.upgraded ? hostUpgradeState.current || '' : '',
+    issues: issueKeys
+  });
+}
+
+function dismissCurrentRescueBanner(): void {
+  const sig = computeRescueSignature();
+  dismissedRescueSignature = sig;
+  try {
+    window.localStorage?.setItem(DISMISSED_RESCUE_KEY, sig);
+  } catch {}
+  notifyRescueChanged();
+}
+
+interface RescueSnapshot {
+  unhealthy: Map<string, PluginHealthSummary>;
+  crashes: Map<string, string>;
+  hostUpgrade: HostUpgradeState;
+  modal: RescueModalState;
+  dismissedSignature: string;
+}
+
+function buildRescueSnapshot(): RescueSnapshot {
+  return {
+    unhealthy: new Map(unhealthyPlugins),
+    crashes: new Map(crashedPlugins),
+    hostUpgrade: { ...hostUpgradeState },
+    modal: { ...rescueModalState },
+    dismissedSignature: dismissedRescueSignature
+  };
+}
+
+function useRescueSnapshot(): RescueSnapshot {
+  const [snapshot, setSnapshot] = useState<RescueSnapshot>(buildRescueSnapshot);
+  useEffect(() => {
+    const sync = () => setSnapshot(buildRescueSnapshot());
+    rescueListeners.add(sync);
+    sync();
+    return () => {
+      rescueListeners.delete(sync);
+    };
+  }, []);
+  return snapshot;
+}
+
+const IGNORED_NODE_MODULES = new Set([
+  'react',
+  'react-dom',
+  'scheduler',
+  'cordis',
+  'schemastery',
+  SELF_PACKAGE_NAME
+]);
+
+function extractPackageFromStackText(text: string): string | null {
+  if (!text) return null;
+  const normalized = text.replace(/\\/g, '/');
+  const nmRegex = /node_modules\/((?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = nmRegex.exec(normalized)) !== null) {
+    const candidate = match[1];
+    if (!candidate || candidate.startsWith('@deepseek-ai/') || IGNORED_NODE_MODULES.has(candidate)) continue;
+    return candidate;
+  }
+
+  const loaderMatch = normalized.match(/__ModuleLoader__[\s\S]{0,120}?["']((?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+)["']/);
+  if (loaderMatch?.[1]) {
+    const candidate = loaderMatch[1];
+    if (!candidate.startsWith('@deepseek-ai/') && !IGNORED_NODE_MODULES.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  const sortedKnown = Array.from(knownThirdPartyPackages)
+    .filter(n => n && n !== SELF_PACKAGE_NAME && !n.startsWith('@deepseek-ai/'))
+    .sort((a, b) => b.length - a.length);
+  for (const pkg of sortedKnown) {
+    if (normalized.includes(`/${pkg}/`) || normalized.includes(`"${pkg}"`) || normalized.includes(`'${pkg}'`)) {
+      return pkg;
+    }
+  }
+  return null;
+}
+
+function attributePluginCrash(message: string, stackOrFile: string): void {
+  const combined = `${stackOrFile}\n${message}`;
+  if (
+    stackOrFile.includes(`/${SELF_PACKAGE_NAME}/`) ||
+    stackOrFile.includes(`\\${SELF_PACKAGE_NAME}\\`) ||
+    message.includes(`"${SELF_PACKAGE_NAME}"`)
+  ) {
+    return;
+  }
+
+  const fromStack = extractPackageFromStackText(combined);
+  if (fromStack) {
+    recordClientCrash(fromStack, message || 'Uncaught error');
+    return;
+  }
+
+  if (lastClickedPlugin && Date.now() - lastClickedPlugin.timestamp <= 1500) {
+    recordClientCrash(lastClickedPlugin.name, message || 'Error immediately after opening plugin');
+    return;
+  }
+
+  const detailEl = document.querySelector('[data-plugin-detail]');
+  if (detailEl && lastClickedPlugin && Date.now() - lastClickedPlugin.timestamp <= 4000) {
+    recordClientCrash(lastClickedPlugin.name, message || 'Plugin detail page error');
+  }
+}
+
 function loadStorageMap(storage: Storage | undefined, key: string, target: Map<string, string>): void {
   try {
     const raw = storage?.getItem(key);
@@ -325,6 +728,58 @@ function clearPluginUpdatable(packageName: string, updatedToVersion?: string): v
   }
 }
 
+function syncHostVersionState(hostVersion?: string): boolean {
+  if (!hostVersion || !hostVersion.trim()) return false;
+  const current = hostVersion.trim();
+  let prev = '';
+  try {
+    prev = window.localStorage?.getItem(LAST_HOST_VERSION_KEY) || '';
+    if (prev !== current) {
+      window.localStorage?.setItem(LAST_HOST_VERSION_KEY, current);
+    }
+  } catch {}
+
+  if (prev && prev !== current) {
+    hostUpgradeState = { previous: prev, current, upgraded: true };
+    notifyRescueChanged();
+    return true;
+  }
+  if (!hostUpgradeState.current) {
+    hostUpgradeState = { ...hostUpgradeState, current };
+    notifyRescueChanged();
+  }
+  return false;
+}
+
+function syncUnhealthyPluginsMap(nextUnhealthy?: Record<string, PluginHealthSummary>): void {
+  if (!nextUnhealthy || typeof nextUnhealthy !== 'object') return;
+  const nextKeys = Object.keys(nextUnhealthy);
+  let changed = nextKeys.length !== unhealthyPlugins.size;
+  if (!changed) {
+    for (const key of nextKeys) {
+      const prev = unhealthyPlugins.get(key);
+      const curr = nextUnhealthy[key];
+      if (
+        !prev ||
+        prev.errorDetail !== curr.errorDetail ||
+        prev.issues.join(',') !== (curr.issues || []).join(',')
+      ) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  if (!changed) return;
+  unhealthyPlugins.clear();
+  for (const [pkg, summary] of Object.entries(nextUnhealthy)) {
+    if (pkg && summary && Array.isArray(summary.issues) && summary.issues.length > 0) {
+      unhealthyPlugins.set(pkg, summary);
+      knownThirdPartyPackages.add(pkg);
+    }
+  }
+  notifyRescueChanged();
+}
+
 function runBatchCheck(force = false, reconcileOnly = false): void {
   if (!force && !reconcileOnly && hasRunInitialBatchCheck) return;
   hasRunInitialBatchCheck = true;
@@ -357,38 +812,47 @@ function runBatchCheck(force = false, reconcileOnly = false): void {
         registryUrl: payload.registry,
         alwaysShowDetailButton: payload.alwaysShowDetailButton
       });
-      if (!payload.updatable || typeof payload.updatable !== 'object') return;
+      syncUnhealthyPluginsMap(payload.unhealthy);
+      const hostJustUpgraded = syncHostVersionState(payload.hostVersion);
 
-      const nextMap = new Map<string, string>();
-      for (const [rawName, rawVer] of Object.entries(payload.updatable)) {
-        if (typeof rawName !== 'string' || typeof rawVer !== 'string') continue;
-        const name = rawName.trim();
-        const ver = rawVer.trim().replace(/^[v^~]/, '');
-        if (!name || !ver || name.startsWith('@deepseek-ai/')) continue;
-        const alreadyUpdatedTo = updatedInSession.get(name);
-        if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) continue;
-        nextMap.set(name, ver);
-      }
+      if (payload.updatable && typeof payload.updatable === 'object') {
+        const nextMap = new Map<string, string>();
+        for (const [rawName, rawVer] of Object.entries(payload.updatable)) {
+          if (typeof rawName !== 'string' || typeof rawVer !== 'string') continue;
+          const name = rawName.trim();
+          const ver = rawVer.trim().replace(/^[v^~]/, '');
+          if (!name || !ver || name.startsWith('@deepseek-ai/')) continue;
+          knownThirdPartyPackages.add(name);
+          const alreadyUpdatedTo = updatedInSession.get(name);
+          if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) continue;
+          nextMap.set(name, ver);
+        }
 
-      let changed = nextMap.size !== updatablePlugins.size;
-      if (!changed) {
-        for (const [k, v] of nextMap.entries()) {
-          if (updatablePlugins.get(k) !== v) {
-            changed = true;
-            break;
+        let changed = nextMap.size !== updatablePlugins.size;
+        if (!changed) {
+          for (const [k, v] of nextMap.entries()) {
+            if (updatablePlugins.get(k) !== v) {
+              changed = true;
+              break;
+            }
           }
         }
+
+        if (changed) {
+          updatablePlugins.clear();
+          for (const [k, v] of nextMap.entries()) {
+            updatablePlugins.set(k, v);
+          }
+          persistUpdatablePlugins();
+          notifyUpdatableChanged();
+        } else {
+          persistUpdatablePlugins();
+        }
       }
 
-      if (changed) {
-        updatablePlugins.clear();
-        for (const [k, v] of nextMap.entries()) {
-          updatablePlugins.set(k, v);
-        }
-        persistUpdatablePlugins();
-        notifyUpdatableChanged();
-      } else {
-        persistUpdatablePlugins();
+      // If DSH just upgraded and this check used cached knownUpdates, force a fresh remote probe immediately.
+      if (hostJustUpgraded && !force) {
+        window.setTimeout(() => runBatchCheck(true), 50);
       }
     })
     .catch(() => {})
@@ -511,6 +975,494 @@ const smallButtonStyle: React.CSSProperties = {
   cursor: 'pointer'
 };
 
+const ISSUE_LABEL_KEY: Record<PluginHealthIssueKind, string> = {
+  'bundle-unavailable': 'rescue.issue.bundleUnavailable',
+  'bundle-error': 'rescue.issue.bundleError',
+  'entry-missing': 'rescue.issue.entryMissing',
+  'unregistered-bundle': 'rescue.issue.unregisteredBundle',
+  'client-crash': 'rescue.issue.clientCrash'
+};
+
+function syncDiagnosticsStores(payload: DiagnoseResult): void {
+  syncHostVersionState(payload.hostVersion);
+  const nextUnhealthy: Record<string, PluginHealthSummary> = {};
+  for (const item of payload.plugins) {
+    if (item.hasUpdate && item.latestVersion) {
+      markPluginUpdatable(item.packageName, item.latestVersion);
+    } else {
+      clearPluginUpdatable(item.packageName, item.currentVersion);
+    }
+    const backendIssues = item.issues.filter(kind => kind !== 'client-crash');
+    if (backendIssues.length > 0) {
+      nextUnhealthy[item.packageName] = {
+        issues: backendIssues,
+        errorDetail: item.errorDetail,
+        currentVersion: item.currentVersion
+      };
+    }
+  }
+  syncUnhealthyPluginsMap(nextUnhealthy);
+}
+
+interface RescueCenterPanelProps {
+  t: Translator;
+  focusPackage?: string;
+  autoBatch?: boolean;
+  compact?: boolean;
+}
+
+const RescueCenterPanel: React.FC<RescueCenterPanelProps> = ({ t, focusPackage, autoBatch, compact }) => {
+  const [loading, setLoading] = useState(true);
+  const [report, setReport] = useState<DiagnoseResult | null>(null);
+  const [diagnoseError, setDiagnoseError] = useState('');
+  const [busyPkg, setBusyPkg] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<RescueAction | null>(null);
+  const [confirmUninstallPkg, setConfirmUninstallPkg] = useState<string | null>(null);
+  const [actionFeedback, setActionFeedback] = useState<Record<string, { ok: boolean; text: string }>>({});
+  const [batchState, setBatchState] = useState<{
+    running: boolean;
+    done: number;
+    total: number;
+    currentPkg: string;
+    okCount: number;
+    failCount: number;
+    finished: boolean;
+  } | null>(null);
+
+  const mountedRef = useRef(true);
+  const busyRef = useRef(false);
+  const didAutoBatchRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const runDiagnose = useCallback(async (forceCheckUpdates = false): Promise<DiagnoseResult | null> => {
+    setLoading(true);
+    setDiagnoseError('');
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), DIAGNOSE_TIMEOUT_MS);
+    try {
+      const crashesObj: Record<string, string> = {};
+      for (const [k, v] of crashedPlugins.entries()) crashesObj[k] = v;
+      const response = await fetch(DIAGNOSE_PATH, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ forceCheckUpdates, clientCrashes: crashesObj }),
+        signal: controller.signal
+      });
+      const payload = (await response.json().catch(() => null)) as DiagnoseResult | null;
+      if (!mountedRef.current) return null;
+      if (!payload || typeof payload !== 'object' || payload.ok === false) {
+        setDiagnoseError(errorText(t, payload?.errorCode, payload?.error));
+        return null;
+      }
+      setReport(payload);
+      syncDiagnosticsStores(payload);
+      return payload;
+    } catch (error: any) {
+      if (!mountedRef.current) return null;
+      setDiagnoseError(error?.name === 'AbortError' ? t('check.timeout') : t('check.network'));
+      return null;
+    } finally {
+      window.clearTimeout(timer);
+      if (mountedRef.current) setLoading(false);
+    }
+  }, [t]);
+
+  const executeSingleRescue = useCallback(
+    async (pkg: PluginHealthReport, action: RescueAction): Promise<boolean> => {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), UPDATE_TIMEOUT_MS);
+      try {
+        const response = await fetch(RESCUE_PATH, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            packageName: pkg.packageName,
+            action,
+            targetVersion: action === 'update' ? pkg.latestVersion : undefined,
+            source: pkg.source
+          }),
+          signal: controller.signal
+        });
+        const payload = (await response.json().catch(() => null)) as RescueResult | null;
+        if (!mountedRef.current) return false;
+        if (!payload || typeof payload !== 'object' || payload.ok === false) {
+          const baseError = errorText(t, payload?.errorCode, payload?.error);
+          const fullError =
+            payload?.rollback === 'failed' && payload?.errorCode !== ERROR_CODES.rollbackFailed
+              ? `${baseError} (${t('error.rollbackFailed')})`
+              : baseError;
+          setActionFeedback(prev => ({
+            ...prev,
+            [pkg.packageName]: { ok: false, text: fullError }
+          }));
+          return false;
+        }
+
+        const finalVersion = payload.targetVersion || pkg.latestVersion || pkg.currentVersion;
+        if (action === 'uninstall') {
+          clearPluginUpdatable(pkg.packageName);
+          clearPluginHealthState(pkg.packageName);
+          setActionFeedback(prev => ({
+            ...prev,
+            [pkg.packageName]: { ok: true, text: t('rescue.result.uninstalled', { packageName: pkg.packageName }) }
+          }));
+        } else {
+          clearPluginUpdatable(pkg.packageName, finalVersion);
+          clearPluginHealthState(pkg.packageName);
+          const key =
+            action === 'reinstall'
+              ? 'rescue.result.reinstalled'
+              : pkg.packageName === SELF_PACKAGE_NAME
+                ? 'update.selfUpdate'
+                : 'rescue.result.updated';
+          setActionFeedback(prev => ({
+            ...prev,
+            [pkg.packageName]: { ok: true, text: t(key, { version: finalVersion }) }
+          }));
+        }
+        return true;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    },
+    [t]
+  );
+
+  const handleRescueAction = async (pkg: PluginHealthReport, action: RescueAction) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setConfirmUninstallPkg(null);
+    setBusyPkg(pkg.packageName);
+    setBusyAction(action);
+    try {
+      const ok = await executeSingleRescue(pkg, action);
+      if (ok && mountedRef.current) {
+        runBatchCheck(true);
+        await runDiagnose(false);
+      }
+    } catch {
+      if (mountedRef.current) {
+        setActionFeedback(prev => ({
+          ...prev,
+          [pkg.packageName]: { ok: false, text: t('update.failed') }
+        }));
+      }
+    } finally {
+      busyRef.current = false;
+      if (mountedRef.current) {
+        setBusyPkg(null);
+        setBusyAction(null);
+      }
+    }
+  };
+
+  const handleBatchUpdate = useCallback(
+    async (plugins: PluginHealthReport[]) => {
+      const targets = plugins
+        .filter(p => p.hasUpdate && p.latestVersion)
+        .sort((a, b) => (a.packageName === SELF_PACKAGE_NAME ? 1 : b.packageName === SELF_PACKAGE_NAME ? -1 : 0));
+      if (targets.length === 0 || busyRef.current) return;
+
+      busyRef.current = true;
+      let okCount = 0;
+      let failCount = 0;
+      try {
+        setBatchState({
+          running: true,
+          done: 0,
+          total: targets.length,
+          currentPkg: targets[0].packageName,
+          okCount: 0,
+          failCount: 0,
+          finished: false
+        });
+
+        for (let i = 0; i < targets.length; i++) {
+          const item = targets[i];
+          if (!mountedRef.current) break;
+          setBatchState({
+            running: true,
+            done: i,
+            total: targets.length,
+            currentPkg: item.packageName,
+            okCount,
+            failCount,
+            finished: false
+          });
+          try {
+            const ok = await executeSingleRescue(item, 'update');
+            if (ok) okCount += 1;
+            else failCount += 1;
+          } catch {
+            failCount += 1;
+            if (mountedRef.current) {
+              setActionFeedback(prev => ({
+                ...prev,
+                [item.packageName]: { ok: false, text: t('update.failed') }
+              }));
+            }
+          }
+        }
+
+        if (!mountedRef.current) return;
+        setBatchState({
+          running: false,
+          done: targets.length,
+          total: targets.length,
+          currentPkg: '',
+          okCount,
+          failCount,
+          finished: true
+        });
+        runBatchCheck(true);
+        await runDiagnose(false);
+      } finally {
+        busyRef.current = false;
+      }
+    },
+    [executeSingleRescue, runDiagnose, t]
+  );
+
+  useEffect(() => {
+    void runDiagnose(false).then(result => {
+      if (autoBatch && !didAutoBatchRef.current && result?.plugins?.length) {
+        didAutoBatchRef.current = true;
+        void handleBatchUpdate(result.plugins);
+      }
+    });
+  }, [autoBatch, handleBatchUpdate, runDiagnose]);
+
+  const plugins = report?.plugins || [];
+  const updatableCount = plugins.filter(p => p.hasUpdate && p.latestVersion).length;
+  const unhealthyCount = plugins.filter(p => !p.healthy).length;
+  const hostVersionText = report?.hostVersion
+    ? t('rescue.center.hostVersion', { version: report.hostVersion })
+    : t('rescue.center.hostVersionUnknown');
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+        <div style={{ fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>{hostVersionText}</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          <SafeButton
+            variant="outline"
+            size="sm"
+            disabled={loading || Boolean(busyPkg) || Boolean(batchState?.running)}
+            onClick={() => void runDiagnose(true)}
+          >
+            {loading ? t('rescue.center.diagnosing') : t('rescue.center.diagnoseBtn')}
+          </SafeButton>
+          {updatableCount > 0 && (
+            <SafeButton
+              variant="primary"
+              size="sm"
+              disabled={loading || Boolean(busyPkg) || Boolean(batchState?.running)}
+              onClick={() => void handleBatchUpdate(plugins)}
+            >
+              {t('rescue.center.batchUpdateBtn', { count: updatableCount })}
+            </SafeButton>
+          )}
+        </div>
+      </div>
+
+      {batchState && (
+        <div
+          style={{
+            padding: '8px 10px',
+            borderRadius: 8,
+            fontSize: 12,
+            background: batchState.finished ? 'rgba(22, 163, 74, 0.08)' : 'rgba(37, 99, 235, 0.08)',
+            border: batchState.finished ? '1px solid rgba(22, 163, 74, 0.25)' : '1px solid rgba(37, 99, 235, 0.25)',
+            color: batchState.finished ? '#15803d' : 'var(--dsw-alias-label-primary, #1e293b)'
+          }}
+        >
+          {batchState.running
+            ? t('rescue.center.batchUpdating', {
+                done: batchState.done,
+                total: batchState.total,
+                packageName: batchState.currentPkg
+              })
+            : t('rescue.center.batchDone', { ok: batchState.okCount, fail: batchState.failCount })}
+        </div>
+      )}
+
+      {diagnoseError && (
+        <div style={{ fontSize: 12, color: '#dc2626', padding: '6px 10px', borderRadius: 6, background: 'rgba(239, 68, 68, 0.08)' }}>
+          {diagnoseError}
+        </div>
+      )}
+
+      {!loading && !diagnoseError && plugins.length > 0 && unhealthyCount === 0 && (
+        <div style={{ fontSize: 12, color: '#15803d' }}>
+          {t('rescue.center.allHealthy', { count: plugins.length })}
+        </div>
+      )}
+
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
+          maxHeight: compact ? 320 : 420,
+          overflowY: 'auto',
+          paddingRight: 2
+        }}
+      >
+        {plugins.map(item => {
+          const isFocused = Boolean(focusPackage && item.packageName === focusPackage);
+          const isBusy = busyPkg === item.packageName;
+          const feedback = actionFeedback[item.packageName];
+          const isConfirmingUninstall = confirmUninstallPkg === item.packageName;
+          const isSelf = item.packageName === SELF_PACKAGE_NAME;
+
+          return (
+            <div
+              key={item.packageName}
+              ref={el => {
+                if (isFocused && el) {
+                  try {
+                    el.scrollIntoView({ block: 'nearest' });
+                  } catch {}
+                }
+              }}
+              style={{
+                padding: '10px 12px',
+                borderRadius: 8,
+                border: isFocused
+                  ? '1.5px solid #f59e0b'
+                  : !item.healthy
+                    ? '1px solid rgba(239, 68, 68, 0.4)'
+                    : '1px solid var(--dsw-alias-border-l2, #e2e8f0)',
+                background: !item.healthy
+                  ? 'rgba(239, 68, 68, 0.03)'
+                  : 'var(--dsw-alias-bg-subtle, #f8fafc)'
+              }}
+            >
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontWeight: 600, fontSize: 13 }}>{item.packageName}</span>
+                  <span style={{ fontSize: 11, fontFamily: 'monospace', color: 'var(--dsw-alias-label-secondary, #64748b)' }}>
+                    {t('rescue.center.currentVersion', { version: item.currentVersion })}
+                  </span>
+                  {item.hasUpdate && item.latestVersion && (
+                    <SafeTag tone="info">{t('rescue.center.latestVersion', { version: item.latestVersion })}</SafeTag>
+                  )}
+                  {item.healthy ? (
+                    <SafeTag tone="success">{t('rescue.center.healthyTag')}</SafeTag>
+                  ) : (
+                    item.issues.map(issue => (
+                      <SafeTag key={issue} tone="warning">
+                        {t(ISSUE_LABEL_KEY[issue] || 'error.unknown')}
+                      </SafeTag>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {item.errorDetail && (
+                <div
+                  style={{
+                    marginTop: 6,
+                    fontSize: 11,
+                    color: '#b91c1c',
+                    fontFamily: 'monospace',
+                    wordBreak: 'break-word',
+                    background: 'rgba(239, 68, 68, 0.06)',
+                    padding: '4px 8px',
+                    borderRadius: 6
+                  }}
+                >
+                  {item.errorDetail}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 8 }}>
+                {item.hasUpdate && item.latestVersion && (
+                  <SafeButton
+                    variant="primary"
+                    size="sm"
+                    disabled={Boolean(busyPkg) || Boolean(batchState?.running)}
+                    onClick={() => void handleRescueAction(item, 'update')}
+                  >
+                    {isBusy && busyAction === 'update'
+                      ? t('rescue.status.updating')
+                      : t('rescue.action.updateFix', { version: item.latestVersion })}
+                  </SafeButton>
+                )}
+                <SafeButton
+                  variant={!item.healthy && !item.hasUpdate ? 'primary' : 'outline'}
+                  size="sm"
+                  disabled={Boolean(busyPkg) || Boolean(batchState?.running)}
+                  onClick={() => void handleRescueAction(item, 'reinstall')}
+                >
+                  {isBusy && busyAction === 'reinstall' ? t('rescue.status.reinstalling') : t('rescue.action.reinstall')}
+                </SafeButton>
+                {!isSelf && !isConfirmingUninstall && (
+                  <SafeButton
+                    variant="outline"
+                    size="sm"
+                    style={{ color: '#dc2626', borderColor: 'rgba(239, 68, 68, 0.4)' }}
+                    disabled={Boolean(busyPkg) || Boolean(batchState?.running)}
+                    onClick={() => setConfirmUninstallPkg(item.packageName)}
+                  >
+                    {isBusy && busyAction === 'uninstall' ? t('rescue.status.uninstalling') : t('rescue.action.uninstall')}
+                  </SafeButton>
+                )}
+              </div>
+
+              {isConfirmingUninstall && (
+                <div
+                  style={{
+                    marginTop: 8,
+                    padding: '6px 8px',
+                    borderRadius: 6,
+                    background: 'rgba(239, 68, 68, 0.08)',
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 8,
+                    fontSize: 12
+                  }}
+                >
+                  <span style={{ color: '#b91c1c' }}>
+                    {t('rescue.action.confirmUninstall', { packageName: item.packageName })}
+                  </span>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <SafeButton
+                      variant="danger"
+                      size="sm"
+                      disabled={Boolean(busyPkg) || Boolean(batchState?.running)}
+                      onClick={() => void handleRescueAction(item, 'uninstall')}
+                    >
+                      {t('rescue.action.uninstall')}
+                    </SafeButton>
+                    <SafeButton variant="outline" size="sm" onClick={() => setConfirmUninstallPkg(null)}>
+                      {t('confirm.cancel')}
+                    </SafeButton>
+                  </div>
+                </div>
+              )}
+
+              {feedback && (
+                <div style={{ marginTop: 6, fontSize: 12, color: feedback.ok ? '#15803d' : '#b91c1c' }}>
+                  {feedback.text}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
 interface RegistrySettingsCardProps {
   form?: any;
   t: Translator;
@@ -584,95 +1536,108 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
       : normalizeRegistryUrl(settings.registry) === normalizeRegistryUrl(value);
 
   return (
-    <div style={cardStyle}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-        <span style={{ fontSize: 15, fontWeight: 600 }}>{t('settings.title')}</span>
-        {notice && <span style={{ fontSize: 11, color: '#16a34a' }}>{t(notice.key, notice.params)}</span>}
-      </div>
-      <div style={{ ...hintStyle, marginBottom: 10 }}>{t('settings.intro')}</div>
-
-      <div style={optionStyle(isCurrent('npmjs'))} onClick={() => void select('npmjs')}>
-        <input type="radio" checked={isCurrent('npmjs')} onChange={() => void select('npmjs')} disabled={!writable} style={{ marginRight: 10, marginTop: 3 }} />
-        <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 600 }}>{t('settings.npmjs')} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{OFFICIAL_REGISTRY}</span></div>
-          <div style={hintStyle}>{t('settings.npmjsHint')}</div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div style={cardStyle}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <span style={{ fontSize: 15, fontWeight: 600 }}>{t('settings.title')}</span>
+          {notice && <span style={{ fontSize: 11, color: '#16a34a' }}>{t(notice.key, notice.params)}</span>}
         </div>
-      </div>
+        <div style={{ ...hintStyle, marginBottom: 10 }}>{t('settings.intro')}</div>
 
-      <div style={optionStyle(isCurrent('npmmirror'))} onClick={() => void select('npmmirror')}>
-        <input type="radio" checked={isCurrent('npmmirror')} onChange={() => void select('npmmirror')} disabled={!writable} style={{ marginRight: 10, marginTop: 3 }} />
-        <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 600 }}>{t('settings.npmmirror')} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{DOMESTIC_REGISTRY}</span></div>
-          <div style={hintStyle}>{t('settings.npmmirrorHint')}</div>
+        <div style={optionStyle(isCurrent('npmjs'))} onClick={() => void select('npmjs')}>
+          <input type="radio" checked={isCurrent('npmjs')} onChange={() => void select('npmjs')} disabled={!writable} style={{ marginRight: 10, marginTop: 3 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600 }}>{t('settings.npmjs')} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{OFFICIAL_REGISTRY}</span></div>
+            <div style={hintStyle}>{t('settings.npmjsHint')}</div>
+          </div>
         </div>
-      </div>
 
-      {settings.customRegistries.map(item => {
-        const active = isCurrent(item.url);
-        return (
-          <div key={item.url} style={optionStyle(active)} onClick={() => void select(item.url)}>
-            <input type="radio" checked={active} onChange={() => void select(item.url)} disabled={!writable} style={{ marginRight: 10, marginTop: 3 }} />
-            <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 600 }}>{item.name || t('settings.customFallbackName')} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{item.url}</span></div>
-              <div style={hintStyle}>{t('settings.customHint')}</div>
+        <div style={optionStyle(isCurrent('npmmirror'))} onClick={() => void select('npmmirror')}>
+          <input type="radio" checked={isCurrent('npmmirror')} onChange={() => void select('npmmirror')} disabled={!writable} style={{ marginRight: 10, marginTop: 3 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600 }}>{t('settings.npmmirror')} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{DOMESTIC_REGISTRY}</span></div>
+            <div style={hintStyle}>{t('settings.npmmirrorHint')}</div>
+          </div>
+        </div>
+
+        {settings.customRegistries.map(item => {
+          const active = isCurrent(item.url);
+          return (
+            <div key={item.url} style={optionStyle(active)} onClick={() => void select(item.url)}>
+              <input type="radio" checked={active} onChange={() => void select(item.url)} disabled={!writable} style={{ marginRight: 10, marginTop: 3 }} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600 }}>{item.name || t('settings.customFallbackName')} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{item.url}</span></div>
+                <div style={hintStyle}>{t('settings.customHint')}</div>
+              </div>
+              {writable && (
+                <button
+                  type="button"
+                  style={{ ...smallButtonStyle, color: '#dc2626', borderColor: '#fca5a5' }}
+                  onClick={event => {
+                    event.stopPropagation();
+                    void removeCustom(item.url);
+                  }}
+                >
+                  {t('settings.delete')}
+                </button>
+              )}
             </div>
-            {writable && (
-              <button
-                type="button"
-                style={{ ...smallButtonStyle, color: '#dc2626', borderColor: '#fca5a5' }}
-                onClick={event => {
-                  event.stopPropagation();
-                  void removeCustom(item.url);
-                }}
-              >
-                {t('settings.delete')}
-              </button>
-            )}
+          );
+        })}
+
+        {!adding && (
+          <button type="button" style={smallButtonStyle} onClick={() => setAdding(true)} disabled={!writable}>
+            {t('settings.addCustom')}
+          </button>
+        )}
+        {adding && (
+          <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <input value={name} onChange={event => setName(event.target.value)} placeholder={t('settings.customNamePlaceholder')} style={{ height: 32, padding: '0 10px', borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1, #cbd5e1)' }} />
+            <input value={url} onChange={event => setUrl(event.target.value)} placeholder={t('settings.customUrlPlaceholder')} style={{ height: 32, padding: '0 10px', borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1, #cbd5e1)' }} />
+            {errorKey && <div style={{ color: '#b91c1c', fontSize: 12 }}>{t(errorKey)}</div>}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button type="button" style={smallButtonStyle} onClick={() => void addCustom()} disabled={!writable}>{t('settings.saveUse')}</button>
+              <button type="button" style={smallButtonStyle} onClick={() => { setAdding(false); setErrorKey(''); }}>{t('settings.cancel')}</button>
+            </div>
           </div>
-        );
-      })}
+        )}
 
-      {!adding && (
-        <button type="button" style={smallButtonStyle} onClick={() => setAdding(true)} disabled={!writable}>
-          {t('settings.addCustom')}
-        </button>
-      )}
-      {adding && (
-        <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <input value={name} onChange={event => setName(event.target.value)} placeholder={t('settings.customNamePlaceholder')} style={{ height: 32, padding: '0 10px', borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1, #cbd5e1)' }} />
-          <input value={url} onChange={event => setUrl(event.target.value)} placeholder={t('settings.customUrlPlaceholder')} style={{ height: 32, padding: '0 10px', borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1, #cbd5e1)' }} />
-          {errorKey && <div style={{ color: '#b91c1c', fontSize: 12 }}>{t(errorKey)}</div>}
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button type="button" style={smallButtonStyle} onClick={() => void addCustom()} disabled={!writable}>{t('settings.saveUse')}</button>
-            <button type="button" style={smallButtonStyle} onClick={() => { setAdding(false); setErrorKey(''); }}>{t('settings.cancel')}</button>
+        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 14, fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>
+          <input
+            type="checkbox"
+            checked={settings.fallbackToOfficial}
+            disabled={!writable}
+            onChange={() => void updateField('fallbackToOfficial', !settings.fallbackToOfficial)}
+            style={{ marginTop: 2 }}
+          />
+          {t('settings.fallback')}
+        </label>
+
+        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 12, fontSize: 12, color: 'var(--dsw-alias-label-primary, #1e293b)', cursor: writable ? 'pointer' : 'default' }}>
+          <input
+            type="checkbox"
+            checked={settings.alwaysShowDetailButton}
+            disabled={!writable}
+            onChange={() => void updateField('alwaysShowDetailButton', !settings.alwaysShowDetailButton)}
+            style={{ marginTop: 3 }}
+          />
+          <div>
+            <div style={{ fontWeight: 500 }}>{t('settings.alwaysShowDetail')}</div>
+            <div style={hintStyle}>{t('settings.alwaysShowDetailHint')}</div>
           </div>
-        </div>
-      )}
+        </label>
+      </div>
 
-      <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 14, fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>
-        <input
-          type="checkbox"
-          checked={settings.fallbackToOfficial}
-          disabled={!writable}
-          onChange={() => void updateField('fallbackToOfficial', !settings.fallbackToOfficial)}
-          style={{ marginTop: 2 }}
-        />
-        {t('settings.fallback')}
-      </label>
-
-      <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 12, fontSize: 12, color: 'var(--dsw-alias-label-primary, #1e293b)', cursor: writable ? 'pointer' : 'default' }}>
-        <input
-          type="checkbox"
-          checked={settings.alwaysShowDetailButton}
-          disabled={!writable}
-          onChange={() => void updateField('alwaysShowDetailButton', !settings.alwaysShowDetailButton)}
-          style={{ marginTop: 3 }}
-        />
-        <div>
-          <div style={{ fontWeight: 500 }}>{t('settings.alwaysShowDetail')}</div>
-          <div style={hintStyle}>{t('settings.alwaysShowDetailHint')}</div>
+      <div style={cardStyle}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
+          <span style={{ fontSize: 15, fontWeight: 600 }}>{t('rescue.center.title')}</span>
+          <SafeButton variant="outline" size="sm" onClick={() => openRescueModal()}>
+            {t('rescue.center.openRescueModal')}
+          </SafeButton>
         </div>
-      </label>
+        <div style={{ ...hintStyle, marginBottom: 12 }}>{t('rescue.center.intro')}</div>
+        <RescueCenterPanel t={t} compact />
+      </div>
     </div>
   );
 };
@@ -911,14 +1876,14 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     return (
       <div style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
         {status === 'has_update' && (
-          <Button
+          <SafeButton
             variant="outline"
             size="sm"
             onClick={() => setConfirmOpen(true)}
             title={t('action.fastUpdateTip')}
           >
             {t('action.fastUpdate', { version: latestVersion })}
-          </Button>
+          </SafeButton>
         )}
         {status === 'updating' && (
           <span style={{ fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>{t('action.updating')}</span>
@@ -927,14 +1892,14 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
           <span style={{ fontSize: 12, color: '#15803d' }}>{messageText || t('action.success')}</span>
         )}
         {status === 'error' && (
-          <Button variant="outline" size="sm" onClick={() => void fetchCheck()}>
+          <SafeButton variant="outline" size="sm" onClick={() => void fetchCheck()}>
             {t('action.retry')}
-          </Button>
+          </SafeButton>
         )}
         {messageText && status !== 'success' && (
           <div style={{ fontSize: 12, color: status === 'error' ? '#b91c1c' : '#15803d', maxWidth: 360 }}>{messageText}</div>
         )}
-        <Modal
+        <SafeModal
           open={confirmOpen}
           onClose={() => setConfirmOpen(false)}
           title={t('confirm.title')}
@@ -942,12 +1907,12 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
           description={t('confirm.body', { packageName, version: latestVersion })}
           footer={
             <>
-              <Button variant="outline" onClick={() => setConfirmOpen(false)}>
+              <SafeButton variant="outline" onClick={() => setConfirmOpen(false)}>
                 {t('confirm.cancel')}
-              </Button>
-              <Button variant="primary" onClick={() => void runUpdate()}>
+              </SafeButton>
+              <SafeButton variant="primary" onClick={() => void runUpdate()}>
                 {t('confirm.ok')}
-              </Button>
+              </SafeButton>
             </>
           }
         />
@@ -982,19 +1947,19 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
 
   return (
     <div style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
-      <Button
+      <SafeButton
         variant={status === 'has_update' ? 'primary' : 'outline'}
         size="sm"
         onClick={onButtonClick}
         disabled={status === 'checking' || status === 'updating'}
       >
         {buttonLabel}
-      </Button>
+      </SafeButton>
       {messageText && (
         <div style={{ fontSize: 12, color: status === 'error' ? '#b91c1c' : '#15803d', maxWidth: 360 }}>{messageText}</div>
       )}
 
-      <Modal
+      <SafeModal
         open={confirmOpen}
         onClose={() => setConfirmOpen(false)}
         title={t('confirm.title')}
@@ -1002,12 +1967,12 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
         description={t('confirm.body', { packageName, version: latestVersion })}
         footer={
           <>
-            <Button variant="outline" onClick={() => setConfirmOpen(false)}>
+            <SafeButton variant="outline" onClick={() => setConfirmOpen(false)}>
               {t('confirm.cancel')}
-            </Button>
-            <Button variant="primary" onClick={() => void runUpdate()}>
+            </SafeButton>
+            <SafeButton variant="primary" onClick={() => void runUpdate()}>
               {t('confirm.ok')}
-            </Button>
+            </SafeButton>
           </>
         }
       />
@@ -1015,10 +1980,11 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
   );
 };
 
-// --- Proactive & persistent update reminders (Sidebar count & Installed list badges) -
+// --- Proactive & persistent update reminders (Sidebar count, row badges & rescue UI) --
 
 const SIDEBAR_BADGE_ATTR = 'data-dsh-updater-sidebar-badge';
 const ROW_BADGE_ATTR = 'data-dsh-updater-row-badge';
+const ROW_ISSUE_ATTR = 'data-dsh-updater-row-issue';
 const NATIVE_UPDATE_LABELS = new Set(['可更新', 'Update available']);
 
 function hasNativeUpdateTag(card: HTMLElement, t: Translator): boolean {
@@ -1027,8 +1993,9 @@ function hasNativeUpdateTag(card: HTMLElement, t: Translator): boolean {
   for (const el of Array.from(candidates)) {
     if (
       el.hasAttribute(ROW_BADGE_ATTR) ||
-      el.closest(`[${ROW_BADGE_ATTR}]`) ||
-      el.querySelector(`[${ROW_BADGE_ATTR}]`)
+      el.hasAttribute(ROW_ISSUE_ATTR) ||
+      el.closest(`[${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}]`) ||
+      el.querySelector(`[${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}]`)
     ) {
       continue;
     }
@@ -1044,9 +2011,9 @@ function hasNativeUpdateTag(card: HTMLElement, t: Translator): boolean {
   return false;
 }
 
-function mountRowBadgeHost(card: HTMLLIElement, pkgName: string): HTMLElement {
+function mountRowBadgeHost(card: HTMLLIElement, pkgName: string, attrName: string = ROW_BADGE_ATTR): HTMLElement {
   const host = document.createElement('span');
-  host.setAttribute(ROW_BADGE_ATTR, pkgName);
+  host.setAttribute(attrName, pkgName);
   host.style.cssText = 'display: inline-flex; align-items: center; flex: none; cursor: pointer;';
   // DSH PackageCard renders native status tags (Beta / Update available) inside the titleRow beside cardTitle.
   const titleBtn = card.querySelector<HTMLElement>('button:not([role="switch"])');
@@ -1075,7 +2042,8 @@ function isOwnBadgeMutation(mutation: MutationRecord): boolean {
     targetEl &&
     (targetEl.hasAttribute(SIDEBAR_BADGE_ATTR) ||
       targetEl.hasAttribute(ROW_BADGE_ATTR) ||
-      targetEl.closest(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}]`))
+      targetEl.hasAttribute(ROW_ISSUE_ATTR) ||
+      targetEl.closest(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}]`))
   ) {
     return true;
   }
@@ -1086,7 +2054,9 @@ function isOwnBadgeMutation(mutation: MutationRecord): boolean {
       nodes.every(
         node =>
           node instanceof Element &&
-          (node.hasAttribute(SIDEBAR_BADGE_ATTR) || node.hasAttribute(ROW_BADGE_ATTR))
+          (node.hasAttribute(SIDEBAR_BADGE_ATTR) ||
+            node.hasAttribute(ROW_BADGE_ATTR) ||
+            node.hasAttribute(ROW_ISSUE_ATTR))
       )
     ) {
       return true;
@@ -1150,12 +2120,22 @@ interface RowMountTarget {
   card: HTMLLIElement;
 }
 
+interface IssueRowMountTarget {
+  packageName: string;
+  hasUpdate: boolean;
+  latestVersion?: string;
+  detail?: string;
+  host: HTMLElement;
+}
+
 const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, t, locale }) => {
   useLocaleRevision(locale);
   const updatableEntries = useUpdatableSnapshot();
+  const rescue = useRescueSnapshot();
 
   const [sidebarHost, setSidebarHost] = useState<HTMLElement | null>(null);
   const [rowTargets, setRowTargets] = useState<RowMountTarget[]>([]);
+  const [issueTargets, setIssueTargets] = useState<IssueRowMountTarget[]>([]);
   const lastNativeDoneRef = useRef(false);
 
   useEffect(() => {
@@ -1165,9 +2145,51 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
     return () => window.clearTimeout(timer);
   }, []);
 
+  // Global client crash sniffer & plugin card click attribution.
+  useEffect(() => {
+    const onCaptureClick = (event: MouseEvent) => {
+      const target = event.target as Element | null;
+      if (!target) return;
+      if (target.closest(`[${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}], [role="switch"]`)) return;
+      const card = target.closest('li[data-plugin-package]');
+      const pkgName = card?.getAttribute('data-plugin-package')?.trim();
+      if (pkgName && pkgName !== SELF_PACKAGE_NAME && !pkgName.startsWith('@deepseek-ai/')) {
+        knownThirdPartyPackages.add(pkgName);
+        lastClickedPlugin = { name: pkgName, timestamp: Date.now() };
+      }
+    };
+
+    const onWindowError = (event: ErrorEvent) => {
+      const msg = String(event?.message || event?.error?.message || '');
+      const stack = `${event?.filename || ''}\n${event?.error?.stack || ''}`;
+      attributePluginCrash(msg, stack);
+    };
+
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const reason = event?.reason;
+      const msg =
+        typeof reason === 'string'
+          ? reason
+          : typeof reason?.message === 'string'
+            ? reason.message
+            : String(reason || '');
+      const stack = typeof reason?.stack === 'string' ? reason.stack : '';
+      attributePluginCrash(msg, stack);
+    };
+
+    document.addEventListener('click', onCaptureClick, true);
+    window.addEventListener('error', onWindowError);
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
+    return () => {
+      document.removeEventListener('click', onCaptureClick, true);
+      window.removeEventListener('error', onWindowError);
+      window.removeEventListener('unhandledrejection', onUnhandledRejection);
+    };
+  }, []);
+
   const syncDomTargets = useCallback(() => {
     try {
-      // 1. Sync Sidebar "Plugins" count badge host (Image 4)
+      // 1. Sync Sidebar "Plugins" count badge host
       const pluginsBtn = findSidebarPluginsButton(slots);
       if (pluginsBtn) {
         let host = pluginsBtn.querySelector<HTMLElement>(`span[${SIDEBAR_BADGE_ATTR}="true"]`);
@@ -1200,13 +2222,36 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         setSidebarHost(prev => (prev === null ? null : null));
       }
 
-      // 2. Sync Installed Plugins list row badges at right-arrow position (Image 3)
+      // 2. Detect blank or error-boundary detail page shortly after clicking a third-party plugin card
+      const detailEl = document.querySelector<HTMLElement>('[data-plugin-detail]');
+      if (detailEl && lastClickedPlugin) {
+        const elapsed = Date.now() - lastClickedPlugin.timestamp;
+        if (elapsed <= 5000) {
+          const text = (detailEl.textContent || '').trim();
+          const hasExplicitErr = Boolean(detailEl.querySelector('[data-plugin-error], [data-error-boundary]'));
+          const isBlank = elapsed >= 1000 && text.length === 0;
+          const looksBroken = /Something went wrong|ChunkLoadError|Minified React error|组件加载失败|页面渲染失败|插件加载异常/i.test(text);
+          if (hasExplicitErr || isBlank || looksBroken) {
+            recordClientCrash(
+              lastClickedPlugin.name,
+              isBlank ? '打开插件详情页后页面空白' : text.slice(0, 200)
+            );
+          }
+        }
+      }
+
+      // 3. Sync Installed Plugins list row badges (issue badges & update badges)
       const cards = Array.from(document.querySelectorAll<HTMLLIElement>('li[data-plugin-package]'));
-      if (cards.length > 0 && !document.querySelector('[data-plugin-detail]')) {
+      if (cards.length > 0 && !detailEl) {
         const installedSet = new Set<string>();
         for (const card of cards) {
           const name = card.getAttribute('data-plugin-package');
-          if (name) installedSet.add(name);
+          if (name) {
+            installedSet.add(name);
+            if (name !== SELF_PACKAGE_NAME && !name.startsWith('@deepseek-ai/')) {
+              knownThirdPartyPackages.add(name);
+            }
+          }
         }
         // If the main installed list is rendered, prune any package that was uninstalled
         if (installedSet.has(SELF_PACKAGE_NAME)) {
@@ -1219,29 +2264,52 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
       }
 
       const nextRowTargets: RowMountTarget[] = [];
+      const nextIssueTargets: IssueRowMountTarget[] = [];
       for (const card of cards) {
         const pkgName = card.getAttribute('data-plugin-package') || '';
         if (!pkgName) continue;
         const latestVersion = updatablePlugins.get(pkgName);
+        const unhealthySummary = unhealthyPlugins.get(pkgName);
+        const crashDetail = crashedPlugins.get(pkgName);
+        const hasIssue = Boolean(unhealthySummary || crashDetail);
+
         const escapedPkg =
           typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
             ? CSS.escape(pkgName)
             : pkgName.replace(/["\\]/g, '\\$&');
-        let host = card.querySelector<HTMLElement>(`span[${ROW_BADGE_ATTR}="${escapedPkg}"]`);
+        let updateHost = card.querySelector<HTMLElement>(`span[${ROW_BADGE_ATTR}="${escapedPkg}"]`);
+        let issueHost = card.querySelector<HTMLElement>(`span[${ROW_ISSUE_ATTR}="${escapedPkg}"]`);
+
+        if (hasIssue) {
+          if (updateHost) updateHost.remove();
+          if (!issueHost) {
+            issueHost = mountRowBadgeHost(card as HTMLLIElement, pkgName, ROW_ISSUE_ATTR);
+          }
+          nextIssueTargets.push({
+            packageName: pkgName,
+            hasUpdate: Boolean(latestVersion),
+            latestVersion,
+            detail: crashDetail || unhealthySummary?.errorDetail,
+            host: issueHost
+          });
+          continue;
+        }
+
+        if (issueHost) issueHost.remove();
 
         // Avoid duplicate tags if DSH native already displayed its own "可更新" (statusUpdateAvailable) Tag
         if (latestVersion && !hasNativeUpdateTag(card, t)) {
-          if (!host) {
-            host = mountRowBadgeHost(card as HTMLLIElement, pkgName);
+          if (!updateHost) {
+            updateHost = mountRowBadgeHost(card as HTMLLIElement, pkgName, ROW_BADGE_ATTR);
           }
           nextRowTargets.push({
             packageName: pkgName,
             latestVersion,
-            host,
+            host: updateHost,
             card
           });
-        } else if (host) {
-          host.remove();
+        } else if (updateHost) {
+          updateHost.remove();
         }
       }
 
@@ -1260,7 +2328,23 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         return nextRowTargets;
       });
 
-      // 3. Reconcile badge cache when DSH's native UpdateDialog / InstallDialog settles on "done"
+      setIssueTargets(prev => {
+        if (
+          prev.length === nextIssueTargets.length &&
+          prev.every(
+            (item, i) =>
+              item.packageName === nextIssueTargets[i].packageName &&
+              item.hasUpdate === nextIssueTargets[i].hasUpdate &&
+              item.latestVersion === nextIssueTargets[i].latestVersion &&
+              item.host === nextIssueTargets[i].host
+          )
+        ) {
+          return prev;
+        }
+        return nextIssueTargets;
+      });
+
+      // 4. Reconcile badge cache when DSH's native UpdateDialog / InstallDialog settles on "done"
       const nativeDone = Boolean(document.querySelector('[data-plugin-update="done"], [data-install-phase="done"]'));
       if (nativeDone && !lastNativeDoneRef.current) {
         runBatchCheck(false, true);
@@ -1271,7 +2355,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
   useEffect(() => {
     syncDomTargets();
-  }, [syncDomTargets, updatableEntries]);
+  }, [syncDomTargets, updatableEntries, rescue]);
 
   useEffect(() => {
     let rafId = 0;
@@ -1312,11 +2396,19 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
   useEffect(() => {
     return () => {
-      document.querySelectorAll(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}]`).forEach(el => el.remove());
+      document
+        .querySelectorAll(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}]`)
+        .forEach(el => el.remove());
     };
   }, []);
 
   const count = updatableEntries.length;
+  const issueCount = new Set([...rescue.unhealthy.keys(), ...rescue.crashes.keys()]).size;
+  const currentSignature = computeRescueSignature();
+  const shouldShowBanner =
+    (issueCount > 0 || (rescue.hostUpgrade.upgraded && count > 0)) &&
+    currentSignature !== rescue.dismissedSignature &&
+    !rescue.modal.open;
 
   return (
     <>
@@ -1324,7 +2416,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         count > 0 &&
         createPortal(
           <span title={t('badge.sidebarTip', { count })} style={{ display: 'inline-flex', alignItems: 'center' }}>
-            <Tag tone="info">{String(count)}</Tag>
+            <SafeTag tone="info">{String(count)}</SafeTag>
           </span>,
           sidebarHost
         )}
@@ -1340,11 +2432,89 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
             }}
             style={{ display: 'inline-flex', alignItems: 'center' }}
           >
-            <Tag tone="info">{t('badge.updateAvailable')}</Tag>
+            <SafeTag tone="info">{t('badge.updateAvailable')}</SafeTag>
           </span>,
           host
         )
       )}
+      {issueTargets.map(({ packageName, hasUpdate, latestVersion, detail, host }) =>
+        createPortal(
+          <span
+            key={`issue:${packageName}`}
+            title={detail || (latestVersion ? `v${latestVersion}` : packageName)}
+            onClick={event => {
+              event.preventDefault();
+              event.stopPropagation();
+              openRescueModal(packageName);
+            }}
+            style={{ display: 'inline-flex', alignItems: 'center' }}
+          >
+            <SafeTag tone="warning">{hasUpdate ? t('badge.issueAndUpdate') : t('badge.issueDetected')}</SafeTag>
+          </span>,
+          host
+        )
+      )}
+
+      {shouldShowBanner && (
+        <div
+          style={{
+            position: 'fixed',
+            right: 20,
+            bottom: 20,
+            zIndex: 9500,
+            width: 360,
+            maxWidth: 'calc(100vw - 40px)',
+            padding: '12px 14px',
+            borderRadius: 12,
+            background: 'var(--dsw-alias-bg-elevated, #ffffff)',
+            color: 'var(--dsw-alias-label-primary, #1e293b)',
+            border: issueCount > 0 ? '1.5px solid #f59e0b' : '1.5px solid var(--dsw-alias-primary, #2563eb)',
+            boxShadow: '0 12px 32px rgba(15, 23, 42, 0.18)',
+            boxSizing: 'border-box'
+          }}
+        >
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+            {issueCount > 0
+              ? t('rescue.banner.crashTitle', { count: issueCount })
+              : t('rescue.banner.hostUpgradedTitle', { version: rescue.hostUpgrade.current || '' })}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)', lineHeight: 1.5, marginBottom: 10 }}>
+            {t('rescue.banner.desc')}
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            <SafeButton variant="primary" size="sm" onClick={() => openRescueModal()}>
+              {t('rescue.banner.openCenter')}
+            </SafeButton>
+            {count > 0 && (
+              <SafeButton variant="outline" size="sm" onClick={() => openRescueModal(undefined, true)}>
+                {t('rescue.banner.batchUpdate', { count })}
+              </SafeButton>
+            )}
+            <SafeButton variant="outline" size="sm" onClick={() => dismissCurrentRescueBanner()}>
+              {t('rescue.banner.dismiss')}
+            </SafeButton>
+          </div>
+        </div>
+      )}
+
+      <SafeModal
+        open={rescue.modal.open}
+        onClose={() => closeRescueModal()}
+        title={t('rescue.modal.title')}
+        closeLabel={t('confirm.close')}
+        description={t('rescue.modal.subtitle')}
+        footer={
+          <SafeButton variant="outline" onClick={() => closeRescueModal()}>
+            {t('confirm.close')}
+          </SafeButton>
+        }
+      >
+        <RescueCenterPanel
+          t={t}
+          focusPackage={rescue.modal.focusPackage}
+          autoBatch={rescue.modal.autoBatch}
+        />
+      </SafeModal>
     </>
   );
 };
@@ -1373,7 +2543,12 @@ export function apply(ctx: any) {
         id: 'dsh-plugins-update.reminders-overlay',
         order: 50
       },
-      (props: any) => React.createElement(UpdateRemindersOverlay, { ...props, slots, t, locale })
+      (props: any) =>
+        React.createElement(
+          SafeErrorBoundary,
+          { fallback: null },
+          React.createElement(UpdateRemindersOverlay, { ...props, slots, t, locale })
+        )
     )
   );
 
@@ -1384,7 +2559,12 @@ export function apply(ctx: any) {
         id: 'dsh-plugins-update.action-button',
         order: -10
       },
-      (props: SlotActionProps) => React.createElement(UpdaterActionButton, { ...props, t, locale })
+      (props: SlotActionProps) =>
+        React.createElement(
+          SafeErrorBoundary,
+          { fallback: null },
+          React.createElement(UpdaterActionButton, { ...props, t, locale })
+        )
     )
   );
 
@@ -1395,7 +2575,12 @@ export function apply(ctx: any) {
           name: 'plugins.bundle.config',
           key: 'dsh-plugins-update'
         },
-        () => React.createElement(RegistrySettingsCard, { form: form || getForm(), t, locale })
+        () =>
+          React.createElement(
+            SafeErrorBoundary,
+            { fallback: null },
+            React.createElement(RegistrySettingsCard, { form: form || getForm(), t, locale })
+          )
       )
     );
   };
