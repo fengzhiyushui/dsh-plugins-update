@@ -21,6 +21,8 @@
 
 ---
 
+> ⚠️ **实验性分支说明（`experimental`）**：当前分支为实验性分支（`v0.2.5-exp.1`），**不进行 npm 包打包，不支持通过 npm 安装**，仅支持通过 GitHub 指定分支安装（`fengzhiyushui/dsh-plugins-update#experimental`）。如需稳定正式版，请切换至 [`main` 主分支](https://github.com/fengzhiyushui/dsh-plugins-update/tree/main)。
+
 > **重要提醒**：DeepSeek Harness（DSH）自 `0.2.2-rc.1` 起已原生支持插件检查与更新功能；本插件自 `v0.2.2` 起开始针对 DSH 原生更新机制进行适配（兼容 DSH `0.2.2-rc.1` ~ `0.2.2-rc.3`，当前已适配并验证至 `0.2.2-rc.3`）。
 
 ## 插件介绍
