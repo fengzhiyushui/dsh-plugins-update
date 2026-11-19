@@ -3,8 +3,13 @@ export const OFFICIAL_REGISTRY = 'https://registry.npmjs.org/';
 /** Domestic mirror used by DSH itself. */
 export const DOMESTIC_REGISTRY = 'https://registry.npmmirror.com/';
 
+/** Plugin package and Cordis service identifier. */
+export const PLUGIN_NAME = 'dsh-plugins-update';
+/** Package scope prefix reserved for official DSH plugins. */
+export const OFFICIAL_PACKAGE_PREFIX = '@deepseek-ai/';
+
 /** Locale namespace owned by this plugin's client dictionaries. */
-export const LOCALE_NAMESPACE = 'dsh-plugins-update';
+export const LOCALE_NAMESPACE = PLUGIN_NAME;
 
 /** HTTP paths served by the backend half. */
 export const CHECK_PATH = '/api/dsh-plugins-update/check';
@@ -56,7 +61,6 @@ export interface CheckUpdateResult {
   currentVersion?: string;
   latestVersion?: string;
   hasUpdate: boolean;
-  description?: string;
   source?: string;
   isGithub?: boolean;
   registry?: string;
@@ -68,6 +72,7 @@ export interface CheckUpdateResult {
 export interface CheckAllParams {
   knownUpdates?: Record<string, string>;
   force?: boolean;
+  reconcile?: boolean;
 }
 
 export interface CheckAllResult {
@@ -90,14 +95,9 @@ export interface DoUpdateResult {
   packageName: string;
   targetVersion?: string;
   source?: string;
-  registryUsed?: string;
-  registryLabel?: string;
-  fellBack?: boolean;
-  selfUpdate?: boolean;
   rollback?: 'not-needed' | 'restored' | 'failed';
   error?: string;
   errorCode?: ErrorCode | string;
-  output?: string;
 }
 
 export interface SlotActionSubject {
@@ -119,6 +119,11 @@ export interface SlotActionProps {
   subject: SlotActionSubject;
 }
 
+/** Check whether a package name belongs to the official DSH scope. */
+export function isOfficialPackageName(packageName: string | undefined | null): boolean {
+  return typeof packageName === 'string' && packageName.startsWith(OFFICIAL_PACKAGE_PREFIX);
+}
+
 /** Normalize a registry URL the way pnpm compares them. */
 export function normalizeRegistryUrl(url: string | undefined | null): string | null {
   if (typeof url !== 'string') return null;
@@ -137,18 +142,11 @@ export function normalizeRegistryUrl(url: string | undefined | null): string | n
   return parsed.href;
 }
 
-/** Human-readable label for a registry URL. */
-export function registryLabel(url: string, customs: CustomRegistry[] = []): string {
-  const normalized = normalizeRegistryUrl(url) ?? url;
-  if (normalized === OFFICIAL_REGISTRY) return 'npm 官方源';
-  if (normalized === DOMESTIC_REGISTRY) return '国内源 npmmirror';
-  const custom = customs.find(c => normalizeRegistryUrl(c.url) === normalized);
-  if (custom?.name) return `自定义源「${custom.name}」`;
-  try {
-    return `自定义源 ${new URL(normalized).host}`;
-  } catch {
-    return normalized;
-  }
+/** Resolve a stored registry choice ('npmjs' | 'npmmirror' | custom URL) to a normalized URL. */
+export function resolveRegistryUrl(registry: string | undefined | null): string {
+  if (!registry || registry === 'npmjs') return OFFICIAL_REGISTRY;
+  if (registry === 'npmmirror') return DOMESTIC_REGISTRY;
+  return normalizeRegistryUrl(registry) ?? OFFICIAL_REGISTRY;
 }
 
 export interface ParsedSemver {

@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
-  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.2.4-brightgreen.svg" alt="Release" /></a>
+  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.2.5-brightgreen.svg" alt="Release" /></a>
   <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin" /></a>
 </p>
 
@@ -21,7 +21,7 @@
 
 ---
 
-> **重要提醒**：DeepSeek Harness（DSH）自 `0.2.2-rc.1` 起已原生支持插件检查与更新功能；本插件自 `v0.2.2` 起开始针对 DSH 原生更新机制进行适配（兼容 DSH `0.2.2-rc.1` ~ `0.2.2-rc.3`，当前已适配并验证至 `0.2.2-rc.3`）。
+> **重要提醒**：DeepSeek Harness（DSH）自 `0.2.2-rc.1` 起已原生支持插件检查与更新功能；本插件自 `v0.2.2` 起开始针对 DSH 原生更新机制进行适配（兼容 DSH `0.2.2-rc.1` ~ `0.2.5-rc.5`，当前已适配并验证至 `0.2.5-rc.5`）。
 
 ## 插件介绍
 
