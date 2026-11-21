@@ -12,6 +12,29 @@ All notable changes to this project will be documented in this file.
 - Added three detail-page-independent rescue entrances: installed list row warning badges (`⚠️ Issue / Fix`, opening the Rescue Modal without entering potentially broken detail pages), a floating bottom-right upgrade/rescue banner, and the shared `RescueCenterPanel` (embedded in both `RegistrySettingsCard` and `PluginRescueModal`) with batch update support.
 - Wrapped UI primitives (`SafeButton`, `SafeModal`, `SafeTag`) and slot entrypoints in `SafeErrorBoundary` with native HTML/CSS fallbacks so `dsh-plugins-update` stays resilient across future DSH UI changes.
 
+## [0.2.5] - 2026-11-19
+
+### Added
+- Added `--watch` mode in `build.mjs` using `esbuild.context()` for live incremental rebuilds of `lib/index.js` and wrapped `lib/client.js`.
+- Added `reconcile` flag on `/api/dsh-plugins-update/check-all` so post-dialog badge reconciliation never reuses a stale in-flight startup probe.
+- Added `ResizeObserver` monitoring on the cached sidebar `Plugins` button for smooth collapsed/expanded badge repositioning.
+- Added shared `PLUGIN_NAME`, `OFFICIAL_PACKAGE_PREFIX`, `isOfficialPackageName`, and `resolveRegistryUrl` helpers in `src/types.ts`.
+
+### Changed
+- Changed `fetchNpmLatest` to request abbreviated npm metadata (`Accept: application/vnd.npm.install-v1+json, application/json;q=0.9`), cutting registry payload sizes during background probes.
+- Throttled the global `MutationObserver` (200ms trailing throttle + rAF, keeping attribute-driven dialog settlement immediate) and cached sidebar DOM/CSS state in `UpdateRemindersOverlay`.
+- Pre-read profile `package.json` dependencies once per batch check in `listInstalledThirdPartyPackages` and eliminated redundant store persistence/notifications when values did not change.
+- Aligned client/server timeouts (`15s` client check vs `12s` backend check; `300s` client update timeout) and made `build.mjs` invoke local `tsc` directly and fail fast on declaration errors.
+- Removed unused unredacted `DoUpdateResult.output`, unused response/type fields (`registryUsed`, `registryLabel`, `fellBack`, `selfUpdate`, `description`, `pinnedCommit`), unused locale keys (`action.checkUpdate`, `action.updateTo`, `action.updateFailed`), and unused primitive declarations; deduplicated detail-page `<Modal>` JSX and backend child env/policy-retry helpers.
+- Verified compatibility through DSH `0.2.5-rc.5` in `README.md` and `README_zh.md`.
+
+### Fixed
+- Fixed macOS double `Resources/resources/` path concatenation in `desktopCliCandidates()` and `pnpmCandidates()`.
+- Fixed installed-list search/filtering accidentally pruning update badges for hidden plugins.
+- Fixed `UpdaterActionButton` check/update race conditions by separating `checkAbortRef` / `updateAbortRef`, ignoring stale responses on plugin switches/unmounts, and avoiding aborting in-flight updates when navigating away.
+- Fixed row badge `createPortal` calls missing the third `key` parameter, lockfile-less rollbacks falsely reporting `rollback: 'failed'`, settings card notice timer clashes, radio row click double-triggers, redundant re-scans on unchanged selections, and missing write/error checks in `addCustom`/`removeCustom`.
+- Fixed live locale switching for backend `errorCode` messages in `UpdaterActionButton`, preserved `packageName` in `CHECK_PATH` error responses, and returned the slot disposer from `registerBundleConfig`.
+
 ## [0.2.4] - 2026-11-14
 
 ### Added

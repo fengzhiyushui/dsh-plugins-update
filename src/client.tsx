@@ -9,14 +9,20 @@ import {
   ERROR_CODES,
   LOCALE_NAMESPACE,
   OFFICIAL_REGISTRY,
+  PLUGIN_NAME,
   RESCUE_PATH,
   UPDATE_PATH,
+  isOfficialPackageName,
   normalizeRegistryUrl,
+  resolveRegistryUrl,
   versionGte,
+  type CheckAllParams,
   type CheckAllResult,
+  type CheckUpdateParams,
   type CheckUpdateResult,
   type CustomRegistry,
   type DiagnoseResult,
+  type DoUpdateParams,
   type DoUpdateResult,
   type PluginHealthIssueKind,
   type PluginHealthReport,
@@ -28,11 +34,10 @@ import {
 } from './types.js';
 import { en, zh } from './locales.js';
 
-const CHECK_TIMEOUT_MS = 12_000;
+const CHECK_TIMEOUT_MS = 15_000;
 const BATCH_CHECK_TIMEOUT_MS = 25_000;
 const DIAGNOSE_TIMEOUT_MS = 25_000;
-const UPDATE_TIMEOUT_MS = 190_000;
-const SELF_PACKAGE_NAME = 'dsh-plugins-update';
+const UPDATE_TIMEOUT_MS = 300_000;
 
 // --- Self-defense ErrorBoundary & UI primitive fallbacks ----------------------------
 
@@ -377,7 +382,7 @@ function errorText(t: Translator, errorCode?: string, fallback?: string): string
 }
 
 function isOfficialPackage(pkg: SlotActionProps['subject']['pkg']): boolean {
-  return pkg?.official === true || (typeof pkg?.name === 'string' && pkg.name.startsWith('@deepseek-ai/'));
+  return pkg?.official === true || isOfficialPackageName(pkg?.name);
 }
 
 // --- Persistent updatable plugins store & startup batch probe -------------------------
@@ -425,12 +430,6 @@ function notifyUiPrefsChanged(): void {
       listener();
     } catch {}
   }
-}
-
-function registryChoiceToUrl(registry: string | undefined): string {
-  if (!registry || registry === 'npmjs') return OFFICIAL_REGISTRY;
-  if (registry === 'npmmirror') return DOMESTIC_REGISTRY;
-  return normalizeRegistryUrl(registry) ?? OFFICIAL_REGISTRY;
 }
 
 function syncUiPrefs(next: { registryUrl?: string; alwaysShowDetailButton?: boolean }): void {
@@ -516,7 +515,7 @@ function closeRescueModal(): void {
 
 function recordClientCrash(packageName: string, detail: string): void {
   const name = packageName.trim();
-  if (!name || name === SELF_PACKAGE_NAME || name.startsWith('@deepseek-ai/')) return;
+  if (!name || name === PLUGIN_NAME || isOfficialPackageName(name)) return;
   const cleanDetail = (detail || 'Runtime error').trim().slice(0, 300);
   if (crashedPlugins.get(name) === cleanDetail) return;
   crashedPlugins.set(name, cleanDetail);
@@ -592,7 +591,7 @@ const IGNORED_NODE_MODULES = new Set([
   'scheduler',
   'cordis',
   'schemastery',
-  SELF_PACKAGE_NAME
+  PLUGIN_NAME
 ]);
 
 function extractPackageFromStackText(text: string): string | null {
@@ -602,20 +601,20 @@ function extractPackageFromStackText(text: string): string | null {
   let match: RegExpExecArray | null;
   while ((match = nmRegex.exec(normalized)) !== null) {
     const candidate = match[1];
-    if (!candidate || candidate.startsWith('@deepseek-ai/') || IGNORED_NODE_MODULES.has(candidate)) continue;
+    if (!candidate || isOfficialPackageName(candidate) || IGNORED_NODE_MODULES.has(candidate)) continue;
     return candidate;
   }
 
   const loaderMatch = normalized.match(/__ModuleLoader__[\s\S]{0,120}?["']((?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+)["']/);
   if (loaderMatch?.[1]) {
     const candidate = loaderMatch[1];
-    if (!candidate.startsWith('@deepseek-ai/') && !IGNORED_NODE_MODULES.has(candidate)) {
+    if (!isOfficialPackageName(candidate) && !IGNORED_NODE_MODULES.has(candidate)) {
       return candidate;
     }
   }
 
   const sortedKnown = Array.from(knownThirdPartyPackages)
-    .filter(n => n && n !== SELF_PACKAGE_NAME && !n.startsWith('@deepseek-ai/'))
+    .filter(n => n && n !== PLUGIN_NAME && !isOfficialPackageName(n))
     .sort((a, b) => b.length - a.length);
   for (const pkg of sortedKnown) {
     if (normalized.includes(`/${pkg}/`) || normalized.includes(`"${pkg}"`) || normalized.includes(`'${pkg}'`)) {
@@ -628,9 +627,9 @@ function extractPackageFromStackText(text: string): string | null {
 function attributePluginCrash(message: string, stackOrFile: string): void {
   const combined = `${stackOrFile}\n${message}`;
   if (
-    stackOrFile.includes(`/${SELF_PACKAGE_NAME}/`) ||
-    stackOrFile.includes(`\\${SELF_PACKAGE_NAME}\\`) ||
-    message.includes(`"${SELF_PACKAGE_NAME}"`)
+    stackOrFile.includes(`/${PLUGIN_NAME}/`) ||
+    stackOrFile.includes(`\\${PLUGIN_NAME}\\`) ||
+    message.includes(`"${PLUGIN_NAME}"`)
   ) {
     return;
   }
@@ -676,7 +675,6 @@ function saveStorageMap(storage: Storage | undefined, key: string, source: Map<s
 }
 
 try {
-  loadStorageMap(window.sessionStorage, UPDATABLE_STORAGE_KEY, updatablePlugins);
   loadStorageMap(window.localStorage, UPDATABLE_STORAGE_KEY, updatablePlugins);
   loadStorageMap(window.sessionStorage, UPDATED_SESSION_KEY, updatedInSession);
 } catch {}
@@ -698,13 +696,10 @@ function notifyUpdatableChanged(): void {
 function markPluginUpdatable(packageName: string, latestVersion: string): void {
   const name = packageName.trim();
   const ver = latestVersion.trim().replace(/^[v^~]/, '');
-  if (!name || !ver || name.startsWith('@deepseek-ai/')) return;
+  if (!name || !ver || isOfficialPackageName(name)) return;
   const alreadyUpdatedTo = updatedInSession.get(name);
   if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) return;
-  if (updatablePlugins.get(name) === ver) {
-    notifyUpdatableChanged();
-    return;
-  }
+  if (updatablePlugins.get(name) === ver) return;
   updatablePlugins.set(name, ver);
   persistUpdatablePlugins();
   notifyUpdatableChanged();
@@ -798,10 +793,16 @@ function runBatchCheck(force = false, reconcileOnly = false): void {
     knownUpdates[k] = v;
   }
 
+  const reqBody: CheckAllParams = {
+    knownUpdates,
+    force,
+    ...(reconcileOnly ? { reconcile: true } : {})
+  };
+
   fetch(CHECK_ALL_PATH, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ knownUpdates, force }),
+    body: JSON.stringify(reqBody),
     signal: controller.signal
   })
     .then(res => res.json().catch(() => null))
@@ -821,7 +822,7 @@ function runBatchCheck(force = false, reconcileOnly = false): void {
           if (typeof rawName !== 'string' || typeof rawVer !== 'string') continue;
           const name = rawName.trim();
           const ver = rawVer.trim().replace(/^[v^~]/, '');
-          if (!name || !ver || name.startsWith('@deepseek-ai/')) continue;
+          if (!name || !ver || isOfficialPackageName(name)) continue;
           knownThirdPartyPackages.add(name);
           const alreadyUpdatedTo = updatedInSession.get(name);
           if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) continue;
@@ -845,8 +846,6 @@ function runBatchCheck(force = false, reconcileOnly = false): void {
           }
           persistUpdatablePlugins();
           notifyUpdatableChanged();
-        } else {
-          persistUpdatablePlugins();
         }
       }
 
@@ -907,13 +906,14 @@ function useConfigFormState(form: any): {
         : DEFAULT_SETTINGS.alwaysShowDetailButton
   };
 
+  const hasRaw = Boolean(raw && typeof raw === 'object');
   useEffect(() => {
-    if (!raw || typeof raw !== 'object') return;
+    if (!hasRaw) return;
     syncUiPrefs({
-      registryUrl: registryChoiceToUrl(settings.registry),
+      registryUrl: resolveRegistryUrl(settings.registry),
       alwaysShowDetailButton: settings.alwaysShowDetailButton
     });
-  }, [settings.registry, settings.alwaysShowDetailButton, raw]);
+  }, [settings.registry, settings.alwaysShowDetailButton, hasRaw]);
 
   const updateField = useCallback(
     async (field: keyof PluginSettings, value: any): Promise<boolean> => {
@@ -922,7 +922,7 @@ function useConfigFormState(form: any): {
         const ok = (await form.set(field, value)) !== false;
         if (ok) {
           if (field === 'registry' && typeof value === 'string') {
-            syncUiPrefs({ registryUrl: registryChoiceToUrl(value) });
+            syncUiPrefs({ registryUrl: resolveRegistryUrl(value) });
           } else if (field === 'alwaysShowDetailButton' && typeof value === 'boolean') {
             syncUiPrefs({ alwaysShowDetailButton: value });
           }
@@ -1118,7 +1118,7 @@ const RescueCenterPanel: React.FC<RescueCenterPanelProps> = ({ t, focusPackage, 
           const key =
             action === 'reinstall'
               ? 'rescue.result.reinstalled'
-              : pkg.packageName === SELF_PACKAGE_NAME
+              : pkg.packageName === PLUGIN_NAME
                 ? 'update.selfUpdate'
                 : 'rescue.result.updated';
           setActionFeedback(prev => ({
@@ -1166,7 +1166,7 @@ const RescueCenterPanel: React.FC<RescueCenterPanelProps> = ({ t, focusPackage, 
     async (plugins: PluginHealthReport[]) => {
       const targets = plugins
         .filter(p => p.hasUpdate && p.latestVersion)
-        .sort((a, b) => (a.packageName === SELF_PACKAGE_NAME ? 1 : b.packageName === SELF_PACKAGE_NAME ? -1 : 0));
+        .sort((a, b) => (a.packageName === PLUGIN_NAME ? 1 : b.packageName === PLUGIN_NAME ? -1 : 0));
       if (targets.length === 0 || busyRef.current) return;
 
       busyRef.current = true;
@@ -1319,7 +1319,7 @@ const RescueCenterPanel: React.FC<RescueCenterPanelProps> = ({ t, focusPackage, 
           const isBusy = busyPkg === item.packageName;
           const feedback = actionFeedback[item.packageName];
           const isConfirmingUninstall = confirmUninstallPkg === item.packageName;
-          const isSelf = item.packageName === SELF_PACKAGE_NAME;
+          const isSelf = item.packageName === PLUGIN_NAME;
 
           return (
             <div
@@ -1469,6 +1469,11 @@ interface RegistrySettingsCardProps {
   locale?: LocaleServiceLike;
 }
 
+const BUILTIN_REGISTRIES = [
+  { value: 'npmjs', url: OFFICIAL_REGISTRY, labelKey: 'settings.npmjs', hintKey: 'settings.npmjsHint' },
+  { value: 'npmmirror', url: DOMESTIC_REGISTRY, labelKey: 'settings.npmmirror', hintKey: 'settings.npmmirrorHint' }
+] as const;
+
 export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form, t, locale }) => {
   useLocaleRevision(locale);
   const { settings, writable, updateField } = useConfigFormState(form);
@@ -1477,14 +1482,34 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
   const [url, setUrl] = useState('');
   const [errorKey, setErrorKey] = useState('');
   const [notice, setNotice] = useState<{ key: string; params?: TranslateParams } | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (noticeTimerRef.current !== null) {
+        window.clearTimeout(noticeTimerRef.current);
+      }
+    };
+  }, []);
 
   const showNotice = (key: string, params?: TranslateParams) => {
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
     setNotice({ key, params });
-    window.setTimeout(() => setNotice(null), 2500);
+    noticeTimerRef.current = window.setTimeout(() => {
+      noticeTimerRef.current = null;
+      setNotice(null);
+    }, 2500);
   };
 
+  const isCurrent = (value: string) =>
+    value === 'npmjs' || value === 'npmmirror'
+      ? settings.registry === value
+      : normalizeRegistryUrl(settings.registry) === normalizeRegistryUrl(value);
+
   const select = async (value: string) => {
-    if (!writable) return;
+    if (!writable || isCurrent(value)) return;
     if (await updateField('registry', value)) {
       showNotice('settings.notice.registryUpdated');
       runBatchCheck(true);
@@ -1507,11 +1532,10 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
       return;
     }
     const next: CustomRegistry[] = [...settings.customRegistries, { name: name.trim(), url: normalized }];
-    if (!(await updateField('customRegistries', next))) {
+    if (!(await updateField('customRegistries', next)) || !(await updateField('registry', normalized))) {
       setErrorKey('settings.error.saveFailed');
       return;
     }
-    await updateField('registry', normalized);
     setName('');
     setUrl('');
     setAdding(false);
@@ -1520,20 +1544,16 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
   };
 
   const removeCustom = async (target: string) => {
+    if (!writable) return;
     const normalized = normalizeRegistryUrl(target);
     const next = settings.customRegistries.filter(item => normalizeRegistryUrl(item.url) !== normalized);
-    await updateField('customRegistries', next);
+    if (!(await updateField('customRegistries', next))) return;
     if (normalizeRegistryUrl(settings.registry) === normalized) {
       await updateField('registry', 'npmjs');
       runBatchCheck(true);
     }
     showNotice('settings.notice.customRemoved');
   };
-
-  const isCurrent = (value: string) =>
-    value === 'npmjs' || value === 'npmmirror'
-      ? settings.registry === value
-      : normalizeRegistryUrl(settings.registry) === normalizeRegistryUrl(value);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -1544,39 +1564,70 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
         </div>
         <div style={{ ...hintStyle, marginBottom: 10 }}>{t('settings.intro')}</div>
 
-        <div style={optionStyle(isCurrent('npmjs'))} onClick={() => void select('npmjs')}>
-          <input type="radio" checked={isCurrent('npmjs')} onChange={() => void select('npmjs')} disabled={!writable} style={{ marginRight: 10, marginTop: 3 }} />
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 600 }}>{t('settings.npmjs')} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{OFFICIAL_REGISTRY}</span></div>
-            <div style={hintStyle}>{t('settings.npmjsHint')}</div>
-          </div>
-        </div>
-
-        <div style={optionStyle(isCurrent('npmmirror'))} onClick={() => void select('npmmirror')}>
-          <input type="radio" checked={isCurrent('npmmirror')} onChange={() => void select('npmmirror')} disabled={!writable} style={{ marginRight: 10, marginTop: 3 }} />
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 600 }}>{t('settings.npmmirror')} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{DOMESTIC_REGISTRY}</span></div>
-            <div style={hintStyle}>{t('settings.npmmirrorHint')}</div>
-          </div>
-        </div>
+        {BUILTIN_REGISTRIES.map(item => {
+          const active = isCurrent(item.value);
+          return (
+            <div key={item.value} style={{ ...optionStyle(active), padding: 0, alignItems: 'center', cursor: 'default' }}>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  flex: 1,
+                  padding: '10px 12px',
+                  cursor: writable ? 'pointer' : 'default'
+                }}
+              >
+                <input
+                  type="radio"
+                  checked={active}
+                  onChange={() => void select(item.value)}
+                  disabled={!writable}
+                  style={{ marginRight: 10, marginTop: 3 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600 }}>
+                    {t(item.labelKey)} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{item.url}</span>
+                  </div>
+                  <div style={hintStyle}>{t(item.hintKey)}</div>
+                </div>
+              </label>
+            </div>
+          );
+        })}
 
         {settings.customRegistries.map(item => {
           const active = isCurrent(item.url);
           return (
-            <div key={item.url} style={optionStyle(active)} onClick={() => void select(item.url)}>
-              <input type="radio" checked={active} onChange={() => void select(item.url)} disabled={!writable} style={{ marginRight: 10, marginTop: 3 }} />
-              <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 600 }}>{item.name || t('settings.customFallbackName')} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{item.url}</span></div>
-                <div style={hintStyle}>{t('settings.customHint')}</div>
-              </div>
+            <div key={item.url} style={{ ...optionStyle(active), padding: 0, alignItems: 'center', cursor: 'default' }}>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  flex: 1,
+                  padding: '10px 12px',
+                  cursor: writable ? 'pointer' : 'default'
+                }}
+              >
+                <input
+                  type="radio"
+                  checked={active}
+                  onChange={() => void select(item.url)}
+                  disabled={!writable}
+                  style={{ marginRight: 10, marginTop: 3 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600 }}>
+                    {item.name || t('settings.customFallbackName')}{' '}
+                    <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{item.url}</span>
+                  </div>
+                  <div style={hintStyle}>{t('settings.customHint')}</div>
+                </div>
+              </label>
               {writable && (
                 <button
                   type="button"
-                  style={{ ...smallButtonStyle, color: '#dc2626', borderColor: '#fca5a5' }}
-                  onClick={event => {
-                    event.stopPropagation();
-                    void removeCustom(item.url);
-                  }}
+                  style={{ ...smallButtonStyle, color: '#dc2626', borderColor: '#fca5a5', alignSelf: 'flex-start', marginTop: 10, marginRight: 12 }}
+                  onClick={() => void removeCustom(item.url)}
                 >
                   {t('settings.delete')}
                 </button>
@@ -1645,10 +1696,9 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
 // --- Updater action button ------------------------------------------------------------
 
 type Status = 'checking' | 'has_update' | 'up_to_date' | 'updating' | 'success' | 'error';
-interface MessageState {
-  key: string;
-  params?: TranslateParams;
-}
+type MessageState =
+  | { kind: 'key'; key: string; params?: TranslateParams }
+  | { kind: 'error'; errorCode?: string; fallback?: string; rollbackFailed?: boolean };
 
 interface UpdaterActionButtonProps extends SlotActionProps {
   t: Translator;
@@ -1675,8 +1725,11 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
   const [confirmOpen, setConfirmOpen] = useState(false);
   const mountedRef = useRef(true);
   const tokenRef = useRef(0);
-  const abortRef = useRef<AbortController | null>(null);
+  const checkAbortRef = useRef<AbortController | null>(null);
+  const updateAbortRef = useRef<AbortController | null>(null);
   const successVersionRef = useRef<string | null>(null);
+  const activePackageRef = useRef(packageName);
+  activePackageRef.current = packageName;
 
   const isGithub = isGithubPackage(pkg, checkResult);
 
@@ -1685,11 +1738,14 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     return () => {
       mountedRef.current = false;
       tokenRef.current += 1;
-      abortRef.current?.abort();
+      checkAbortRef.current?.abort();
+      updateAbortRef.current?.abort();
     };
   }, []);
 
   useEffect(() => {
+    tokenRef.current += 1;
+    checkAbortRef.current?.abort();
     successVersionRef.current = null;
     setCheckResult(null);
     setMessage(null);
@@ -1707,9 +1763,9 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
   const fetchCheck = useCallback(async (): Promise<CheckUpdateResult | null> => {
     if (!renderable) return null;
     const token = ++tokenRef.current;
-    abortRef.current?.abort();
+    checkAbortRef.current?.abort();
     const controller = new AbortController();
-    abortRef.current = controller;
+    checkAbortRef.current = controller;
     const timer = window.setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
     setStatus('checking');
     setMessage(null);
@@ -1733,10 +1789,11 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     };
 
     try {
+      const reqBody: CheckUpdateParams = { packageName, currentVersion: clientVersion };
       const response = await fetch(CHECK_PATH, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ packageName, currentVersion: clientVersion }),
+        body: JSON.stringify(reqBody),
         signal: controller.signal
       });
       const payload = (await response.json().catch(() => null)) as CheckUpdateResult | null;
@@ -1751,7 +1808,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
         }
         setCheckResult(null);
         setStatus('error');
-        setMessage({ key: '', params: { text: errorText(t, payload.errorCode, payload.error) } });
+        setMessage({ kind: 'error', errorCode: payload.errorCode, fallback: payload.error });
         return payload;
       }
       syncUiPrefs({
@@ -1773,13 +1830,13 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       if (fallback) return fallback;
       setCheckResult(null);
       setStatus('error');
-      setMessage({ key: error?.name === 'AbortError' ? 'check.timeout' : 'check.network' });
+      setMessage({ kind: 'key', key: error?.name === 'AbortError' ? 'check.timeout' : 'check.network' });
       return null;
     } finally {
       window.clearTimeout(timer);
-      if (abortRef.current === controller) abortRef.current = null;
+      if (checkAbortRef.current === controller) checkAbortRef.current = null;
     }
-  }, [clientVersion, packageName, renderable, t]);
+  }, [clientVersion, packageName, renderable]);
 
   useEffect(() => {
     if (!renderable) return;
@@ -1789,62 +1846,71 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
 
   const runUpdate = async () => {
     if (!checkResult?.hasUpdate || status === 'updating') return;
+    const targetPkg = packageName;
     const targetVersion = checkResult.latestVersion;
     const source = checkResult.source;
+    const updateToken = ++tokenRef.current;
     setConfirmOpen(false);
     setStatus('updating');
     setMessage(null);
 
     const controller = new AbortController();
-    abortRef.current = controller;
+    updateAbortRef.current = controller;
     const timer = window.setTimeout(() => controller.abort(), UPDATE_TIMEOUT_MS);
     try {
+      const reqBody: DoUpdateParams = { packageName: targetPkg, targetVersion, source };
       const response = await fetch(UPDATE_PATH, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ packageName, targetVersion, source }),
+        body: JSON.stringify(reqBody),
         signal: controller.signal
       });
       const payload = (await response.json().catch(() => null)) as DoUpdateResult | null;
-      if (!mountedRef.current) return;
       if (!payload || typeof payload !== 'object') throw new Error(`HTTP ${response.status}`);
       if (payload.ok === false) {
+        if (updateToken !== tokenRef.current || !mountedRef.current) return;
         setStatus('error');
-        const baseError = errorText(t, payload.errorCode, payload.error);
-        const fullError =
-          payload.rollback === 'failed' && payload.errorCode !== ERROR_CODES.rollbackFailed
-            ? `${baseError} (${t('error.rollbackFailed')})`
-            : baseError;
-        setMessage({ key: '', params: { text: fullError } });
+        setMessage({
+          kind: 'error',
+          errorCode: payload.errorCode,
+          fallback: payload.error,
+          rollbackFailed: payload.rollback === 'failed'
+        });
         return;
       }
       const version = payload.targetVersion || targetVersion || clientVersion;
+      clearPluginUpdatable(targetPkg, version);
+      if (updateToken !== tokenRef.current || !mountedRef.current) return;
       successVersionRef.current = version;
-      clearPluginUpdatable(packageName, version);
       setStatus('success');
       setMessage({
-        key: packageName === SELF_PACKAGE_NAME ? 'update.selfUpdate' : 'update.success',
+        kind: 'key',
+        key: targetPkg === PLUGIN_NAME ? 'update.selfUpdate' : 'update.success',
         params: { version }
       });
     } catch {
+      if (updateToken !== tokenRef.current || !mountedRef.current) return;
       await new Promise(resolve => window.setTimeout(resolve, 1500));
+      if (updateToken !== tokenRef.current || !mountedRef.current) return;
       const checked = await fetchCheck();
+      if (!mountedRef.current || activePackageRef.current !== targetPkg) return;
       if (checked && versionGte(checked.currentVersion, targetVersion)) {
         const version = checked.currentVersion || targetVersion || clientVersion;
         successVersionRef.current = version;
-        clearPluginUpdatable(packageName, version);
+        clearPluginUpdatable(targetPkg, version);
         setStatus('success');
         setMessage({
-          key: packageName === SELF_PACKAGE_NAME ? 'update.selfUpdate' : 'update.success',
+          kind: 'key',
+          key: targetPkg === PLUGIN_NAME ? 'update.selfUpdate' : 'update.success',
           params: { version }
         });
       } else {
         setStatus('error');
-        setMessage({ key: 'update.failed' });
+        setMessage({ kind: 'key', key: 'update.failed' });
       }
     } finally {
       window.clearTimeout(timer);
-      if (abortRef.current === controller) abortRef.current = null;
+      if (updateAbortRef.current === controller) updateAbortRef.current = null;
     }
   };
 
@@ -1867,61 +1933,17 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
   }
 
   const latestVersion = checkResult?.latestVersion || '';
-  const messageText = message ? (message.key ? t(message.key, message.params) : String(message.params?.text || '')) : '';
+  const messageText = message
+    ? message.kind === 'key'
+      ? t(message.key, message.params)
+      : (() => {
+          const baseError = errorText(t, message.errorCode, message.fallback);
+          return message.rollbackFailed && message.errorCode !== ERROR_CODES.rollbackFailed
+            ? `${baseError} (${t('error.rollbackFailed')})`
+            : baseError;
+        })()
+    : '';
 
-  // Render for npm packages with an update available:
-  // Render an unobtrusive outline button for fast/instant update (bypassing minimumReleaseAge),
-  // which co-exists harmoniously with DSH native's primary update button without visual conflict.
-  if (!isGithub) {
-    return (
-      <div style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
-        {status === 'has_update' && (
-          <SafeButton
-            variant="outline"
-            size="sm"
-            onClick={() => setConfirmOpen(true)}
-            title={t('action.fastUpdateTip')}
-          >
-            {t('action.fastUpdate', { version: latestVersion })}
-          </SafeButton>
-        )}
-        {status === 'updating' && (
-          <span style={{ fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>{t('action.updating')}</span>
-        )}
-        {status === 'success' && (
-          <span style={{ fontSize: 12, color: '#15803d' }}>{messageText || t('action.success')}</span>
-        )}
-        {status === 'error' && (
-          <SafeButton variant="outline" size="sm" onClick={() => void fetchCheck()}>
-            {t('action.retry')}
-          </SafeButton>
-        )}
-        {messageText && status !== 'success' && (
-          <div style={{ fontSize: 12, color: status === 'error' ? '#b91c1c' : '#15803d', maxWidth: 360 }}>{messageText}</div>
-        )}
-        <SafeModal
-          open={confirmOpen}
-          onClose={() => setConfirmOpen(false)}
-          title={t('confirm.title')}
-          closeLabel={t('confirm.close')}
-          description={t('confirm.body', { packageName, version: latestVersion })}
-          footer={
-            <>
-              <SafeButton variant="outline" onClick={() => setConfirmOpen(false)}>
-                {t('confirm.cancel')}
-              </SafeButton>
-              <SafeButton variant="primary" onClick={() => void runUpdate()}>
-                {t('confirm.ok')}
-              </SafeButton>
-            </>
-          }
-        />
-      </div>
-    );
-  }
-
-  // Render for GitHub packages:
-  // DSH native does NOT support updating GitHub packages, so our plugin is the primary update interface.
   const buttonLabel =
     status === 'checking'
       ? t('action.checking')
@@ -1945,17 +1967,45 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     void fetchCheck();
   };
 
+  const showMessage = Boolean(messageText) && (isGithub || status !== 'success');
+
   return (
     <div style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
-      <SafeButton
-        variant={status === 'has_update' ? 'primary' : 'outline'}
-        size="sm"
-        onClick={onButtonClick}
-        disabled={status === 'checking' || status === 'updating'}
-      >
-        {buttonLabel}
-      </SafeButton>
-      {messageText && (
+      {isGithub ? (
+        <SafeButton
+          variant={status === 'has_update' ? 'primary' : 'outline'}
+          size="sm"
+          onClick={onButtonClick}
+          disabled={status === 'checking' || status === 'updating'}
+        >
+          {buttonLabel}
+        </SafeButton>
+      ) : (
+        <>
+          {status === 'has_update' && (
+            <SafeButton
+              variant="outline"
+              size="sm"
+              onClick={() => setConfirmOpen(true)}
+              title={t('action.fastUpdateTip')}
+            >
+              {t('action.fastUpdate', { version: latestVersion })}
+            </SafeButton>
+          )}
+          {status === 'updating' && (
+            <span style={{ fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>{t('action.updating')}</span>
+          )}
+          {status === 'success' && (
+            <span style={{ fontSize: 12, color: '#15803d' }}>{messageText || t('action.success')}</span>
+          )}
+          {status === 'error' && (
+            <SafeButton variant="outline" size="sm" onClick={() => void fetchCheck()}>
+              {t('action.retry')}
+            </SafeButton>
+          )}
+        </>
+      )}
+      {showMessage && (
         <div style={{ fontSize: 12, color: status === 'error' ? '#b91c1c' : '#15803d', maxWidth: 360 }}>{messageText}</div>
       )}
 
@@ -2137,6 +2187,8 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
   const [rowTargets, setRowTargets] = useState<RowMountTarget[]>([]);
   const [issueTargets, setIssueTargets] = useState<IssueRowMountTarget[]>([]);
   const lastNativeDoneRef = useRef(false);
+  const sidebarBtnRef = useRef<HTMLElement | null>(null);
+  const lastSidebarCssRef = useRef<string>('');
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -2153,7 +2205,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
       if (target.closest(`[${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}], [role="switch"]`)) return;
       const card = target.closest('li[data-plugin-package]');
       const pkgName = card?.getAttribute('data-plugin-package')?.trim();
-      if (pkgName && pkgName !== SELF_PACKAGE_NAME && !pkgName.startsWith('@deepseek-ai/')) {
+      if (pkgName && pkgName !== PLUGIN_NAME && !isOfficialPackageName(pkgName)) {
         knownThirdPartyPackages.add(pkgName);
         lastClickedPlugin = { name: pkgName, timestamp: Date.now() };
       }
@@ -2190,36 +2242,48 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
   const syncDomTargets = useCallback(() => {
     try {
       // 1. Sync Sidebar "Plugins" count badge host
-      const pluginsBtn = findSidebarPluginsButton(slots);
+      let pluginsBtn = sidebarBtnRef.current;
+      if (!pluginsBtn || !pluginsBtn.isConnected) {
+        pluginsBtn = findSidebarPluginsButton(slots);
+        sidebarBtnRef.current = pluginsBtn;
+        lastSidebarCssRef.current = '';
+      }
       if (pluginsBtn) {
         let host = pluginsBtn.querySelector<HTMLElement>(`span[${SIDEBAR_BADGE_ATTR}="true"]`);
         if (!host) {
           host = document.createElement('span');
           host.setAttribute(SIDEBAR_BADGE_ATTR, 'true');
           pluginsBtn.appendChild(host);
+          lastSidebarCssRef.current = '';
         }
-        const isCollapsed = pluginsBtn.clientWidth > 0 && pluginsBtn.clientWidth <= 48;
+        let nextCssText = 'display: none;';
         if (updatablePlugins.size > 0) {
-          if (window.getComputedStyle(pluginsBtn).position === 'static') {
+          if (
+            (!pluginsBtn.style.position || pluginsBtn.style.position === 'static') &&
+            window.getComputedStyle(pluginsBtn).position === 'static'
+          ) {
             pluginsBtn.style.position = 'relative';
           }
+          const isCollapsed = pluginsBtn.clientWidth > 0 && pluginsBtn.clientWidth <= 48;
           if (isCollapsed) {
-            host.style.cssText =
+            nextCssText =
               'position: absolute; top: 2px; right: 2px; display: inline-flex; align-items: center; pointer-events: none; transform: scale(0.8); transform-origin: top right;';
           } else {
             const panelEntry = pluginsBtn.closest('nav > div') || pluginsBtn.parentElement;
             const hasUnpinBtn = Boolean(
               panelEntry && Array.from(panelEntry.querySelectorAll('button')).some(btn => btn !== pluginsBtn)
             );
-            host.style.cssText =
+            nextCssText =
               `position: absolute; top: 50%; right: ${hasUnpinBtn ? '32px' : '10px'}; transform: translateY(-50%); display: inline-flex; align-items: center; pointer-events: none;`;
           }
-        } else {
-          host.style.cssText = 'display: none;';
+        }
+        if (lastSidebarCssRef.current !== nextCssText) {
+          host.style.cssText = nextCssText;
+          lastSidebarCssRef.current = nextCssText;
         }
         setSidebarHost(prev => (prev === host ? prev : host));
       } else {
-        setSidebarHost(prev => (prev === null ? null : null));
+        setSidebarHost(null);
       }
 
       // 2. Detect blank or error-boundary detail page shortly after clicking a third-party plugin card
@@ -2243,22 +2307,10 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
       // 3. Sync Installed Plugins list row badges (issue badges & update badges)
       const cards = Array.from(document.querySelectorAll<HTMLLIElement>('li[data-plugin-package]'));
       if (cards.length > 0 && !detailEl) {
-        const installedSet = new Set<string>();
         for (const card of cards) {
-          const name = card.getAttribute('data-plugin-package');
-          if (name) {
-            installedSet.add(name);
-            if (name !== SELF_PACKAGE_NAME && !name.startsWith('@deepseek-ai/')) {
-              knownThirdPartyPackages.add(name);
-            }
-          }
-        }
-        // If the main installed list is rendered, prune any package that was uninstalled
-        if (installedSet.has(SELF_PACKAGE_NAME)) {
-          for (const [trackedPkg] of updatablePlugins.entries()) {
-            if (!installedSet.has(trackedPkg)) {
-              clearPluginUpdatable(trackedPkg);
-            }
+          const pkg = card.getAttribute('data-plugin-package');
+          if (pkg && pkg !== PLUGIN_NAME && !isOfficialPackageName(pkg)) {
+            knownThirdPartyPackages.add(pkg);
           }
         }
       }
@@ -2283,7 +2335,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         if (hasIssue) {
           if (updateHost) updateHost.remove();
           if (!issueHost) {
-            issueHost = mountRowBadgeHost(card as HTMLLIElement, pkgName, ROW_ISSUE_ATTR);
+            issueHost = mountRowBadgeHost(card, pkgName, ROW_ISSUE_ATTR);
           }
           nextIssueTargets.push({
             packageName: pkgName,
@@ -2300,7 +2352,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         // Avoid duplicate tags if DSH native already displayed its own "可更新" (statusUpdateAvailable) Tag
         if (latestVersion && !hasNativeUpdateTag(card, t)) {
           if (!updateHost) {
-            updateHost = mountRowBadgeHost(card as HTMLLIElement, pkgName, ROW_BADGE_ATTR);
+            updateHost = mountRowBadgeHost(card, pkgName, ROW_BADGE_ATTR);
           }
           nextRowTargets.push({
             packageName: pkgName,
@@ -2358,22 +2410,71 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
   }, [syncDomTargets, updatableEntries, rescue]);
 
   useEffect(() => {
+    const btn = sidebarBtnRef.current;
+    if (!btn || typeof ResizeObserver === 'undefined') return undefined;
     let rafId = 0;
-    const scheduleSync = () => {
+    const ro = new ResizeObserver(() => {
       if (rafId) return;
       rafId = window.requestAnimationFrame(() => {
         rafId = 0;
         syncDomTargets();
       });
+    });
+    ro.observe(btn);
+    return () => {
+      ro.disconnect();
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, [sidebarHost, syncDomTargets]);
+
+  useEffect(() => {
+    const THROTTLE_MS = 200;
+    let rafId = 0;
+    let throttleTimer = 0;
+    let lastSyncTime = 0;
+
+    const runNow = () => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        lastSyncTime = Date.now();
+        syncDomTargets();
+      });
+    };
+
+    const scheduleSync = (immediate = false) => {
+      if (immediate) {
+        if (throttleTimer) {
+          window.clearTimeout(throttleTimer);
+          throttleTimer = 0;
+        }
+        runNow();
+        return;
+      }
+      const elapsed = Date.now() - lastSyncTime;
+      if (elapsed >= THROTTLE_MS) {
+        runNow();
+      } else if (!throttleTimer && !rafId) {
+        throttleTimer = window.setTimeout(() => {
+          throttleTimer = 0;
+          runNow();
+        }, THROTTLE_MS - elapsed);
+      }
     };
 
     const observer = new MutationObserver(mutations => {
+      let hasRelevant = false;
+      let isDialogDoneAttr = false;
       for (const m of mutations) {
-        if (isOwnBadgeMutation(m)) {
-          continue;
+        if (isOwnBadgeMutation(m)) continue;
+        hasRelevant = true;
+        if (m.type === 'attributes') {
+          isDialogDoneAttr = true;
+          break;
         }
-        scheduleSync();
-        break;
+      }
+      if (hasRelevant) {
+        scheduleSync(isDialogDoneAttr);
       }
     });
 
@@ -2384,13 +2485,15 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
       attributeFilter: ['data-plugin-update', 'data-install-phase']
     });
 
-    window.addEventListener('resize', scheduleSync);
+    const onResize = () => scheduleSync();
+    window.addEventListener('resize', onResize);
     syncDomTargets();
 
     return () => {
       observer.disconnect();
-      window.removeEventListener('resize', scheduleSync);
+      window.removeEventListener('resize', onResize);
       if (rafId) window.cancelAnimationFrame(rafId);
+      if (throttleTimer) window.clearTimeout(throttleTimer);
     };
   }, [syncDomTargets]);
 
@@ -2423,7 +2526,6 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
       {rowTargets.map(({ packageName, latestVersion, host, card }) =>
         createPortal(
           <span
-            key={packageName}
             title={`v${latestVersion}`}
             onClick={event => {
               event.stopPropagation();
@@ -2434,13 +2536,13 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
           >
             <SafeTag tone="info">{t('badge.updateAvailable')}</SafeTag>
           </span>,
-          host
+          host,
+          packageName
         )
       )}
       {issueTargets.map(({ packageName, hasUpdate, latestVersion, detail, host }) =>
         createPortal(
           <span
-            key={`issue:${packageName}`}
             title={detail || (latestVersion ? `v${latestVersion}` : packageName)}
             onClick={event => {
               event.preventDefault();
@@ -2451,7 +2553,8 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
           >
             <SafeTag tone="warning">{hasUpdate ? t('badge.issueAndUpdate') : t('badge.issueDetected')}</SafeTag>
           </span>,
-          host
+          host,
+          `issue:${packageName}`
         )
       )}
 
@@ -2529,7 +2632,7 @@ export function apply(ctx: any) {
   let formInstance: any;
   const getForm = () => {
     if (formInstance) return formInstance;
-    if (ctx.configForms?.get) formInstance = ctx.configForms.get('dsh-plugins-update');
+    if (ctx.configForms?.get) formInstance = ctx.configForms.get(PLUGIN_NAME);
     return formInstance;
   };
 
@@ -2540,7 +2643,7 @@ export function apply(ctx: any) {
     slots.register(
       {
         name: 'shell.overlay',
-        id: 'dsh-plugins-update.reminders-overlay',
+        id: `${PLUGIN_NAME}.reminders-overlay`,
         order: 50
       },
       (props: any) =>
@@ -2552,11 +2655,11 @@ export function apply(ctx: any) {
     )
   );
 
-  ctx.slots.inject('plugins.detail.actions', () =>
-    ctx.slots.register(
+  slots.inject('plugins.detail.actions', () =>
+    slots.register(
       {
         name: 'plugins.detail.actions',
-        id: 'dsh-plugins-update.action-button',
+        id: `${PLUGIN_NAME}.action-button`,
         order: -10
       },
       (props: SlotActionProps) =>
@@ -2568,12 +2671,12 @@ export function apply(ctx: any) {
     )
   );
 
-  const registerBundleConfig = (form?: any) => {
-    ctx.slots.inject('plugins.bundle.config', () =>
-      ctx.slots.register(
+  const registerBundleConfig = (form?: any) =>
+    slots.inject('plugins.bundle.config', () =>
+      slots.register(
         {
           name: 'plugins.bundle.config',
-          key: 'dsh-plugins-update'
+          key: PLUGIN_NAME
         },
         () =>
           React.createElement(
@@ -2583,15 +2686,14 @@ export function apply(ctx: any) {
           )
       )
     );
-  };
 
   if (ctx.configForms?.whileServed) {
     ctx.effect(
       () =>
-        ctx.configForms.whileServed(['dsh-plugins-update'], () => {
-          const form = ctx.configForms.get('dsh-plugins-update');
+        ctx.configForms.whileServed([PLUGIN_NAME], () => {
+          const form = ctx.configForms.get(PLUGIN_NAME);
           formInstance = form;
-          registerBundleConfig(form);
+          return registerBundleConfig(form);
         }),
       'dsh-plugins-update: bundle settings card'
     );
@@ -2600,5 +2702,5 @@ export function apply(ctx: any) {
   }
 }
 
-export const name = 'dsh-plugins-update';
+export const name = PLUGIN_NAME;
 export const inject = ['slots', 'configForms', 'locale'];

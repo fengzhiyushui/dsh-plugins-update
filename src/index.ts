@@ -7,18 +7,21 @@ import {
   CHECK_ALL_PATH,
   CHECK_PATH,
   DIAGNOSE_PATH,
-  DOMESTIC_REGISTRY,
   ERROR_CODES,
   OFFICIAL_REGISTRY,
+  PLUGIN_NAME,
   RESCUE_PATH,
   UPDATE_PATH,
   compareSemver,
+  isOfficialPackageName,
   normalizeRegistryUrl,
-  registryLabel,
+  parseSemver,
+  resolveRegistryUrl,
   type CheckAllResult,
   type CheckUpdateResult,
   type CustomRegistry,
   type DiagnoseResult,
+  type DoUpdateParams,
   type DoUpdateResult,
   type ErrorCode,
   type PluginHealthIssueKind,
@@ -29,15 +32,13 @@ import {
   type RescueResult
 } from './types.js';
 
-export const name = 'dsh-plugins-update';
+export const name = PLUGIN_NAME;
 export const inject = ['connection'];
 
-const OWN_PACKAGE_NAME = 'dsh-plugins-update';
 const PACKAGE_NAME_PATTERN = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
-const TARGET_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const INSTALL_TIMEOUT_MS = 180_000;
 const ROLLBACK_TIMEOUT_MS = 60_000;
-const CHECK_TIMEOUT_MS = 15_000;
+const CHECK_TIMEOUT_MS = 12_000;
 const OUTPUT_LIMIT = 8_000;
 
 function live<T>(schema: T): T {
@@ -104,12 +105,6 @@ function readSettings(config: any): PluginSettings {
   };
 }
 
-function selectedRegistry(settings: PluginSettings): string {
-  if (settings.registry === 'npmjs') return OFFICIAL_REGISTRY;
-  if (settings.registry === 'npmmirror') return DOMESTIC_REGISTRY;
-  return normalizeRegistryUrl(settings.registry) ?? OFFICIAL_REGISTRY;
-}
-
 function readPackageName(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const packageName = value.trim();
@@ -120,13 +115,11 @@ function readPackageName(value: unknown): string | undefined {
 function readTargetVersion(value: unknown): string | undefined | null {
   if (value === undefined || value === null || value === '') return undefined;
   if (typeof value !== 'string') return null;
-  const version = value.trim().replace(/^[v^~]/, '');
-  if (!version) return undefined;
-  return TARGET_VERSION_PATTERN.test(version) ? version : null;
-}
-
-function isOfficialPackageName(packageName: string): boolean {
-  return packageName.startsWith('@deepseek-ai/');
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const version = trimmed.replace(/^[v^~]/, '');
+  if (!version || /^[v^~]/.test(version)) return null;
+  return parseSemver(version) ? version : null;
 }
 
 // --- profile / package ----------------------------------------------------------------
@@ -248,7 +241,7 @@ interface InstalledThirdPartyPackage {
 function extractVersionFromSpec(spec: unknown): string {
   if (typeof spec !== 'string') return '0.0.0';
   const cleaned = spec.trim().replace(/^[v^~=]+/, '');
-  return TARGET_VERSION_PATTERN.test(cleaned) ? cleaned : '0.0.0';
+  return cleaned && parseSemver(cleaned) ? cleaned : '0.0.0';
 }
 
 function collectExportTargets(exp: unknown, out: string[]): void {
@@ -329,11 +322,14 @@ async function inspectInstalledPluginsHealth(ctx: any): Promise<InstalledThirdPa
     if (b && typeof b.name === 'string') bundleMap.set(b.name, b);
   }
 
-  const candidateProfiles = profileCandidates();
+  const profiles = profileCandidates().map(candidate => ({
+    ...candidate,
+    deps: readProfileDependencies(candidate.dir)
+  }));
+  const primaryProfile = profiles.find(p => p.profileName === 'desktop') ?? profiles[0];
   const manifestDepsByPackage = new Map<string, string>();
-  for (const candidate of candidateProfiles) {
-    const deps = readProfileDependencies(candidate.dir);
-    for (const [depName, spec] of Object.entries(deps)) {
+  for (const candidate of profiles) {
+    for (const [depName, spec] of Object.entries(candidate.deps)) {
       if (!manifestDepsByPackage.has(depName) && typeof spec === 'string') {
         manifestDepsByPackage.set(depName, spec);
       }
@@ -353,7 +349,8 @@ async function inspectInstalledPluginsHealth(ctx: any): Promise<InstalledThirdPa
     const inManifest = Boolean(declaredSpec);
     if (!inManifest && bundle?.installed === false) continue;
 
-    const { dir, profileName } = resolveProfileDir(packageName);
+    const owner = profiles.find(p => Object.prototype.hasOwnProperty.call(p.deps, packageName)) ?? primaryProfile;
+    const { dir, profileName } = owner;
     const disk = inspectPackageDiskHealth(dir, packageName);
     if (!inManifest && !disk.currentVersion) continue;
 
@@ -433,7 +430,6 @@ interface GithubOrigin {
   owner: string;
   repo: string;
   ref?: string;
-  pinnedCommit?: string;
   subpath?: string;
 }
 
@@ -468,7 +464,6 @@ function parseGithubSource(value?: string): GithubOrigin | null {
   }
 
   let ref: string | undefined;
-  let pinnedCommit: string | undefined;
   let subpath: string | undefined;
 
   if (rawFragment) {
@@ -487,7 +482,7 @@ function parseGithubSource(value?: string): GithubOrigin | null {
           .join('/');
         if (normalizedPath) subpath = normalizedPath;
       } else if (/^[0-9a-f]{40}$/i.test(part)) {
-        pinnedCommit = part.toLowerCase();
+        // Ignore pinned commit SHA so checks/updates target the default or explicit ref.
       } else if (!part.includes(':') && !part.includes('..') && /^[A-Za-z0-9._/-]+$/.test(part)) {
         ref = part;
       }
@@ -498,7 +493,6 @@ function parseGithubSource(value?: string): GithubOrigin | null {
     owner,
     repo,
     ...(ref ? { ref } : {}),
-    ...(pinnedCommit ? { pinnedCommit } : {}),
     ...(subpath ? { subpath } : {})
   };
 }
@@ -548,15 +542,20 @@ function encodePackageName(packageName: string): string {
   return encodeURIComponent(packageName).replace(/^%40/i, '@');
 }
 
-async function fetchJson(url: string, timeoutMs = CHECK_TIMEOUT_MS, externalSignal?: AbortSignal): Promise<any> {
+async function fetchJson(
+  url: string,
+  timeoutMs = CHECK_TIMEOUT_MS,
+  externalSignal?: AbortSignal,
+  accept = 'application/json'
+): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const signal = externalSignal ? AbortSignal.any([controller.signal, externalSignal]) : controller.signal;
   try {
     const parsed = new URL(url);
     const headers: Record<string, string> = {
-      accept: 'application/json',
-      'user-agent': 'dsh-plugins-update'
+      accept,
+      'user-agent': PLUGIN_NAME
     };
     if (parsed.username || parsed.password) {
       const credentials = `${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`;
@@ -579,20 +578,23 @@ async function fetchJson(url: string, timeoutMs = CHECK_TIMEOUT_MS, externalSign
 
 interface RemotePackageInfo {
   version: string;
-  description?: string;
   registry?: string;
   isGithub: boolean;
 }
 
 async function fetchNpmLatest(packageName: string, registry: string): Promise<RemotePackageInfo> {
-  const data = await fetchJson(`${registry}${encodePackageName(packageName)}`);
+  const data = await fetchJson(
+    `${registry}${encodePackageName(packageName)}`,
+    CHECK_TIMEOUT_MS,
+    undefined,
+    'application/vnd.npm.install-v1+json, application/json;q=0.9'
+  );
   const version = data?.['dist-tags']?.latest;
   if (typeof version !== 'string' || !version.trim()) {
     throw new RemoteError(ERROR_CODES.offline, '更新源未返回最新版本号');
   }
   return {
     version: version.trim(),
-    description: typeof data?.description === 'string' ? data.description : undefined,
     registry,
     isGithub: false
   };
@@ -621,7 +623,6 @@ async function fetchGithubPackageJson(github: GithubOrigin): Promise<RemotePacka
     }
     return {
       version: data.version.trim(),
-      description: typeof data?.description === 'string' ? data.description : undefined,
       isGithub: true
     };
   });
@@ -645,11 +646,11 @@ async function resolveRemotePackage(
   source?: string
 ): Promise<{ info: RemotePackageInfo; origin: PackageOrigin; registry: string }> {
   const origin = resolvePackageOrigin(profileDir, packageName, source);
+  const registry = resolveRegistryUrl(settings.registry);
   if (origin.isGithub && origin.github) {
     const info = await fetchGithubPackageJson(origin.github);
-    return { info, origin, registry: selectedRegistry(settings) };
+    return { info, origin, registry };
   }
-  const registry = selectedRegistry(settings);
   const info = await fetchNpmLatest(packageName, registry);
   return { info, origin, registry };
 }
@@ -660,11 +661,12 @@ function desktopCliCandidates(): string[] {
   const candidates: string[] = [];
   const override = process.env.DSH_CLI_JS?.trim();
   if (override) candidates.push(override);
-  const cliRel = join('resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js');
+  const appRel = join('app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js');
+  const cliRel = join('resources', appRel);
   const execDir = process.execPath ? dirname(process.execPath) : '';
   if (execDir) {
     candidates.push(join(execDir, cliRel));
-    candidates.push(join(execDir, '..', 'Resources', cliRel));
+    candidates.push(join(execDir, '..', 'Resources', appRel));
   }
   if (process.env.LOCALAPPDATA) candidates.push(join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness', cliRel));
   return candidates;
@@ -674,10 +676,12 @@ function pnpmCandidates(): string[] {
   const candidates: string[] = [];
   const override = process.env.DSH_PNPM_JS?.trim();
   if (override) candidates.push(override);
-  const rel = join('resources', 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs');
+  const runtimeRel = join('runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs');
+  const rel = join('resources', runtimeRel);
   const execDir = process.execPath ? dirname(process.execPath) : '';
   if (execDir) {
     candidates.push(join(execDir, rel));
+    candidates.push(join(execDir, '..', 'Resources', runtimeRel));
     candidates.push(join(execDir, '..', rel));
   }
   const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
@@ -686,16 +690,16 @@ function pnpmCandidates(): string[] {
   return candidates;
 }
 
-function buildChildEnv(registry?: string): NodeJS.ProcessEnv {
+function createChildEnv(registry?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ELECTRON_RUN_AS_NODE: '1',
-    ...(registry ? { npm_config_registry: registry } : {}),
     npm_config_update_notifier: 'false',
     pnpm_config_update_notifier: 'false',
     npm_config_fund: 'false',
     npm_config_audit: 'false'
   };
+  if (registry) env.npm_config_registry = registry;
   delete env.GITHUB_TOKEN;
   delete env.GH_TOKEN;
   return env;
@@ -707,7 +711,7 @@ function buildInstallCommand(
   registry: string,
   policyBypass: boolean
 ): { command: string; args: string[]; env: NodeJS.ProcessEnv } | { error: string } {
-  const env = buildChildEnv(registry);
+  const env = createChildEnv(registry);
   const extraArgs = [
     '--config.update-notifier=false',
     ...(policyBypass ? ['--config.minimum-release-age=0'] : [])
@@ -735,7 +739,7 @@ function buildRemoveCommand(
   profileName: string,
   packageName: string
 ): { command: string; args: string[]; env: NodeJS.ProcessEnv } | { error: string } {
-  const env = buildChildEnv();
+  const env = createChildEnv();
   const extraArgs = ['--config.update-notifier=false'];
   const cliJs = desktopCliCandidates().find(candidate => existsSync(candidate));
   if (cliJs) {
@@ -861,6 +865,20 @@ function isSupplyChainPolicyFailure(output: string): boolean {
   );
 }
 
+async function installWithPolicyFallback(
+  profileDir: string,
+  profileName: string,
+  spec: string,
+  registry: string,
+  initialPolicyBypass = false
+): Promise<InstallAttempt> {
+  const attempt = await spawnInstall(profileDir, profileName, spec, registry, initialPolicyBypass);
+  if (!attempt.ok && !attempt.timedOut && !initialPolicyBypass && isSupplyChainPolicyFailure(attempt.output)) {
+    return spawnInstall(profileDir, profileName, spec, registry, true);
+  }
+  return attempt;
+}
+
 interface Snapshot {
   manifest: string | null;
   lockfile: string | null;
@@ -888,7 +906,6 @@ function restoreSnapshot(profileDir: string, snapshot: Snapshot): boolean {
 async function alignNodeModulesAfterRollback(profileDir: string): Promise<'aligned' | 'skipped' | 'failed'> {
   const pnpmJs = pnpmCandidates().find(candidate => existsSync(candidate));
   if (!pnpmJs) return 'skipped';
-  const env = buildChildEnv();
   const result = await spawnCommand(
     process.execPath,
     [
@@ -902,7 +919,7 @@ async function alignNodeModulesAfterRollback(profileDir: string): Promise<'align
       '--config.minimum-release-age=0'
     ],
     profileDir,
-    env,
+    createChildEnv(),
     ROLLBACK_TIMEOUT_MS
   );
   return result.ok ? 'aligned' : 'failed';
@@ -917,6 +934,7 @@ async function rollbackAfterFailure(
 ): Promise<'restored' | 'failed'> {
   const restored = restoreSnapshot(profileDir, snapshot);
   if (!restored) return 'failed';
+  if (snapshot.lockfile === null) return 'restored';
   // Skip expensive pnpm alignment unless verification failed or node_modules was mutated before failure.
   const versionAfterRestore = readInstalledVersion(profileDir, packageName);
   const drifted = forceAlign || (Boolean(previousVersion) && versionAfterRestore !== previousVersion);
@@ -940,13 +958,10 @@ async function runInstallWithFallback(
   settings: PluginSettings,
   initialPolicyBypass = false
 ): Promise<{ attempt: InstallAttempt; registryUsed: string; fellBack: boolean }> {
-  let registryUsed = selectedRegistry(settings);
+  let registryUsed = resolveRegistryUrl(settings.registry);
   let fellBack = false;
-  let attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, initialPolicyBypass);
+  let attempt = await installWithPolicyFallback(profileDir, profileName, spec, registryUsed, initialPolicyBypass);
 
-  if (!attempt.ok && !attempt.timedOut && !initialPolicyBypass && isSupplyChainPolicyFailure(attempt.output)) {
-    attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, true);
-  }
   if (
     !attempt.ok &&
     !attempt.timedOut &&
@@ -955,16 +970,13 @@ async function runInstallWithFallback(
   ) {
     fellBack = true;
     registryUsed = OFFICIAL_REGISTRY;
-    attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, initialPolicyBypass);
-    if (!attempt.ok && !attempt.timedOut && !initialPolicyBypass && isSupplyChainPolicyFailure(attempt.output)) {
-      attempt = await spawnInstall(profileDir, profileName, spec, registryUsed, true);
-    }
+    attempt = await installWithPolicyFallback(profileDir, profileName, spec, registryUsed, initialPolicyBypass);
   }
   return { attempt, registryUsed, fellBack };
 }
 
 function triggerPackageRefresh(packageName: string, refresh: () => Promise<void>): Promise<void> {
-  if (packageName === OWN_PACKAGE_NAME) {
+  if (packageName === PLUGIN_NAME) {
     const timer = setTimeout(() => void refresh(), 1500);
     timer.unref?.();
     return Promise.resolve();
@@ -973,20 +985,18 @@ function triggerPackageRefresh(packageName: string, refresh: () => Promise<void>
 }
 
 async function performUpdate(
-  ctx: any,
   config: any,
-  params: { packageName: string; targetVersion?: string; source?: string },
+  profile: { dir: string; profileName: string },
+  params: DoUpdateParams,
   refresh: () => Promise<void>
 ): Promise<DoUpdateResult> {
   const { packageName } = params;
+  const { dir: profileDir, profileName } = profile;
   const settings = readSettings(config);
-  const { dir: profileDir, profileName } = resolveProfileDir(packageName);
-  if (!existsSync(join(profileDir, 'package.json'))) {
-    return { ok: false, packageName, error: '找不到可用的 DSH profile 目录', errorCode: ERROR_CODES.profileNotFound };
-  }
 
   const origin = resolvePackageOrigin(profileDir, packageName, params.source);
   const currentVersion = readInstalledVersion(profileDir, packageName);
+  const registryUsed = resolveRegistryUrl(settings.registry);
   let targetVersion = params.targetVersion;
   let spec = '';
 
@@ -997,8 +1007,7 @@ async function performUpdate(
     }
     spec = buildGithubInstallSpec(origin.github);
   } else {
-    const registry = selectedRegistry(settings);
-    const remote = targetVersion ? undefined : await fetchNpmLatest(packageName, registry);
+    const remote = targetVersion ? undefined : await fetchNpmLatest(packageName, registryUsed);
     targetVersion = targetVersion || remote!.version;
     spec = `${packageName}@${targetVersion}`;
   }
@@ -1008,7 +1017,7 @@ async function performUpdate(
   }
 
   const snapshot = captureSnapshot(profileDir);
-  const { attempt, registryUsed, fellBack } = await runInstallWithFallback(profileDir, profileName, spec, settings);
+  const { attempt } = await runInstallWithFallback(profileDir, profileName, spec, settings);
 
   if (!attempt.ok) {
     const rollback = await rollbackAfterFailure(profileDir, packageName, currentVersion, snapshot, false);
@@ -1017,13 +1026,9 @@ async function performUpdate(
       packageName,
       targetVersion,
       source: origin.declaredSpec,
-      registryUsed: safeRegistryUrl(registryUsed),
-      registryLabel: registryLabel(registryUsed, settings.customRegistries),
-      fellBack,
       rollback,
       error: attempt.timedOut ? '更新超时，已中止安装' : attempt.error || '安装失败',
-      errorCode: attempt.timedOut ? ERROR_CODES.timeout : ERROR_CODES.installFailed,
-      output: attempt.output
+      errorCode: attempt.timedOut ? ERROR_CODES.timeout : ERROR_CODES.installFailed
     };
   }
 
@@ -1036,17 +1041,12 @@ async function performUpdate(
       packageName,
       targetVersion,
       source: origin.declaredSpec,
-      registryUsed: safeRegistryUrl(registryUsed),
-      registryLabel: registryLabel(registryUsed, settings.customRegistries),
-      fellBack,
       rollback,
       error: `安装后校验未通过：期望 ${targetVersion}，实际 ${installedVersion || '未知'}`,
-      errorCode: ERROR_CODES.verificationFailed,
-      output: attempt.output
+      errorCode: ERROR_CODES.verificationFailed
     };
   }
 
-  const selfUpdate = packageName === OWN_PACKAGE_NAME;
   await triggerPackageRefresh(packageName, refresh);
 
   return {
@@ -1054,33 +1054,19 @@ async function performUpdate(
     packageName,
     targetVersion: installedVersion,
     source: origin.declaredSpec,
-    registryUsed: safeRegistryUrl(registryUsed),
-    registryLabel: registryLabel(registryUsed, settings.customRegistries),
-    fellBack,
-    selfUpdate,
-    rollback: 'not-needed',
-    output: attempt.output
+    rollback: 'not-needed'
   };
 }
 
 async function performReinstall(
-  _ctx: any,
   config: any,
+  profile: { dir: string; profileName: string },
   params: { packageName: string; targetVersion?: string; source?: string },
   refresh: () => Promise<void>
 ): Promise<RescueResult> {
   const { packageName } = params;
+  const { dir: profileDir, profileName } = profile;
   const settings = readSettings(config);
-  const { dir: profileDir, profileName } = resolveProfileDir(packageName);
-  if (!existsSync(join(profileDir, 'package.json'))) {
-    return {
-      ok: false,
-      packageName,
-      action: 'reinstall',
-      error: '找不到可用的 DSH profile 目录',
-      errorCode: ERROR_CODES.profileNotFound
-    };
-  }
 
   const origin = resolvePackageOrigin(profileDir, packageName, params.source);
   const currentVersion = readInstalledVersion(profileDir, packageName);
@@ -1096,7 +1082,7 @@ async function performReinstall(
     }
     spec = buildGithubInstallSpec(origin.github);
   } else {
-    const registry = selectedRegistry(settings);
+    const registry = resolveRegistryUrl(settings.registry);
     if (!targetVersion) {
       try {
         const remote = await fetchNpmLatest(packageName, registry);
@@ -1119,7 +1105,7 @@ async function performReinstall(
       rollback,
       error: attempt.timedOut ? '重装超时，已中止操作' : attempt.error || '重装失败',
       errorCode: attempt.timedOut ? ERROR_CODES.timeout : ERROR_CODES.installFailed,
-      output: attempt.output
+      output: redactSecrets(attempt.output)
     };
   }
 
@@ -1140,11 +1126,11 @@ async function performReinstall(
         ? `重装后入口校验仍缺失：${disk.errorDetail || '文件不完整'}`
         : `重装后版本校验未通过：期望 ${targetVersion || '可用版本'}，实际 ${installedVersion || '未知'}`,
       errorCode: ERROR_CODES.verificationFailed,
-      output: attempt.output
+      output: redactSecrets(attempt.output)
     };
   }
 
-  const selfUpdate = packageName === OWN_PACKAGE_NAME;
+  const selfUpdate = packageName === PLUGIN_NAME;
   await triggerPackageRefresh(packageName, refresh);
 
   return {
@@ -1154,16 +1140,17 @@ async function performReinstall(
     targetVersion: installedVersion,
     selfUpdate,
     rollback: 'not-needed',
-    output: attempt.output
+    output: redactSecrets(attempt.output)
   };
 }
 
 async function performUninstall(
+  profile: { dir: string; profileName: string },
   packageName: string,
   bundle: BundleInfo | undefined,
   refresh: () => Promise<void>
 ): Promise<RescueResult> {
-  if (packageName === OWN_PACKAGE_NAME) {
+  if (packageName === PLUGIN_NAME) {
     return {
       ok: false,
       packageName,
@@ -1173,16 +1160,7 @@ async function performUninstall(
     };
   }
 
-  const { dir: profileDir, profileName } = resolveProfileDir(packageName);
-  if (!existsSync(join(profileDir, 'package.json'))) {
-    return {
-      ok: false,
-      packageName,
-      action: 'uninstall',
-      error: '找不到可用的 DSH profile 目录',
-      errorCode: ERROR_CODES.profileNotFound
-    };
-  }
+  const { dir: profileDir, profileName } = profile;
 
   const inManifest = Object.prototype.hasOwnProperty.call(readProfileDependencies(profileDir), packageName);
   const inNodeModules = existsSync(join(profileDir, 'node_modules', packageName));
@@ -1209,7 +1187,7 @@ async function performUninstall(
       rollback,
       error: attempt.timedOut ? '卸载超时，已中止操作' : attempt.error || '卸载失败',
       errorCode: attempt.timedOut ? ERROR_CODES.timeout : ERROR_CODES.installFailed,
-      output: attempt.output
+      output: redactSecrets(attempt.output)
     };
   }
 
@@ -1223,7 +1201,7 @@ async function performUninstall(
       rollback,
       error: '卸载后校验未通过：插件仍存在于 profile 配置中',
       errorCode: ERROR_CODES.verificationFailed,
-      output: attempt.output
+      output: redactSecrets(attempt.output)
     };
   }
 
@@ -1234,7 +1212,7 @@ async function performUninstall(
     packageName,
     action: 'uninstall',
     rollback: 'not-needed',
-    output: attempt.output
+    output: redactSecrets(attempt.output)
   };
 }
 
@@ -1307,9 +1285,10 @@ export function apply(ctx: any, config: any) {
         methods: ['POST'],
         requestBody: 'buffered',
         fetch: async (req: Request) => {
+          let packageName = '';
           try {
             const body = await parseJsonBody(req);
-            const packageName = readPackageName(body?.packageName);
+            packageName = readPackageName(body?.packageName) ?? '';
             if (!packageName) {
               return errorResponse(
                 { packageName: '', hasUpdate: false },
@@ -1336,7 +1315,6 @@ export function apply(ctx: any, config: any) {
               currentVersion,
               latestVersion: info.version,
               hasUpdate: compareSemver(info.version, currentVersion) > 0,
-              description: info.description,
               source: origin.declaredSpec || bundle?.source,
               isGithub: info.isGithub,
               registry: safeRegistryUrl(registry),
@@ -1346,7 +1324,7 @@ export function apply(ctx: any, config: any) {
           } catch (error: any) {
             const errorCode = error instanceof RemoteError ? error.errorCode : ERROR_CODES.unknown;
             return errorResponse(
-              { packageName: '', hasUpdate: false, latestVersion: '0.0.0' },
+              { packageName, hasUpdate: false },
               errorCode,
               redactSecrets(error?.message || '检查更新失败')
             );
@@ -1367,6 +1345,7 @@ export function apply(ctx: any, config: any) {
           try {
             const body = await parseJsonBody(req);
             const force = body?.force === true;
+            const reconcile = body?.reconcile === true;
             const rawKnown: Record<string, unknown> =
               body?.knownUpdates && typeof body.knownUpdates === 'object' ? body.knownUpdates : {};
 
@@ -1422,7 +1401,7 @@ export function apply(ctx: any, config: any) {
             };
 
             let task: Promise<BatchCheckState>;
-            if (!force && inFlightCheckAll) {
+            if (!force && !reconcile && inFlightCheckAll) {
               task = inFlightCheckAll;
             } else {
               task = runBatch().finally(() => {
@@ -1438,7 +1417,7 @@ export function apply(ctx: any, config: any) {
               updatable,
               hostVersion: detectHostVersion(ctx),
               unhealthy,
-              registry: safeRegistryUrl(selectedRegistry(settings)),
+              registry: safeRegistryUrl(resolveRegistryUrl(settings.registry)),
               alwaysShowDetailButton: settings.alwaysShowDetailButton
             };
             return jsonResponse(result);
@@ -1470,7 +1449,7 @@ export function apply(ctx: any, config: any) {
             const clientCrashes = new Map<string, string>();
             for (const [rawName, rawMsg] of Object.entries(rawCrashes)) {
               const pkgName = readPackageName(rawName);
-              if (!pkgName || isOfficialPackageName(pkgName) || pkgName === OWN_PACKAGE_NAME) continue;
+              if (!pkgName || isOfficialPackageName(pkgName) || pkgName === PLUGIN_NAME) continue;
               if (typeof rawMsg === 'string' && rawMsg.trim()) {
                 const msg = redactSecrets(rawMsg.trim());
                 clientCrashes.set(pkgName, msg.length > 300 ? `${msg.slice(0, 300)}...` : msg);
@@ -1536,7 +1515,7 @@ export function apply(ctx: any, config: any) {
               hostVersion: detectHostVersion(ctx),
               profileName: primaryProfile.profileName,
               plugins: reports,
-              registry: safeRegistryUrl(selectedRegistry(settings))
+              registry: safeRegistryUrl(resolveRegistryUrl(settings.registry))
             };
             return jsonResponse(result);
           } catch (error: any) {
@@ -1575,19 +1554,19 @@ export function apply(ctx: any, config: any) {
             const blocked = bundleGuardError(packageName, bundle);
             if (blocked) return errorResponse({ packageName }, blocked.errorCode, blocked.error);
 
-            const { dir } = resolveProfileDir(packageName);
-            if (!existsSync(join(dir, 'package.json'))) {
+            const profile = resolveProfileDir(packageName);
+            if (!existsSync(join(profile.dir, 'package.json'))) {
               return errorResponse({ packageName }, ERROR_CODES.profileNotFound, '找不到可用的 DSH profile 目录');
             }
-            if (runningProfiles.has(dir)) {
+            if (runningProfiles.has(profile.dir)) {
               return errorResponse({ packageName }, ERROR_CODES.installInProgress, '另一个插件正在更新，请稍后再试');
             }
 
-            runningProfiles.add(dir);
+            runningProfiles.add(profile.dir);
             try {
               const result = await performUpdate(
-                ctx,
                 config,
+                profile,
                 {
                   packageName,
                   targetVersion,
@@ -1597,7 +1576,7 @@ export function apply(ctx: any, config: any) {
               );
               return jsonResponse(result);
             } finally {
-              runningProfiles.delete(dir);
+              runningProfiles.delete(profile.dir);
             }
           } catch (error: any) {
             return errorResponse(
@@ -1658,7 +1637,7 @@ export function apply(ctx: any, config: any) {
             if (blocked) {
               return errorResponse({ packageName, action }, blocked.errorCode, blocked.error);
             }
-            if (action === 'uninstall' && packageName === OWN_PACKAGE_NAME) {
+            if (action === 'uninstall' && packageName === PLUGIN_NAME) {
               return errorResponse(
                 { packageName, action },
                 ERROR_CODES.selfUninstallBlocked,
@@ -1666,11 +1645,11 @@ export function apply(ctx: any, config: any) {
               );
             }
 
-            const { dir } = resolveProfileDir(packageName);
-            if (!existsSync(join(dir, 'package.json'))) {
+            const profile = resolveProfileDir(packageName);
+            if (!existsSync(join(profile.dir, 'package.json'))) {
               return errorResponse({ packageName, action }, ERROR_CODES.profileNotFound, '找不到可用的 DSH profile 目录');
             }
-            if (runningProfiles.has(dir)) {
+            if (runningProfiles.has(profile.dir)) {
               return errorResponse(
                 { packageName, action },
                 ERROR_CODES.installInProgress,
@@ -1678,13 +1657,13 @@ export function apply(ctx: any, config: any) {
               );
             }
 
-            runningProfiles.add(dir);
+            runningProfiles.add(profile.dir);
             try {
               const source = typeof body?.source === 'string' ? body.source : bundle?.source;
               if (action === 'update') {
                 const updated = await performUpdate(
-                  ctx,
                   config,
+                  profile,
                   { packageName, targetVersion, source },
                   refreshAfterInstall
                 );
@@ -1693,27 +1672,26 @@ export function apply(ctx: any, config: any) {
                   packageName,
                   action: 'update',
                   targetVersion: updated.targetVersion,
-                  selfUpdate: updated.selfUpdate,
+                  selfUpdate: packageName === PLUGIN_NAME,
                   rollback: updated.rollback,
                   error: updated.error,
-                  errorCode: updated.errorCode,
-                  output: updated.output
+                  errorCode: updated.errorCode
                 };
                 return jsonResponse(result);
               }
               if (action === 'reinstall') {
                 const reinstalled = await performReinstall(
-                  ctx,
                   config,
+                  profile,
                   { packageName, targetVersion, source },
                   refreshAfterInstall
                 );
                 return jsonResponse(reinstalled);
               }
-              const uninstalled = await performUninstall(packageName, bundle, refreshAfterInstall);
+              const uninstalled = await performUninstall(profile, packageName, bundle, refreshAfterInstall);
               return jsonResponse(uninstalled);
             } finally {
-              runningProfiles.delete(dir);
+              runningProfiles.delete(profile.dir);
             }
           } catch (error: any) {
             return errorResponse(

@@ -2,6 +2,10 @@
 export declare const OFFICIAL_REGISTRY = "https://registry.npmjs.org/";
 /** Domestic mirror used by DSH itself. */
 export declare const DOMESTIC_REGISTRY = "https://registry.npmmirror.com/";
+/** Plugin package and Cordis service identifier. */
+export declare const PLUGIN_NAME = "dsh-plugins-update";
+/** Package scope prefix reserved for official DSH plugins. */
+export declare const OFFICIAL_PACKAGE_PREFIX = "@deepseek-ai/";
 /** Locale namespace owned by this plugin's client dictionaries. */
 export declare const LOCALE_NAMESPACE = "dsh-plugins-update";
 /** HTTP paths served by the backend half. */
@@ -50,7 +54,6 @@ export interface CheckUpdateResult {
     currentVersion?: string;
     latestVersion?: string;
     hasUpdate: boolean;
-    description?: string;
     source?: string;
     isGithub?: boolean;
     registry?: string;
@@ -111,6 +114,7 @@ export interface RescueResult {
 export interface CheckAllParams {
     knownUpdates?: Record<string, string>;
     force?: boolean;
+    reconcile?: boolean;
 }
 export interface CheckAllResult {
     ok: boolean;
@@ -132,14 +136,9 @@ export interface DoUpdateResult {
     packageName: string;
     targetVersion?: string;
     source?: string;
-    registryUsed?: string;
-    registryLabel?: string;
-    fellBack?: boolean;
-    selfUpdate?: boolean;
     rollback?: 'not-needed' | 'restored' | 'failed';
     error?: string;
     errorCode?: ErrorCode | string;
-    output?: string;
 }
 export interface SlotActionSubject {
     kind: string;
@@ -158,10 +157,12 @@ export interface SlotActionSubject {
 export interface SlotActionProps {
     subject: SlotActionSubject;
 }
+/** Check whether a package name belongs to the official DSH scope. */
+export declare function isOfficialPackageName(packageName: string | undefined | null): boolean;
 /** Normalize a registry URL the way pnpm compares them. */
 export declare function normalizeRegistryUrl(url: string | undefined | null): string | null;
-/** Human-readable label for a registry URL. */
-export declare function registryLabel(url: string, customs?: CustomRegistry[]): string;
+/** Resolve a stored registry choice ('npmjs' | 'npmmirror' | custom URL) to a normalized URL. */
+export declare function resolveRegistryUrl(registry: string | undefined | null): string;
 export interface ParsedSemver {
     core: number[];
     prerelease: string[];

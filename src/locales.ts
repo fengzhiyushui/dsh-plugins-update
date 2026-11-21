@@ -5,16 +5,13 @@
 
 export const zh = {
   'action.checking': '检查中…',
-  'action.checkUpdate': '检查更新',
   'action.upToDate': '已是最新',
-  'action.updateTo': '更新至 v{version}',
   'action.fastUpdate': '⚡ 极速更新 (v{version})',
   'action.fastUpdateTip': '绕过供应链安全观察期，直接安装最新版',
   'action.githubUpdate': '更新最新提交 (v{version})',
   'action.updating': '更新中…',
   'action.success': '已更新',
   'action.retry': '重试',
-  'action.updateFailed': '更新失败(重试)',
 
   'badge.updateAvailable': '可更新',
   'badge.sidebarTip': '{count} 个插件可更新',
@@ -118,16 +115,13 @@ export type MessageKey = keyof typeof zh;
 
 export const en: Record<MessageKey, string> = {
   'action.checking': 'Checking…',
-  'action.checkUpdate': 'Check for updates',
   'action.upToDate': 'Up to date',
-  'action.updateTo': 'Update to v{version}',
   'action.fastUpdate': '⚡ Fast Update (v{version})',
   'action.fastUpdateTip': 'Bypass release age policy and update to latest version directly',
   'action.githubUpdate': 'Update to v{version}',
   'action.updating': 'Updating…',
   'action.success': 'Updated',
   'action.retry': 'Retry',
-  'action.updateFailed': 'Update failed (retry)',
 
   'badge.updateAvailable': 'Update available',
   'badge.sidebarTip': '{count} plugin(s) have updates',

@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugins-update",
-  "version": "0.2.5-exp.2",
+  "version": "0.2.6-exp.1",
   "private": true,
   "description": "A DeepSeek Harness plugin for one-click updating third-party plugins in desktop & web client.",
   "author": "fengzhiyushui",
