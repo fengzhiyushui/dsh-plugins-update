@@ -22,7 +22,7 @@ interface UpdaterActionButtonProps extends SlotActionProps {
     locale?: LocaleServiceLike;
 }
 export declare const UpdaterActionButton: React.FC<UpdaterActionButtonProps>;
-export declare function apply(ctx: any): void;
+export declare function apply(ctx: any, config?: any): void;
 export declare const name = "dsh-plugins-update";
 export declare const inject: string[];
 export {};

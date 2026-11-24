@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.6] - 2026-11-24
+
+### Added
+- Added native `sidebar.panellist.trailing` slot integration (`id: 'plugins'`, `priority: 10` non-colliding fallback priority) in `src/client.tsx` for DSH `0.2.3-alpha.1`, rendering the updatable plugin counter with accessible screen-reader descriptions across expanded and collapsed sidebar modes while preserving the DOM badge portal as an automatic fallback for `0.2.2.x` releases.
+- Added live client-side `SyncedConfig` subscription (`bindSyncedConfig` via `apply(ctx, config)` and `ctx.config.resolveConfigByPackage`) so `registry` and `alwaysShowDetailButton` sync immediately at boot and on host config changes in DSH `0.2.3-alpha.1`.
+
+### Changed
+- Simplified the top compatibility notice in `README.md` and `README_zh.md` (`0.2.2-rc.1` ~ `0.2.3-alpha.1`).
+
 ## [0.2.5-exp.2] - 2026-11-19 (Experimental)
 
 ### Added

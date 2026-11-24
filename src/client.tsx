@@ -461,6 +461,91 @@ function useUiPrefs(): UiPrefs {
   return snapshot;
 }
 
+interface SyncedConfigRefLike<T = unknown> {
+  get: () => T;
+  subscribe?: (listener: () => void) => (() => void) | void;
+}
+
+function isSyncedConfigRef<T = unknown>(value: unknown): value is SyncedConfigRefLike<T> {
+  return typeof value === 'object' && value !== null && typeof (value as any).get === 'function';
+}
+
+function resolveSyncedConfigSource(ctx: any, config: any): Record<string, any> | undefined {
+  if (config && typeof config === 'object' && isSyncedConfigRef(config.registry)) {
+    return config as Record<string, any>;
+  }
+  try {
+    const resolved = ctx?.config?.resolveConfigByPackage?.(PLUGIN_NAME);
+    if (resolved && typeof resolved === 'object' && isSyncedConfigRef(resolved.registry)) {
+      return resolved as Record<string, any>;
+    }
+  } catch {}
+  return undefined;
+}
+
+function bindSyncedConfig(ctx: any, config: any): void {
+  const source = resolveSyncedConfigSource(ctx, config);
+  if (!source) return;
+
+  const registryRef = source.registry;
+  const alwaysShowRef = source.alwaysShowDetailButton;
+
+  const applySnapshot = () => {
+    const next: { registryUrl?: string; alwaysShowDetailButton?: boolean } = {};
+    if (isSyncedConfigRef<unknown>(registryRef)) {
+      try {
+        const rawRegistry = registryRef.get();
+        if (typeof rawRegistry === 'string' && rawRegistry.trim() && rawRegistry !== 'auto') {
+          next.registryUrl = resolveRegistryUrl(rawRegistry.trim());
+        }
+      } catch {}
+    }
+    if (isSyncedConfigRef<unknown>(alwaysShowRef)) {
+      try {
+        const rawAlwaysShow = alwaysShowRef.get();
+        if (typeof rawAlwaysShow === 'boolean') {
+          next.alwaysShowDetailButton = rawAlwaysShow;
+        }
+      } catch {}
+    }
+    syncUiPrefs(next);
+  };
+
+  const setup = () => {
+    applySnapshot();
+    const disposers: Array<() => void> = [];
+    if (isSyncedConfigRef(registryRef) && typeof registryRef.subscribe === 'function') {
+      try {
+        const off = registryRef.subscribe(applySnapshot);
+        if (typeof off === 'function') disposers.push(off);
+      } catch {}
+    }
+    if (isSyncedConfigRef(alwaysShowRef) && typeof alwaysShowRef.subscribe === 'function') {
+      try {
+        const off = alwaysShowRef.subscribe(applySnapshot);
+        if (typeof off === 'function') disposers.push(off);
+      } catch {}
+    }
+    return disposers.length > 0
+      ? () => {
+          for (const dispose of disposers) {
+            try {
+              dispose();
+            } catch {}
+          }
+        }
+      : undefined;
+  };
+
+  if (typeof ctx?.effect === 'function') {
+    try {
+      ctx.effect(setup, 'dsh-plugins-update: synced config');
+      return;
+    } catch {}
+  }
+  setup();
+}
+
 const updatablePlugins = new Map<string, string>();
 const updatedInSession = new Map<string, string>();
 const updatableListeners = new Set<() => void>();
@@ -2157,6 +2242,79 @@ function findSidebarPluginsButton(slots: any): HTMLElement | null {
   return null;
 }
 
+let nativeSidebarTrailingDepth = 0;
+const nativeSidebarTrailingListeners = new Set<() => void>();
+
+function notifyNativeSidebarTrailingChanged(): void {
+  for (const listener of nativeSidebarTrailingListeners) {
+    try {
+      listener();
+    } catch {}
+  }
+}
+
+function useNativeSidebarTrailingActive(): boolean {
+  const [active, setActive] = useState<boolean>(() => nativeSidebarTrailingDepth > 0);
+  useEffect(() => {
+    const sync = () => setActive(nativeSidebarTrailingDepth > 0);
+    nativeSidebarTrailingListeners.add(sync);
+    sync();
+    return () => {
+      nativeSidebarTrailingListeners.delete(sync);
+    };
+  }, []);
+  return active;
+}
+
+const srOnlyStyle: React.CSSProperties = {
+  position: 'absolute',
+  width: '1px',
+  height: '1px',
+  padding: 0,
+  margin: '-1px',
+  overflow: 'hidden',
+  clip: 'rect(0, 0, 0, 0)',
+  whiteSpace: 'nowrap',
+  border: 0
+};
+
+interface SidebarPluginsTrailingProps {
+  wide?: boolean;
+  active?: boolean;
+  t: Translator;
+  locale?: LocaleServiceLike;
+}
+
+const SidebarPluginsTrailingBadge: React.FC<SidebarPluginsTrailingProps> = ({ wide = true, t, locale }) => {
+  useLocaleRevision(locale);
+  const updatableEntries = useUpdatableSnapshot();
+  const count = updatableEntries.length;
+  if (count <= 0) return null;
+
+  const tip = t('badge.sidebarTip', { count });
+  return (
+    <span
+      title={wide ? tip : undefined}
+      style={
+        wide
+          ? { display: 'inline-flex', alignItems: 'center' }
+          : {
+              display: 'inline-flex',
+              alignItems: 'center',
+              pointerEvents: 'none',
+              transform: 'scale(0.75) translate(3px, -3px)',
+              transformOrigin: 'top right'
+            }
+      }
+    >
+      <span style={srOnlyStyle}>{tip}</span>
+      <span aria-hidden="true" style={{ display: 'inline-flex', alignItems: 'center' }}>
+        <SafeTag tone="info">{String(count)}</SafeTag>
+      </span>
+    </span>
+  );
+};
+
 interface UpdateRemindersOverlayProps {
   slots: any;
   t: Translator;
@@ -2182,6 +2340,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
   useLocaleRevision(locale);
   const updatableEntries = useUpdatableSnapshot();
   const rescue = useRescueSnapshot();
+  const nativeSidebarTrailing = useNativeSidebarTrailingActive();
 
   const [sidebarHost, setSidebarHost] = useState<HTMLElement | null>(null);
   const [rowTargets, setRowTargets] = useState<RowMountTarget[]>([]);
@@ -2241,49 +2400,62 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
   const syncDomTargets = useCallback(() => {
     try {
-      // 1. Sync Sidebar "Plugins" count badge host
-      let pluginsBtn = sidebarBtnRef.current;
-      if (!pluginsBtn || !pluginsBtn.isConnected) {
-        pluginsBtn = findSidebarPluginsButton(slots);
-        sidebarBtnRef.current = pluginsBtn;
-        lastSidebarCssRef.current = '';
-      }
-      if (pluginsBtn) {
-        let host = pluginsBtn.querySelector<HTMLElement>(`span[${SIDEBAR_BADGE_ATTR}="true"]`);
-        if (!host) {
-          host = document.createElement('span');
-          host.setAttribute(SIDEBAR_BADGE_ATTR, 'true');
-          pluginsBtn.appendChild(host);
+      // 1. Sync legacy Sidebar "Plugins" count badge host (fallback for DSH < 0.2.3-alpha.1 without sidebar.panellist.trailing)
+      if (nativeSidebarTrailingDepth > 0) {
+        if (sidebarBtnRef.current) {
+          sidebarBtnRef.current.querySelector(`span[${SIDEBAR_BADGE_ATTR}="true"]`)?.remove();
+          sidebarBtnRef.current = null;
           lastSidebarCssRef.current = '';
         }
-        let nextCssText = 'display: none;';
-        if (updatablePlugins.size > 0) {
-          if (
-            (!pluginsBtn.style.position || pluginsBtn.style.position === 'static') &&
-            window.getComputedStyle(pluginsBtn).position === 'static'
-          ) {
-            pluginsBtn.style.position = 'relative';
-          }
-          const isCollapsed = pluginsBtn.clientWidth > 0 && pluginsBtn.clientWidth <= 48;
-          if (isCollapsed) {
-            nextCssText =
-              'position: absolute; top: 2px; right: 2px; display: inline-flex; align-items: center; pointer-events: none; transform: scale(0.8); transform-origin: top right;';
-          } else {
-            const panelEntry = pluginsBtn.closest('nav > div') || pluginsBtn.parentElement;
-            const hasUnpinBtn = Boolean(
-              panelEntry && Array.from(panelEntry.querySelectorAll('button')).some(btn => btn !== pluginsBtn)
-            );
-            nextCssText =
-              `position: absolute; top: 50%; right: ${hasUnpinBtn ? '32px' : '10px'}; transform: translateY(-50%); display: inline-flex; align-items: center; pointer-events: none;`;
-          }
-        }
-        if (lastSidebarCssRef.current !== nextCssText) {
-          host.style.cssText = nextCssText;
-          lastSidebarCssRef.current = nextCssText;
-        }
-        setSidebarHost(prev => (prev === host ? prev : host));
-      } else {
         setSidebarHost(null);
+      } else {
+        let pluginsBtn = sidebarBtnRef.current;
+        if (!pluginsBtn || !pluginsBtn.isConnected) {
+          pluginsBtn = findSidebarPluginsButton(slots);
+          sidebarBtnRef.current = pluginsBtn;
+          lastSidebarCssRef.current = '';
+        }
+        const hasNativeTrailingSlotInDom = Boolean(
+          pluginsBtn?.querySelector('[data-slot="sidebar.panellist.trailing"]')
+        );
+        if (pluginsBtn && !hasNativeTrailingSlotInDom) {
+          let host = pluginsBtn.querySelector<HTMLElement>(`span[${SIDEBAR_BADGE_ATTR}="true"]`);
+          if (!host) {
+            host = document.createElement('span');
+            host.setAttribute(SIDEBAR_BADGE_ATTR, 'true');
+            pluginsBtn.appendChild(host);
+            lastSidebarCssRef.current = '';
+          }
+          let nextCssText = 'display: none;';
+          if (updatablePlugins.size > 0) {
+            if (
+              (!pluginsBtn.style.position || pluginsBtn.style.position === 'static') &&
+              window.getComputedStyle(pluginsBtn).position === 'static'
+            ) {
+              pluginsBtn.style.position = 'relative';
+            }
+            const isCollapsed = pluginsBtn.clientWidth > 0 && pluginsBtn.clientWidth <= 48;
+            if (isCollapsed) {
+              nextCssText =
+                'position: absolute; top: 2px; right: 2px; display: inline-flex; align-items: center; pointer-events: none; transform: scale(0.8); transform-origin: top right;';
+            } else {
+              const panelEntry = pluginsBtn.closest('nav > div') || pluginsBtn.parentElement;
+              const hasUnpinBtn = Boolean(
+                panelEntry && Array.from(panelEntry.querySelectorAll('button')).some(btn => btn !== pluginsBtn)
+              );
+              nextCssText =
+                `position: absolute; top: 50%; right: ${hasUnpinBtn ? '32px' : '10px'}; transform: translateY(-50%); display: inline-flex; align-items: center; pointer-events: none;`;
+            }
+          }
+          if (lastSidebarCssRef.current !== nextCssText) {
+            host.style.cssText = nextCssText;
+            lastSidebarCssRef.current = nextCssText;
+          }
+          setSidebarHost(prev => (prev === host ? prev : host));
+        } else {
+          pluginsBtn?.querySelector(`span[${SIDEBAR_BADGE_ATTR}="true"]`)?.remove();
+          setSidebarHost(null);
+        }
       }
 
       // 2. Detect blank or error-boundary detail page shortly after clicking a third-party plugin card
@@ -2407,7 +2579,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
   useEffect(() => {
     syncDomTargets();
-  }, [syncDomTargets, updatableEntries, rescue]);
+  }, [syncDomTargets, updatableEntries, rescue, nativeSidebarTrailing]);
 
   useEffect(() => {
     const btn = sidebarBtnRef.current;
@@ -2624,10 +2796,11 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
 // --- Client entry ---------------------------------------------------------------------
 
-export function apply(ctx: any) {
+export function apply(ctx: any, config?: any) {
   const locale = getLocaleService(ctx);
   const t = createTranslator(locale);
   registerLocaleDictionaries(ctx, locale);
+  bindSyncedConfig(ctx, config);
 
   let formInstance: any;
   const getForm = () => {
@@ -2638,6 +2811,40 @@ export function apply(ctx: any) {
 
   const slots = ctx.slots;
   if (!slots?.inject || !slots?.register) return;
+
+  try {
+    slots.inject('sidebar.panellist.trailing', () => {
+      let disposeRegistration: (() => void) | void;
+      try {
+        disposeRegistration = slots.register(
+          {
+            name: 'sidebar.panellist.trailing',
+            id: 'plugins',
+            priority: 10
+          },
+          (props: SidebarPluginsTrailingProps) =>
+            React.createElement(
+              SafeErrorBoundary,
+              { fallback: null },
+              React.createElement(SidebarPluginsTrailingBadge, { ...props, t, locale })
+            )
+        );
+      } catch {
+        return undefined;
+      }
+      nativeSidebarTrailingDepth += 1;
+      notifyNativeSidebarTrailingChanged();
+      return () => {
+        nativeSidebarTrailingDepth = Math.max(0, nativeSidebarTrailingDepth - 1);
+        notifyNativeSidebarTrailingChanged();
+        if (typeof disposeRegistration === 'function') {
+          try {
+            disposeRegistration();
+          } catch {}
+        }
+      };
+    });
+  } catch {}
 
   slots.inject('shell.overlay', () =>
     slots.register(

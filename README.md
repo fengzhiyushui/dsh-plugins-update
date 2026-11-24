@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/fengzhiyushui/dsh-plugins-update/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
-  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.2.5-brightgreen.svg" alt="Release" /></a>
+  <a href="https://github.com/fengzhiyushui/dsh-plugins-update/releases"><img src="https://img.shields.io/badge/Release-v0.2.6-brightgreen.svg" alt="Release" /></a>
   <a href="https://awesome-dsh-plugin.com"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin" /></a>
 </p>
 
@@ -21,9 +21,9 @@
 
 ---
 
-> ⚠️ **Experimental Branch Notice (`experimental`)**: This is the experimental branch (`v0.2.6-exp.1`). It is **not packaged or published to npm and cannot be installed via npm**. Install it via GitHub branch spec only (`fengzhiyushui/dsh-plugins-update#experimental`). For stable releases, please switch to the [`main` branch](https://github.com/fengzhiyushui/dsh-plugins-update/tree/main).
+> ⚠️ **Experimental Branch Notice (`experimental`)**: This is the experimental branch (`v0.2.7-exp.1`). It is **not packaged or published to npm and cannot be installed via npm**. Install it via GitHub branch spec only (`fengzhiyushui/dsh-plugins-update#experimental`). For stable releases, please switch to the [`main` branch](https://github.com/fengzhiyushui/dsh-plugins-update/tree/main).
 
-> **Important Notice**: DeepSeek Harness (DSH) has natively supported checking and updating plugins since `0.2.2-rc.1`. Starting from `v0.2.2`, this plugin adapts to coexist with DSH's native update mechanism (compatible with DSH `0.2.2-rc.1` through `0.2.5-rc.5`, locally verified on `0.2.5-rc.5`).
+> **Important Notice**: DSH natively supports plugin updates since `0.2.2-rc.1`. This plugin coexists seamlessly with the native updater (compatible with `0.2.2-rc.1` ~ `0.2.3-alpha.1`).
 
 ## Introduction
 
