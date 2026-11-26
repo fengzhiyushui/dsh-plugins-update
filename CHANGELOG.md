@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.7-exp.2] - 2026-11-26 (Experimental)
+
+### Added
+- Added startup conflict auto-disable guard (`runStartupConflictScan`, `disableConflictingPlugin`) and crash-loop sentinel in `src/index.ts` that automatically disables conflicting third-party plugins via `pluginManager.setBundleEnabled(..., false)` (with atomic `package.json` fallback) while keeping them disabled until manually re-enabled by the user after updating.
+- Added `/api/dsh-plugins-update/report-conflict` endpoint and lightweight frontend error/unhandledrejection stack attribution to auto-disable crashing third-party plugins at runtime.
+- Added orthogonal red/blue conflict vs update indicators across all three UI surfaces: sidebar (`[red] [blue]` in expanded mode, red badge + blue dot in collapsed mode), installed plugin rows (`Disabled (conflict)` and `Update available` side by side), and plugin detail page header badge (`plugins.detail.badge`).
+- Added `SafeSwitch` (wrapping native `Switch` from `@deepseek-ai/dsh-client-ui-primitives` with native HTML/CSS pill toggle fallback) and upgraded settings into 4 independent switches (`fallbackToOfficial`, `alwaysShowDetailButton`, plus off-by-default high-risk toggles `allowFreshRelease` and `allowUnreviewed` gated by danger confirmation modals).
+- Added market security review verification (`pluginMarket` configured indexes with automatic Format-1 fallback to `awesome-dsh-plugin.com` / `dshmarket.com` / `dsh-plugin-catalog` mirrors when empty) and `<24h` npm publication timestamp inspection via full packument metadata.
+- Added fallback activation on detail pages (`UpdaterActionButton`) whenever DSH native updates are unavailable (`isFreshRelease`, Git / GitHub sources, or non-official registries) with single-step direct installation.
+
+### Changed
+- Replaced the experimental Rescue Center modal, floating banner, `/diagnose`, and `/rescue` routes with the silent startup auto-disable guard and in-place orthogonal badges.
+- Decoupled plugin entrypoints from optional Cordis services (`inject = []` on backend, `inject = ['slots']` on client, guarded `require` for `@deepseek-ai/dsh-client-ui-primitives`, and `try/catch` around `Schema`) so future DSH UI/service changes never hang `dsh-plugins-update`.
+- Removed emojis from UI strings (`src/locales.ts`) and added explicit accessible `<label>` elements and `role="alert"` validation on custom registry inputs.
+
+### Security
+- Replaced global `--config.minimum-release-age=0` CLI override with targeted single-package `minimumReleaseAgeExclude` entries (`<pkg>@<version>`) in `pnpm-workspace.yaml` (included in atomic snapshot rollback), preserving 24h supply-chain cooling protection across all transitive dependencies.
+- Removed untrusted client `body.source` from `/check` and `/update`; package origin now resolves strictly from authoritative local profile manifests and host bundle metadata.
+- Replaced full `process.env` inheritance in `createChildEnv` with a minimal allowlist of runtime/proxy variables.
+- Added `--ignore-scripts` on `pnpm` CLI fallback installs and strict validation for `DSH_PROFILE` / `profileName` and install specs.
+- Hardened registry URL validation (`normalizeRegistryUrl`, `isDisallowedHost`, `assertSafeHttpsUrl`) to enforce `https:`, reject embedded credentials, and block loopback/link-local/cloud metadata SSRF targets across manual redirects (`redirect: 'manual'`).
+- Added atomic temporary-file writes (`writeFileAtomicSync`), package path containment checks in `inspectPackageDiskHealth`, and `x-dsh-updater: 1` + `application/json` verification on all POST routes.
+
 ## [0.2.6] - 2026-11-24
 
 ### Added

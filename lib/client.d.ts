@@ -11,15 +11,19 @@ interface LocaleServiceLike {
     };
     subscribe?: (listener: () => void) => (() => void) | void;
 }
+interface DynamicLocaleBridge {
+    t: Translator;
+    getRevision: () => number;
+    subscribe: (listener: () => void) => () => void;
+    attach: (ctx: any, locale: LocaleServiceLike | undefined) => void;
+}
 interface RegistrySettingsCardProps {
     form?: any;
-    t: Translator;
-    locale?: LocaleServiceLike;
+    localeBridge: DynamicLocaleBridge;
 }
 export declare const RegistrySettingsCard: React.FC<RegistrySettingsCardProps>;
 interface UpdaterActionButtonProps extends SlotActionProps {
-    t: Translator;
-    locale?: LocaleServiceLike;
+    localeBridge: DynamicLocaleBridge;
 }
 export declare const UpdaterActionButton: React.FC<UpdaterActionButtonProps>;
 export declare function apply(ctx: any, config?: any): void;

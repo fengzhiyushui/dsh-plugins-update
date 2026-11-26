@@ -1,19 +1,21 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Button, Modal, Tag } from '@deepseek-ai/dsh-client-ui-primitives';
+import type * as DshPrimitives from '@deepseek-ai/dsh-client-ui-primitives';
 import {
   CHECK_ALL_PATH,
   CHECK_PATH,
-  DIAGNOSE_PATH,
   DOMESTIC_REGISTRY,
   ERROR_CODES,
   LOCALE_NAMESPACE,
   OFFICIAL_REGISTRY,
   PLUGIN_NAME,
-  RESCUE_PATH,
+  REPORT_CONFLICT_PATH,
   UPDATE_PATH,
+  UPDATER_REQUEST_HEADER,
+  compareSemver,
   isOfficialPackageName,
   normalizeRegistryUrl,
+  parseSemver,
   resolveRegistryUrl,
   versionGte,
   type CheckAllParams,
@@ -21,25 +23,43 @@ import {
   type CheckUpdateParams,
   type CheckUpdateResult,
   type CustomRegistry,
-  type DiagnoseResult,
   type DoUpdateParams,
   type DoUpdateResult,
-  type PluginHealthIssueKind,
-  type PluginHealthReport,
-  type PluginHealthSummary,
+  type PluginConflictInfo,
   type PluginSettings,
-  type RescueAction,
-  type RescueResult,
+  type ReportConflictParams,
+  type ReportConflictResult,
   type SlotActionProps
 } from './types.js';
 import { en, zh } from './locales.js';
 
+declare const require: ((id: string) => any) | undefined;
+
 const CHECK_TIMEOUT_MS = 15_000;
 const BATCH_CHECK_TIMEOUT_MS = 25_000;
-const DIAGNOSE_TIMEOUT_MS = 25_000;
 const UPDATE_TIMEOUT_MS = 300_000;
+const REPORT_TIMEOUT_MS = 15_000;
 
-// --- Self-defense ErrorBoundary & UI primitive fallbacks ----------------------------
+// --- Guarded DSH UI Primitives loader & self-defense components -----------------------
+
+interface LoadedPrimitives {
+  Button?: typeof DshPrimitives.Button;
+  Modal?: typeof DshPrimitives.Modal;
+  Switch?: typeof DshPrimitives.Switch;
+  Tag?: typeof DshPrimitives.Tag;
+}
+
+function loadDshPrimitives(): LoadedPrimitives {
+  try {
+    if (typeof require === 'function') {
+      const mod = require('@deepseek-ai/dsh-client-ui-primitives');
+      if (mod && typeof mod === 'object') return mod as LoadedPrimitives;
+    }
+  } catch {}
+  return {};
+}
+
+const { Button, Modal, Switch, Tag } = loadDshPrimitives();
 
 function isUsableComponent(comp: unknown): comp is React.ComponentType<any> {
   return typeof comp === 'function' || (typeof comp === 'object' && comp !== null);
@@ -76,6 +96,13 @@ const SafeButton: React.FC<any> = ({ variant = 'outline', size = 'md', style, ch
   const isPrimary = variant === 'primary';
   const isDanger = variant === 'danger';
   const isSm = size === 'sm';
+  const dangerStyle: React.CSSProperties | undefined = isDanger
+    ? {
+        background: 'var(--dsw-alias-danger, #dc2626)',
+        borderColor: 'var(--dsw-alias-danger, #dc2626)',
+        color: '#ffffff'
+      }
+    : undefined;
   const fallback = (
     <button
       type="button"
@@ -92,17 +119,20 @@ const SafeButton: React.FC<any> = ({ variant = 'outline', size = 'md', style, ch
         border: isPrimary
           ? '1px solid var(--dsw-alias-primary, #2563eb)'
           : isDanger
-            ? '1px solid #ef4444'
+            ? '1px solid var(--dsw-alias-danger, #dc2626)'
             : '1px solid var(--dsw-alias-border-l1, #cbd5e1)',
         background: isPrimary
           ? 'var(--dsw-alias-primary, #2563eb)'
           : isDanger
-            ? '#dc2626'
+            ? 'var(--dsw-alias-danger, #dc2626)'
             : 'var(--dsw-alias-bg-elevated, #ffffff)',
         color: isPrimary || isDanger ? '#ffffff' : 'var(--dsw-alias-label-primary, #1e293b)',
-        opacity: disabled ? 0.55 : 1,
+        opacity: disabled ? 0.5 : 1,
         cursor: disabled ? 'not-allowed' : 'pointer',
         lineHeight: 1.4,
+        whiteSpace: 'nowrap',
+        transition: 'opacity 160ms cubic-bezier(0.16, 1, 0.3, 1)',
+        ...dangerStyle,
         ...style
       }}
       {...rest}
@@ -114,20 +144,43 @@ const SafeButton: React.FC<any> = ({ variant = 'outline', size = 'md', style, ch
   if (!isUsableComponent(Button)) return fallback;
   return (
     <SafeErrorBoundary fallback={fallback}>
-      <Button variant={variant === 'danger' ? 'outline' : variant} size={size} style={style} disabled={disabled} {...rest}>
+      <Button
+        variant={isDanger ? 'primary' : variant}
+        size={size}
+        style={{ ...dangerStyle, ...style }}
+        disabled={disabled}
+        {...rest}
+      >
         {children}
       </Button>
     </SafeErrorBoundary>
   );
 };
 
-const SafeTag: React.FC<any> = ({ tone = 'info', style, children, ...rest }) => {
+const SafeTag: React.FC<{
+  tone?: 'info' | 'danger' | 'success';
+  style?: React.CSSProperties;
+  title?: string;
+  children?: React.ReactNode;
+}> = ({ tone = 'info', style, children, ...rest }) => {
   const palette =
-    tone === 'warning' || tone === 'danger'
-      ? { bg: 'rgba(239, 68, 68, 0.12)', border: 'rgba(239, 68, 68, 0.35)', color: '#dc2626' }
+    tone === 'danger'
+      ? {
+          bg: 'rgba(220, 38, 38, 0.12)',
+          border: 'rgba(220, 38, 38, 0.32)',
+          color: 'var(--dsw-alias-danger, #dc2626)'
+        }
       : tone === 'success'
-        ? { bg: 'rgba(22, 163, 74, 0.12)', border: 'rgba(22, 163, 74, 0.3)', color: '#15803d' }
-        : { bg: 'rgba(37, 99, 235, 0.1)', border: 'rgba(37, 99, 235, 0.25)', color: 'var(--dsw-alias-primary, #2563eb)' };
+        ? {
+            bg: 'rgba(22, 163, 74, 0.12)',
+            border: 'rgba(22, 163, 74, 0.3)',
+            color: '#15803d'
+          }
+        : {
+            bg: 'rgba(37, 99, 235, 0.1)',
+            border: 'rgba(37, 99, 235, 0.25)',
+            color: 'var(--dsw-alias-primary, #2563eb)'
+          };
 
   const fallback = (
     <span
@@ -143,6 +196,7 @@ const SafeTag: React.FC<any> = ({ tone = 'info', style, children, ...rest }) => 
         color: palette.color,
         lineHeight: 1.5,
         whiteSpace: 'nowrap',
+        fontVariantNumeric: 'tabular-nums',
         ...style
       }}
       {...rest}
@@ -151,7 +205,7 @@ const SafeTag: React.FC<any> = ({ tone = 'info', style, children, ...rest }) => 
     </span>
   );
 
-  if (!isUsableComponent(Tag) || tone === 'warning' || tone === 'danger') return fallback;
+  if (!isUsableComponent(Tag)) return fallback;
   return (
     <SafeErrorBoundary fallback={fallback}>
       <Tag tone={tone} style={style} {...rest}>
@@ -161,18 +215,81 @@ const SafeTag: React.FC<any> = ({ tone = 'info', style, children, ...rest }) => 
   );
 };
 
-const SafeModal: React.FC<any> = ({ open, onClose, title, description, footer, children, closeLabel }) => {
+interface SafeSwitchProps {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  label: string;
+  disabled?: boolean;
+}
+
+const SafeSwitch: React.FC<SafeSwitchProps> = ({ checked, onChange, label, disabled = false }) => {
+  const fallback = (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => {
+        if (!disabled) onChange(!checked);
+      }}
+      style={{
+        position: 'relative',
+        display: 'inline-flex',
+        alignItems: 'center',
+        width: 36,
+        height: 20,
+        padding: 2,
+        borderRadius: 999,
+        border: 'none',
+        boxSizing: 'border-box',
+        flexShrink: 0,
+        background: checked
+          ? 'var(--dsw-alias-label-primary, #111827)'
+          : 'var(--dsw-alias-border-l1, #cbd5e1)',
+        opacity: disabled ? 0.45 : 1,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        transition: 'background-color 180ms cubic-bezier(0.16, 1, 0.3, 1)'
+      }}
+    >
+      <span
+        aria-hidden="true"
+        style={{
+          width: 16,
+          height: 16,
+          borderRadius: 999,
+          background: '#ffffff',
+          boxShadow: '0 1px 2px rgba(0, 0, 0, 0.18)',
+          transform: checked ? 'translateX(16px)' : 'translateX(0)',
+          transition: 'transform 180ms cubic-bezier(0.16, 1, 0.3, 1)'
+        }}
+      />
+    </button>
+  );
+
+  if (!isUsableComponent(Switch)) return fallback;
+  return (
+    <SafeErrorBoundary fallback={fallback}>
+      <span style={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0 }}>
+        <Switch checked={checked} onChange={onChange} label={label} disabled={disabled} />
+      </span>
+    </SafeErrorBoundary>
+  );
+};
+
+const SafeModal: React.FC<any> = ({ open, onClose, title, description, footer, closeLabel }) => {
   if (!open) return null;
   const fallback = (
     <div
       role="dialog"
       aria-modal="true"
+      aria-label={title}
       onClick={() => onClose?.()}
       style={{
         position: 'fixed',
         inset: 0,
-        zIndex: 10000,
-        background: 'rgba(15, 23, 42, 0.5)',
+        zIndex: 1000,
+        background: 'rgba(15, 23, 42, 0.48)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -183,15 +300,13 @@ const SafeModal: React.FC<any> = ({ open, onClose, title, description, footer, c
         onClick={event => event.stopPropagation()}
         style={{
           width: '100%',
-          maxWidth: 680,
-          maxHeight: '85vh',
-          overflow: 'auto',
+          maxWidth: 440,
           borderRadius: 12,
           padding: 20,
           background: 'var(--dsw-alias-bg-elevated, #ffffff)',
           color: 'var(--dsw-alias-label-primary, #1e293b)',
           border: '1px solid var(--dsw-alias-border-l1, #e2e8f0)',
-          boxShadow: '0 20px 50px rgba(0, 0, 0, 0.25)',
+          boxShadow: '0 16px 40px rgba(15, 23, 42, 0.18)',
           boxSizing: 'border-box'
         }}
       >
@@ -208,49 +323,59 @@ const SafeModal: React.FC<any> = ({ open, onClose, title, description, footer, c
               cursor: 'pointer',
               fontSize: 18,
               lineHeight: 1,
-              padding: '2px 6px'
+              padding: '4px 8px'
             }}
           >
             ×
           </button>
         </div>
         {description && (
-          <div style={{ fontSize: 13, color: 'var(--dsw-alias-label-secondary, #64748b)', marginBottom: 12 }}>
+          <div style={{ fontSize: 13, color: 'var(--dsw-alias-label-secondary, #64748b)', lineHeight: 1.6, marginBottom: 12 }}>
             {description}
           </div>
         )}
-        {children}
-        {footer && (
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
-            {footer}
-          </div>
-        )}
+        {footer && <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>{footer}</div>}
       </div>
     </div>
   );
 
-  // If custom children (like the large Rescue Center list) are passed, or Modal isn't available, use the fallback container
-  // so complex scrollable lists render reliably across DSH versions.
-  if (children || !isUsableComponent(Modal)) return fallback;
+  if (!isUsableComponent(Modal)) return fallback;
   return (
     <SafeErrorBoundary fallback={fallback}>
-      <Modal
-        open={open}
-        onClose={onClose}
-        title={title}
-        closeLabel={closeLabel}
-        description={description}
-        footer={footer}
-      />
+      <Modal open={open} onClose={onClose} title={title} closeLabel={closeLabel} description={description} footer={footer} />
     </SafeErrorBoundary>
   );
 };
+
+// --- HTTP helper with required anti-CSRF header --------------------------------------
+
+async function postUpdaterRequest<T>(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal
+): Promise<{ status: number; payload: T | null }> {
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      [UPDATER_REQUEST_HEADER]: '1'
+    },
+    body: JSON.stringify(body),
+    signal
+  });
+  const payload = (await response.json().catch(() => null)) as T | null;
+  return { status: response.status, payload };
+}
+
+// --- Locale bridge (supports optional / delayed locale service) -----------------------
 
 const DEFAULT_SETTINGS: PluginSettings = {
   registry: 'npmjs',
   customRegistries: [],
   fallbackToOfficial: true,
-  alwaysShowDetailButton: false
+  alwaysShowDetailButton: false,
+  allowFreshRelease: false,
+  allowUnreviewed: false
 };
 
 type TranslateParams = Record<string, string | number>;
@@ -261,6 +386,13 @@ interface LocaleServiceLike {
   bind?: (namespace: string) => Translator;
   getSnapshot?: () => { revision?: number; [key: string]: unknown };
   subscribe?: (listener: () => void) => (() => void) | void;
+}
+
+interface DynamicLocaleBridge {
+  t: Translator;
+  getRevision: () => number;
+  subscribe: (listener: () => void) => () => void;
+  attach: (ctx: any, locale: LocaleServiceLike | undefined) => void;
 }
 
 function interpolate(template: string, params?: TranslateParams): string {
@@ -330,34 +462,74 @@ function registerLocaleDictionaries(ctx: any, locale: LocaleServiceLike | undefi
   register();
 }
 
-function useLocaleRevision(locale: LocaleServiceLike | undefined): number {
-  const readRevision = () => {
-    try {
-      const snapshot = locale?.getSnapshot?.();
-      return typeof snapshot?.revision === 'number' ? snapshot.revision : 0;
-    } catch {
-      return 0;
+function createDynamicLocaleBridge(initialCtx: any): DynamicLocaleBridge {
+  let activeLocale = getLocaleService(initialCtx);
+  let activeTranslator = createTranslator(activeLocale);
+  let revisionCounter = 0;
+  let unsubscribeLocale: (() => void) | void;
+  const listeners = new Set<() => void>();
+
+  const bump = () => {
+    revisionCounter += 1;
+    for (const fn of listeners) {
+      try {
+        fn();
+      } catch {}
     }
   };
-  const [revision, setRevision] = useState<number>(readRevision);
-  useEffect(() => {
-    if (!locale || typeof locale.subscribe !== 'function') return undefined;
-    const sync = () => setRevision(readRevision());
-    let unsubscribe: (() => void) | void;
-    try {
-      unsubscribe = locale.subscribe(sync);
-    } catch {
-      return undefined;
+
+  const attach = (targetCtx: any, nextLocale: LocaleServiceLike | undefined) => {
+    if (!nextLocale) return;
+    if (typeof unsubscribeLocale === 'function') {
+      try {
+        unsubscribeLocale();
+      } catch {}
+      unsubscribeLocale = undefined;
     }
-    sync();
-    return () => {
-      if (typeof unsubscribe === 'function') {
-        try {
-          unsubscribe();
-        } catch {}
+    activeLocale = nextLocale;
+    registerLocaleDictionaries(targetCtx, nextLocale);
+    activeTranslator = createTranslator(nextLocale);
+    if (typeof nextLocale.subscribe === 'function') {
+      try {
+        unsubscribeLocale = nextLocale.subscribe(bump);
+      } catch {}
+    }
+    bump();
+  };
+
+  if (activeLocale) {
+    attach(initialCtx, activeLocale);
+  }
+
+  return {
+    t: (key, params) => activeTranslator(key, params),
+    getRevision: () => {
+      try {
+        const snap = activeLocale?.getSnapshot?.();
+        const hostRev = typeof snap?.revision === 'number' ? snap.revision : 0;
+        return revisionCounter * 1000 + hostRev;
+      } catch {
+        return revisionCounter;
       }
-    };
-  }, [locale]);
+    },
+    subscribe: listener => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    attach
+  };
+}
+
+function useLocaleRevision(bridge: DynamicLocaleBridge): number {
+  const [revision, setRevision] = useState<number>(() => bridge.getRevision());
+  useEffect(() => {
+    const sync = () => setRevision(bridge.getRevision());
+    const off = bridge.subscribe(sync);
+    sync();
+    return off;
+  }, [bridge]);
   return revision;
 }
 
@@ -373,7 +545,9 @@ const ERROR_KEY_BY_CODE: Record<string, string> = {
   [ERROR_CODES.timeout]: 'error.timeout',
   [ERROR_CODES.verificationFailed]: 'error.verificationFailed',
   [ERROR_CODES.rollbackFailed]: 'error.rollbackFailed',
-  [ERROR_CODES.selfUninstallBlocked]: 'error.selfUninstallBlocked'
+  [ERROR_CODES.freshReleaseBlocked]: 'error.freshReleaseBlocked',
+  [ERROR_CODES.unreviewedBlocked]: 'error.unreviewedBlocked',
+  [ERROR_CODES.forbidden]: 'error.forbidden'
 };
 
 function errorText(t: Translator, errorCode?: string, fallback?: string): string {
@@ -385,22 +559,25 @@ function isOfficialPackage(pkg: SlotActionProps['subject']['pkg']): boolean {
   return pkg?.official === true || isOfficialPackageName(pkg?.name);
 }
 
-// --- Persistent updatable plugins store & startup batch probe -------------------------
+// --- Persistent stores: UI prefs, updatable plugins & orthogonal conflict badges ------
 
 const UPDATABLE_STORAGE_KEY = 'dsh-plugins-update:updatable-v1';
+const CONFLICTS_STORAGE_KEY = 'dsh-plugins-update:conflicts-v1';
 const UPDATED_SESSION_KEY = 'dsh-plugins-update:updated-in-session-v1';
 const UI_PREFS_STORAGE_KEY = 'dsh-plugins-update:ui-prefs-v1';
-const LAST_HOST_VERSION_KEY = 'dsh-plugins-update:last-host-version-v1';
-const DISMISSED_RESCUE_KEY = 'dsh-plugins-update:dismissed-rescue-v1';
 
 interface UiPrefs {
   registryUrl: string;
   alwaysShowDetailButton: boolean;
+  allowFreshRelease: boolean;
+  allowUnreviewed: boolean;
 }
 
 const uiPrefs: UiPrefs = {
   registryUrl: OFFICIAL_REGISTRY,
-  alwaysShowDetailButton: false
+  alwaysShowDetailButton: false,
+  allowFreshRelease: false,
+  allowUnreviewed: false
 };
 const uiPrefsListeners = new Set<() => void>();
 
@@ -414,6 +591,12 @@ function loadUiPrefs(): void {
       if (normalized) uiPrefs.registryUrl = normalized;
       if (typeof parsed.alwaysShowDetailButton === 'boolean') {
         uiPrefs.alwaysShowDetailButton = parsed.alwaysShowDetailButton;
+      }
+      if (typeof parsed.allowFreshRelease === 'boolean') {
+        uiPrefs.allowFreshRelease = parsed.allowFreshRelease;
+      }
+      if (typeof parsed.allowUnreviewed === 'boolean') {
+        uiPrefs.allowUnreviewed = parsed.allowUnreviewed;
       }
     }
   } catch {}
@@ -432,7 +615,12 @@ function notifyUiPrefsChanged(): void {
   }
 }
 
-function syncUiPrefs(next: { registryUrl?: string; alwaysShowDetailButton?: boolean }): void {
+function syncUiPrefs(next: {
+  registryUrl?: string;
+  alwaysShowDetailButton?: boolean;
+  allowFreshRelease?: boolean;
+  allowUnreviewed?: boolean;
+}): void {
   let changed = false;
   if (next.registryUrl !== undefined) {
     const normalized = normalizeRegistryUrl(next.registryUrl);
@@ -443,6 +631,14 @@ function syncUiPrefs(next: { registryUrl?: string; alwaysShowDetailButton?: bool
   }
   if (typeof next.alwaysShowDetailButton === 'boolean' && next.alwaysShowDetailButton !== uiPrefs.alwaysShowDetailButton) {
     uiPrefs.alwaysShowDetailButton = next.alwaysShowDetailButton;
+    changed = true;
+  }
+  if (typeof next.allowFreshRelease === 'boolean' && next.allowFreshRelease !== uiPrefs.allowFreshRelease) {
+    uiPrefs.allowFreshRelease = next.allowFreshRelease;
+    changed = true;
+  }
+  if (typeof next.allowUnreviewed === 'boolean' && next.allowUnreviewed !== uiPrefs.allowUnreviewed) {
+    uiPrefs.allowUnreviewed = next.allowUnreviewed;
     changed = true;
   }
   if (changed) notifyUiPrefsChanged();
@@ -489,9 +685,16 @@ function bindSyncedConfig(ctx: any, config: any): void {
 
   const registryRef = source.registry;
   const alwaysShowRef = source.alwaysShowDetailButton;
+  const allowFreshRef = source.allowFreshRelease;
+  const allowUnreviewedRef = source.allowUnreviewed;
 
   const applySnapshot = () => {
-    const next: { registryUrl?: string; alwaysShowDetailButton?: boolean } = {};
+    const next: {
+      registryUrl?: string;
+      alwaysShowDetailButton?: boolean;
+      allowFreshRelease?: boolean;
+      allowUnreviewed?: boolean;
+    } = {};
     if (isSyncedConfigRef<unknown>(registryRef)) {
       try {
         const rawRegistry = registryRef.get();
@@ -508,23 +711,35 @@ function bindSyncedConfig(ctx: any, config: any): void {
         }
       } catch {}
     }
+    if (isSyncedConfigRef<unknown>(allowFreshRef)) {
+      try {
+        const rawFresh = allowFreshRef.get();
+        if (typeof rawFresh === 'boolean') {
+          next.allowFreshRelease = rawFresh;
+        }
+      } catch {}
+    }
+    if (isSyncedConfigRef<unknown>(allowUnreviewedRef)) {
+      try {
+        const rawUnreviewed = allowUnreviewedRef.get();
+        if (typeof rawUnreviewed === 'boolean') {
+          next.allowUnreviewed = rawUnreviewed;
+        }
+      } catch {}
+    }
     syncUiPrefs(next);
   };
 
   const setup = () => {
     applySnapshot();
     const disposers: Array<() => void> = [];
-    if (isSyncedConfigRef(registryRef) && typeof registryRef.subscribe === 'function') {
-      try {
-        const off = registryRef.subscribe(applySnapshot);
-        if (typeof off === 'function') disposers.push(off);
-      } catch {}
-    }
-    if (isSyncedConfigRef(alwaysShowRef) && typeof alwaysShowRef.subscribe === 'function') {
-      try {
-        const off = alwaysShowRef.subscribe(applySnapshot);
-        if (typeof off === 'function') disposers.push(off);
-      } catch {}
+    for (const ref of [registryRef, alwaysShowRef, allowFreshRef, allowUnreviewedRef]) {
+      if (isSyncedConfigRef(ref) && typeof ref.subscribe === 'function') {
+        try {
+          const off = ref.subscribe(applySnapshot);
+          if (typeof off === 'function') disposers.push(off);
+        } catch {}
+      }
     }
     return disposers.length > 0
       ? () => {
@@ -549,126 +764,296 @@ function bindSyncedConfig(ctx: any, config: any): void {
 const updatablePlugins = new Map<string, string>();
 const updatedInSession = new Map<string, string>();
 const updatableListeners = new Set<() => void>();
+
+const conflictedPlugins = new Map<string, PluginConflictInfo>();
+const conflictListeners = new Set<() => void>();
+const knownThirdPartyPackages = new Set<string>();
+const reportedSessionCrashes = new Set<string>();
+
 let hasRunInitialBatchCheck = false;
 let batchCheckAbortController: AbortController | null = null;
 
-// --- Plugin health, crash sniffer & rescue center global stores -----------------------
-
-interface HostUpgradeState {
-  current?: string;
-  previous?: string;
-  upgraded: boolean;
+function loadStorageMap(storage: Storage | undefined, key: string, target: Map<string, string>): void {
+  try {
+    const raw = storage?.getItem(key);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof k === 'string' && typeof v === 'string' && k && v) {
+          target.set(k, v);
+        }
+      }
+    }
+  } catch {}
 }
 
-interface RescueModalState {
-  open: boolean;
-  focusPackage?: string;
-  autoBatch?: boolean;
+function saveStorageMap(storage: Storage | undefined, key: string, source: Map<string, string>): void {
+  try {
+    const obj: Record<string, string> = {};
+    for (const [k, v] of source.entries()) obj[k] = v;
+    storage?.setItem(key, JSON.stringify(obj));
+  } catch {}
 }
 
-const unhealthyPlugins = new Map<string, PluginHealthSummary>();
-const crashedPlugins = new Map<string, string>();
-const knownThirdPartyPackages = new Set<string>();
-const rescueListeners = new Set<() => void>();
-let hostUpgradeState: HostUpgradeState = { upgraded: false };
-let rescueModalState: RescueModalState = { open: false };
-let lastClickedPlugin: { name: string; timestamp: number } | null = null;
-let dismissedRescueSignature = '';
+function loadConflictsStorage(): void {
+  try {
+    const raw = window.localStorage?.getItem(CONFLICTS_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return;
+    for (const [k, v] of Object.entries(parsed)) {
+      if (!k || k === PLUGIN_NAME || isOfficialPackageName(k) || !v || typeof v !== 'object') continue;
+      const item = v as Record<string, unknown>;
+      if (typeof item.pluginVersion !== 'string' || !item.pluginVersion) continue;
+      conflictedPlugins.set(k, {
+        pluginVersion: item.pluginVersion,
+        ...(typeof item.hostVersion === 'string' && item.hostVersion ? { hostVersion: item.hostVersion } : {}),
+        ...(typeof item.reason === 'string' && item.reason ? { reason: item.reason } : {})
+      });
+    }
+  } catch {}
+}
+
+function persistConflictsStorage(): void {
+  try {
+    const obj: Record<string, PluginConflictInfo> = {};
+    for (const [k, v] of conflictedPlugins.entries()) obj[k] = v;
+    window.localStorage?.setItem(CONFLICTS_STORAGE_KEY, JSON.stringify(obj));
+  } catch {}
+}
 
 try {
-  dismissedRescueSignature = window.localStorage?.getItem(DISMISSED_RESCUE_KEY) || '';
+  loadStorageMap(window.localStorage, UPDATABLE_STORAGE_KEY, updatablePlugins);
+  loadStorageMap(window.sessionStorage, UPDATED_SESSION_KEY, updatedInSession);
+  loadConflictsStorage();
 } catch {}
 
-function notifyRescueChanged(): void {
-  for (const listener of rescueListeners) {
+function persistUpdatablePlugins(): void {
+  try {
+    saveStorageMap(window.localStorage, UPDATABLE_STORAGE_KEY, updatablePlugins);
+  } catch {}
+}
+
+function notifyUpdatableChanged(): void {
+  for (const listener of updatableListeners) {
     try {
       listener();
     } catch {}
   }
 }
 
-function openRescueModal(focusPackage?: string, autoBatch = false): void {
-  rescueModalState = { open: true, focusPackage, autoBatch };
-  notifyRescueChanged();
-}
-
-function closeRescueModal(): void {
-  if (!rescueModalState.open) return;
-  rescueModalState = { open: false };
-  notifyRescueChanged();
-}
-
-function recordClientCrash(packageName: string, detail: string): void {
-  const name = packageName.trim();
-  if (!name || name === PLUGIN_NAME || isOfficialPackageName(name)) return;
-  const cleanDetail = (detail || 'Runtime error').trim().slice(0, 300);
-  if (crashedPlugins.get(name) === cleanDetail) return;
-  crashedPlugins.set(name, cleanDetail);
-  // Ensure a newly detected crash immediately surfaces the banner even if previously dismissed.
-  dismissedRescueSignature = '';
-  try {
-    window.localStorage?.removeItem(DISMISSED_RESCUE_KEY);
-  } catch {}
-  notifyRescueChanged();
-}
-
-function clearPluginHealthState(packageName: string): void {
-  const name = packageName.trim();
-  if (!name) return;
-  const removedUnhealthy = unhealthyPlugins.delete(name);
-  const removedCrash = crashedPlugins.delete(name);
-  if (removedUnhealthy || removedCrash) {
-    notifyRescueChanged();
+function notifyConflictsChanged(): void {
+  for (const listener of conflictListeners) {
+    try {
+      listener();
+    } catch {}
   }
 }
 
-function computeRescueSignature(): string {
-  const issueKeys = Array.from(new Set([...unhealthyPlugins.keys(), ...crashedPlugins.keys()])).sort();
-  return JSON.stringify({
-    host: hostUpgradeState.upgraded ? hostUpgradeState.current || '' : '',
-    issues: issueKeys
-  });
+function markPluginUpdatable(packageName: string, latestVersion: string): void {
+  const name = packageName.trim();
+  const ver = latestVersion.trim().replace(/^[v^~]/, '');
+  if (!name || !ver || isOfficialPackageName(name)) return;
+  const alreadyUpdatedTo = updatedInSession.get(name);
+  if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) return;
+  if (updatablePlugins.get(name) === ver) return;
+  updatablePlugins.set(name, ver);
+  persistUpdatablePlugins();
+  notifyUpdatableChanged();
 }
 
-function dismissCurrentRescueBanner(): void {
-  const sig = computeRescueSignature();
-  dismissedRescueSignature = sig;
-  try {
-    window.localStorage?.setItem(DISMISSED_RESCUE_KEY, sig);
-  } catch {}
-  notifyRescueChanged();
+function clearPluginUpdatable(packageName: string, updatedToVersion?: string): void {
+  const name = packageName.trim();
+  if (!name) return;
+  if (updatedToVersion) {
+    const cleanVer = updatedToVersion.trim().replace(/^[v^~]/, '');
+    if (cleanVer) {
+      updatedInSession.set(name, cleanVer);
+      try {
+        saveStorageMap(window.sessionStorage, UPDATED_SESSION_KEY, updatedInSession);
+      } catch {}
+    }
+  }
+  if (updatablePlugins.delete(name)) {
+    persistUpdatablePlugins();
+    notifyUpdatableChanged();
+  }
 }
 
-interface RescueSnapshot {
-  unhealthy: Map<string, PluginHealthSummary>;
-  crashes: Map<string, string>;
-  hostUpgrade: HostUpgradeState;
-  modal: RescueModalState;
-  dismissedSignature: string;
+function sameConflictInfo(a: PluginConflictInfo | undefined, b: PluginConflictInfo | undefined): boolean {
+  if (!a || !b) return false;
+  return a.pluginVersion === b.pluginVersion && a.hostVersion === b.hostVersion && a.reason === b.reason;
 }
 
-function buildRescueSnapshot(): RescueSnapshot {
-  return {
-    unhealthy: new Map(unhealthyPlugins),
-    crashes: new Map(crashedPlugins),
-    hostUpgrade: { ...hostUpgradeState },
-    modal: { ...rescueModalState },
-    dismissedSignature: dismissedRescueSignature
+function markPluginConflicted(packageName: string, info: PluginConflictInfo): void {
+  const name = packageName.trim();
+  if (!name || name === PLUGIN_NAME || isOfficialPackageName(name)) return;
+  const prev = conflictedPlugins.get(name);
+  if (sameConflictInfo(prev, info)) return;
+  conflictedPlugins.set(name, info);
+  persistConflictsStorage();
+  notifyConflictsChanged();
+}
+
+function clearPluginConflict(packageName: string): void {
+  const name = packageName.trim();
+  if (!name) return;
+  if (conflictedPlugins.delete(name)) {
+    persistConflictsStorage();
+    notifyConflictsChanged();
+  }
+}
+
+function syncConflictsMap(nextConflicts?: Record<string, PluginConflictInfo>): void {
+  if (!nextConflicts || typeof nextConflicts !== 'object') return;
+  const nextEntries: Array<[string, PluginConflictInfo]> = [];
+  for (const [rawName, info] of Object.entries(nextConflicts)) {
+    const name = rawName.trim();
+    if (!name || name === PLUGIN_NAME || isOfficialPackageName(name) || !info || typeof info !== 'object') continue;
+    if (typeof info.pluginVersion !== 'string' || !info.pluginVersion) continue;
+    knownThirdPartyPackages.add(name);
+    nextEntries.push([name, info]);
+  }
+
+  let changed = nextEntries.length !== conflictedPlugins.size;
+  if (!changed) {
+    for (const [k, v] of nextEntries) {
+      if (!sameConflictInfo(conflictedPlugins.get(k), v)) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  if (!changed) return;
+
+  conflictedPlugins.clear();
+  for (const [k, v] of nextEntries) {
+    conflictedPlugins.set(k, v);
+  }
+  persistConflictsStorage();
+  notifyConflictsChanged();
+}
+
+function runBatchCheck(force = false, reconcileOnly = false): void {
+  if (!force && !reconcileOnly && hasRunInitialBatchCheck) return;
+  hasRunInitialBatchCheck = true;
+
+  if (batchCheckAbortController) {
+    if (!force && !reconcileOnly) return;
+    batchCheckAbortController.abort();
+  }
+
+  const controller = new AbortController();
+  batchCheckAbortController = controller;
+  const timer = window.setTimeout(() => controller.abort(), BATCH_CHECK_TIMEOUT_MS);
+
+  const knownUpdates: Record<string, string> = {};
+  for (const [k, v] of updatablePlugins.entries()) {
+    knownUpdates[k] = v;
+  }
+
+  const reqBody: CheckAllParams = {
+    knownUpdates,
+    force,
+    ...(reconcileOnly ? { reconcile: true } : {})
   };
+
+  postUpdaterRequest<CheckAllResult>(CHECK_ALL_PATH, reqBody, controller.signal)
+    .then(({ payload }) => {
+      if (batchCheckAbortController !== controller) return;
+      if (!payload || typeof payload !== 'object' || payload.ok === false) return;
+      syncUiPrefs({
+        registryUrl: payload.registry,
+        alwaysShowDetailButton: payload.alwaysShowDetailButton,
+        allowFreshRelease: payload.allowFreshRelease,
+        allowUnreviewed: payload.allowUnreviewed
+      });
+      syncConflictsMap(payload.conflicts ?? {});
+
+      if (payload.updatable && typeof payload.updatable === 'object') {
+        const nextMap = new Map<string, string>();
+        for (const [rawName, rawVer] of Object.entries(payload.updatable)) {
+          if (typeof rawName !== 'string' || typeof rawVer !== 'string') continue;
+          const name = rawName.trim();
+          const ver = rawVer.trim().replace(/^[v^~]/, '');
+          if (!name || !ver || isOfficialPackageName(name)) continue;
+          knownThirdPartyPackages.add(name);
+          const alreadyUpdatedTo = updatedInSession.get(name);
+          if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) continue;
+          nextMap.set(name, ver);
+        }
+
+        let changed = nextMap.size !== updatablePlugins.size;
+        if (!changed) {
+          for (const [k, v] of nextMap.entries()) {
+            if (updatablePlugins.get(k) !== v) {
+              changed = true;
+              break;
+            }
+          }
+        }
+
+        if (changed) {
+          updatablePlugins.clear();
+          for (const [k, v] of nextMap.entries()) {
+            updatablePlugins.set(k, v);
+          }
+          persistUpdatablePlugins();
+          notifyUpdatableChanged();
+        }
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      window.clearTimeout(timer);
+      if (batchCheckAbortController === controller) {
+        batchCheckAbortController = null;
+      }
+    });
 }
 
-function useRescueSnapshot(): RescueSnapshot {
-  const [snapshot, setSnapshot] = useState<RescueSnapshot>(buildRescueSnapshot);
+function useUpdatableSnapshot(): [string, string][] {
+  const [entries, setEntries] = useState<[string, string][]>(() => Array.from(updatablePlugins.entries()));
   useEffect(() => {
-    const sync = () => setSnapshot(buildRescueSnapshot());
-    rescueListeners.add(sync);
+    const sync = () => setEntries(Array.from(updatablePlugins.entries()));
+    updatableListeners.add(sync);
     sync();
     return () => {
-      rescueListeners.delete(sync);
+      updatableListeners.delete(sync);
     };
   }, []);
-  return snapshot;
+  return entries;
 }
+
+function useConflictsSnapshot(): [string, PluginConflictInfo][] {
+  const [entries, setEntries] = useState<[string, PluginConflictInfo][]>(() => Array.from(conflictedPlugins.entries()));
+  useEffect(() => {
+    const sync = () => setEntries(Array.from(conflictedPlugins.entries()));
+    conflictListeners.add(sync);
+    sync();
+    return () => {
+      conflictListeners.delete(sync);
+    };
+  }, []);
+  return entries;
+}
+
+function formatConflictTooltip(t: Translator, info: PluginConflictInfo): string {
+  return info.reason ? t('badge.conflictReasonTip', { reason: info.reason }) : t('badge.conflictTip');
+}
+
+function buildSidebarTip(t: Translator, conflictCount: number, updatableCount: number): string {
+  if (conflictCount > 0 && updatableCount > 0) {
+    return t('badge.sidebarBoth', { conflicts: conflictCount, updates: updatableCount });
+  }
+  if (conflictCount > 0) {
+    return t('badge.sidebarConflictsOnly', { conflicts: conflictCount });
+  }
+  return t('badge.sidebarUpdatesOnly', { updates: updatableCount });
+}
+
+// --- Client runtime crash stack attribution ------------------------------------------
 
 const IGNORED_NODE_MODULES = new Set([
   'react',
@@ -709,257 +1094,32 @@ function extractPackageFromStackText(text: string): string | null {
   return null;
 }
 
-function attributePluginCrash(message: string, stackOrFile: string): void {
-  const combined = `${stackOrFile}\n${message}`;
-  if (
-    stackOrFile.includes(`/${PLUGIN_NAME}/`) ||
-    stackOrFile.includes(`\\${PLUGIN_NAME}\\`) ||
-    message.includes(`"${PLUGIN_NAME}"`)
-  ) {
-    return;
-  }
-
-  const fromStack = extractPackageFromStackText(combined);
-  if (fromStack) {
-    recordClientCrash(fromStack, message || 'Uncaught error');
-    return;
-  }
-
-  if (lastClickedPlugin && Date.now() - lastClickedPlugin.timestamp <= 1500) {
-    recordClientCrash(lastClickedPlugin.name, message || 'Error immediately after opening plugin');
-    return;
-  }
-
-  const detailEl = document.querySelector('[data-plugin-detail]');
-  if (detailEl && lastClickedPlugin && Date.now() - lastClickedPlugin.timestamp <= 4000) {
-    recordClientCrash(lastClickedPlugin.name, message || 'Plugin detail page error');
-  }
-}
-
-function loadStorageMap(storage: Storage | undefined, key: string, target: Map<string, string>): void {
-  try {
-    const raw = storage?.getItem(key);
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') {
-      for (const [k, v] of Object.entries(parsed)) {
-        if (typeof k === 'string' && typeof v === 'string' && k && v) {
-          target.set(k, v);
-        }
-      }
-    }
-  } catch {}
-}
-
-function saveStorageMap(storage: Storage | undefined, key: string, source: Map<string, string>): void {
-  try {
-    const obj: Record<string, string> = {};
-    for (const [k, v] of source.entries()) obj[k] = v;
-    storage?.setItem(key, JSON.stringify(obj));
-  } catch {}
-}
-
-try {
-  loadStorageMap(window.localStorage, UPDATABLE_STORAGE_KEY, updatablePlugins);
-  loadStorageMap(window.sessionStorage, UPDATED_SESSION_KEY, updatedInSession);
-} catch {}
-
-function persistUpdatablePlugins(): void {
-  try {
-    saveStorageMap(window.localStorage, UPDATABLE_STORAGE_KEY, updatablePlugins);
-  } catch {}
-}
-
-function notifyUpdatableChanged(): void {
-  for (const listener of updatableListeners) {
-    try {
-      listener();
-    } catch {}
-  }
-}
-
-function markPluginUpdatable(packageName: string, latestVersion: string): void {
+function reportRuntimeConflictToBackend(packageName: string, detail: string): void {
   const name = packageName.trim();
-  const ver = latestVersion.trim().replace(/^[v^~]/, '');
-  if (!name || !ver || isOfficialPackageName(name)) return;
-  const alreadyUpdatedTo = updatedInSession.get(name);
-  if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) return;
-  if (updatablePlugins.get(name) === ver) return;
-  updatablePlugins.set(name, ver);
-  persistUpdatablePlugins();
-  notifyUpdatableChanged();
-}
-
-function clearPluginUpdatable(packageName: string, updatedToVersion?: string): void {
-  const name = packageName.trim();
-  if (!name) return;
-  if (updatedToVersion) {
-    const cleanVer = updatedToVersion.trim().replace(/^[v^~]/, '');
-    if (cleanVer) {
-      updatedInSession.set(name, cleanVer);
-      try {
-        saveStorageMap(window.sessionStorage, UPDATED_SESSION_KEY, updatedInSession);
-      } catch {}
-    }
-  }
-  if (updatablePlugins.delete(name)) {
-    persistUpdatablePlugins();
-    notifyUpdatableChanged();
-  }
-}
-
-function syncHostVersionState(hostVersion?: string): boolean {
-  if (!hostVersion || !hostVersion.trim()) return false;
-  const current = hostVersion.trim();
-  let prev = '';
-  try {
-    prev = window.localStorage?.getItem(LAST_HOST_VERSION_KEY) || '';
-    if (prev !== current) {
-      window.localStorage?.setItem(LAST_HOST_VERSION_KEY, current);
-    }
-  } catch {}
-
-  if (prev && prev !== current) {
-    hostUpgradeState = { previous: prev, current, upgraded: true };
-    notifyRescueChanged();
-    return true;
-  }
-  if (!hostUpgradeState.current) {
-    hostUpgradeState = { ...hostUpgradeState, current };
-    notifyRescueChanged();
-  }
-  return false;
-}
-
-function syncUnhealthyPluginsMap(nextUnhealthy?: Record<string, PluginHealthSummary>): void {
-  if (!nextUnhealthy || typeof nextUnhealthy !== 'object') return;
-  const nextKeys = Object.keys(nextUnhealthy);
-  let changed = nextKeys.length !== unhealthyPlugins.size;
-  if (!changed) {
-    for (const key of nextKeys) {
-      const prev = unhealthyPlugins.get(key);
-      const curr = nextUnhealthy[key];
-      if (
-        !prev ||
-        prev.errorDetail !== curr.errorDetail ||
-        prev.issues.join(',') !== (curr.issues || []).join(',')
-      ) {
-        changed = true;
-        break;
-      }
-    }
-  }
-  if (!changed) return;
-  unhealthyPlugins.clear();
-  for (const [pkg, summary] of Object.entries(nextUnhealthy)) {
-    if (pkg && summary && Array.isArray(summary.issues) && summary.issues.length > 0) {
-      unhealthyPlugins.set(pkg, summary);
-      knownThirdPartyPackages.add(pkg);
-    }
-  }
-  notifyRescueChanged();
-}
-
-function runBatchCheck(force = false, reconcileOnly = false): void {
-  if (!force && !reconcileOnly && hasRunInitialBatchCheck) return;
-  hasRunInitialBatchCheck = true;
-
-  if (batchCheckAbortController) {
-    if (!force && !reconcileOnly) return;
-    batchCheckAbortController.abort();
-  }
+  if (!name || name === PLUGIN_NAME || isOfficialPackageName(name)) return;
+  if (conflictedPlugins.has(name) || reportedSessionCrashes.has(name)) return;
+  reportedSessionCrashes.add(name);
 
   const controller = new AbortController();
-  batchCheckAbortController = controller;
-  const timer = window.setTimeout(() => controller.abort(), BATCH_CHECK_TIMEOUT_MS);
-
-  const knownUpdates: Record<string, string> = {};
-  for (const [k, v] of updatablePlugins.entries()) {
-    knownUpdates[k] = v;
-  }
-
-  const reqBody: CheckAllParams = {
-    knownUpdates,
-    force,
-    ...(reconcileOnly ? { reconcile: true } : {})
+  const timer = window.setTimeout(() => controller.abort(), REPORT_TIMEOUT_MS);
+  const body: ReportConflictParams = {
+    packageName: name,
+    reason: (detail || 'Runtime error').trim().slice(0, 260)
   };
 
-  fetch(CHECK_ALL_PATH, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(reqBody),
-    signal: controller.signal
-  })
-    .then(res => res.json().catch(() => null))
-    .then((payload: CheckAllResult | null) => {
-      if (batchCheckAbortController !== controller) return;
-      if (!payload || typeof payload !== 'object' || payload.ok === false) return;
-      syncUiPrefs({
-        registryUrl: payload.registry,
-        alwaysShowDetailButton: payload.alwaysShowDetailButton
-      });
-      syncUnhealthyPluginsMap(payload.unhealthy);
-      const hostJustUpgraded = syncHostVersionState(payload.hostVersion);
-
-      if (payload.updatable && typeof payload.updatable === 'object') {
-        const nextMap = new Map<string, string>();
-        for (const [rawName, rawVer] of Object.entries(payload.updatable)) {
-          if (typeof rawName !== 'string' || typeof rawVer !== 'string') continue;
-          const name = rawName.trim();
-          const ver = rawVer.trim().replace(/^[v^~]/, '');
-          if (!name || !ver || isOfficialPackageName(name)) continue;
-          knownThirdPartyPackages.add(name);
-          const alreadyUpdatedTo = updatedInSession.get(name);
-          if (alreadyUpdatedTo && versionGte(alreadyUpdatedTo, ver)) continue;
-          nextMap.set(name, ver);
-        }
-
-        let changed = nextMap.size !== updatablePlugins.size;
-        if (!changed) {
-          for (const [k, v] of nextMap.entries()) {
-            if (updatablePlugins.get(k) !== v) {
-              changed = true;
-              break;
-            }
-          }
-        }
-
-        if (changed) {
-          updatablePlugins.clear();
-          for (const [k, v] of nextMap.entries()) {
-            updatablePlugins.set(k, v);
-          }
-          persistUpdatablePlugins();
-          notifyUpdatableChanged();
-        }
-      }
-
-      // If DSH just upgraded and this check used cached knownUpdates, force a fresh remote probe immediately.
-      if (hostJustUpgraded && !force) {
-        window.setTimeout(() => runBatchCheck(true), 50);
+  postUpdaterRequest<ReportConflictResult>(REPORT_CONFLICT_PATH, body, controller.signal)
+    .then(({ payload }) => {
+      if (payload?.ok && payload.disabled && payload.conflict) {
+        markPluginConflicted(name, payload.conflict);
       }
     })
     .catch(() => {})
     .finally(() => {
       window.clearTimeout(timer);
-      if (batchCheckAbortController === controller) {
-        batchCheckAbortController = null;
-      }
     });
 }
 
-function useUpdatableSnapshot(): [string, string][] {
-  const [entries, setEntries] = useState<[string, string][]>(() => Array.from(updatablePlugins.entries()));
-  useEffect(() => {
-    const sync = () => setEntries(Array.from(updatablePlugins.entries()));
-    updatableListeners.add(sync);
-    sync();
-    return () => {
-      updatableListeners.delete(sync);
-    };
-  }, []);
-  return entries;
-}
+// --- Settings card (native Switch toggles & accessible inputs) ------------------------
 
 function useConfigFormState(form: any): {
   settings: PluginSettings;
@@ -988,7 +1148,11 @@ function useConfigFormState(form: any): {
     alwaysShowDetailButton:
       typeof raw?.alwaysShowDetailButton === 'boolean'
         ? raw.alwaysShowDetailButton
-        : DEFAULT_SETTINGS.alwaysShowDetailButton
+        : DEFAULT_SETTINGS.alwaysShowDetailButton,
+    allowFreshRelease:
+      typeof raw?.allowFreshRelease === 'boolean' ? raw.allowFreshRelease : DEFAULT_SETTINGS.allowFreshRelease,
+    allowUnreviewed:
+      typeof raw?.allowUnreviewed === 'boolean' ? raw.allowUnreviewed : DEFAULT_SETTINGS.allowUnreviewed
   };
 
   const hasRaw = Boolean(raw && typeof raw === 'object');
@@ -996,9 +1160,17 @@ function useConfigFormState(form: any): {
     if (!hasRaw) return;
     syncUiPrefs({
       registryUrl: resolveRegistryUrl(settings.registry),
-      alwaysShowDetailButton: settings.alwaysShowDetailButton
+      alwaysShowDetailButton: settings.alwaysShowDetailButton,
+      allowFreshRelease: settings.allowFreshRelease,
+      allowUnreviewed: settings.allowUnreviewed
     });
-  }, [settings.registry, settings.alwaysShowDetailButton, hasRaw]);
+  }, [
+    settings.registry,
+    settings.alwaysShowDetailButton,
+    settings.allowFreshRelease,
+    settings.allowUnreviewed,
+    hasRaw
+  ]);
 
   const updateField = useCallback(
     async (field: keyof PluginSettings, value: any): Promise<boolean> => {
@@ -1010,6 +1182,10 @@ function useConfigFormState(form: any): {
             syncUiPrefs({ registryUrl: resolveRegistryUrl(value) });
           } else if (field === 'alwaysShowDetailButton' && typeof value === 'boolean') {
             syncUiPrefs({ alwaysShowDetailButton: value });
+          } else if (field === 'allowFreshRelease' && typeof value === 'boolean') {
+            syncUiPrefs({ allowFreshRelease: value });
+          } else if (field === 'allowUnreviewed' && typeof value === 'boolean') {
+            syncUiPrefs({ allowUnreviewed: value });
           }
         }
         return ok;
@@ -1023,8 +1199,6 @@ function useConfigFormState(form: any): {
   return { settings, writable: snapshot?.writable !== false, updateField };
 }
 
-// --- Settings card (the only configuration surface) ----------------------------------
-
 const cardStyle: React.CSSProperties = {
   padding: '16px 20px',
   borderRadius: '10px',
@@ -1035,11 +1209,14 @@ const cardStyle: React.CSSProperties = {
   lineHeight: 1.6,
   boxSizing: 'border-box'
 };
+
 const hintStyle: React.CSSProperties = {
   fontSize: '12px',
   color: 'var(--dsw-alias-label-secondary, #64748b)',
-  marginTop: '3px'
+  marginTop: '3px',
+  maxWidth: '65ch'
 };
+
 const optionStyle = (active: boolean): React.CSSProperties => ({
   display: 'flex',
   alignItems: 'flex-start',
@@ -1050,8 +1227,9 @@ const optionStyle = (active: boolean): React.CSSProperties => ({
   marginBottom: '8px',
   cursor: 'pointer'
 });
+
 const smallButtonStyle: React.CSSProperties = {
-  padding: '3px 8px',
+  padding: '4px 10px',
   fontSize: '12px',
   borderRadius: '6px',
   border: '1px solid var(--dsw-alias-border-l1, #cbd5e1)',
@@ -1060,498 +1238,39 @@ const smallButtonStyle: React.CSSProperties = {
   cursor: 'pointer'
 };
 
-const ISSUE_LABEL_KEY: Record<PluginHealthIssueKind, string> = {
-  'bundle-unavailable': 'rescue.issue.bundleUnavailable',
-  'bundle-error': 'rescue.issue.bundleError',
-  'entry-missing': 'rescue.issue.entryMissing',
-  'unregistered-bundle': 'rescue.issue.unregisteredBundle',
-  'client-crash': 'rescue.issue.clientCrash'
+const inputLabelStyle: React.CSSProperties = {
+  display: 'block',
+  fontSize: '12px',
+  fontWeight: 500,
+  color: 'var(--dsw-alias-label-primary, #1e293b)',
+  marginBottom: '4px'
 };
 
-function syncDiagnosticsStores(payload: DiagnoseResult): void {
-  syncHostVersionState(payload.hostVersion);
-  const nextUnhealthy: Record<string, PluginHealthSummary> = {};
-  for (const item of payload.plugins) {
-    if (item.hasUpdate && item.latestVersion) {
-      markPluginUpdatable(item.packageName, item.latestVersion);
-    } else {
-      clearPluginUpdatable(item.packageName, item.currentVersion);
-    }
-    const backendIssues = item.issues.filter(kind => kind !== 'client-crash');
-    if (backendIssues.length > 0) {
-      nextUnhealthy[item.packageName] = {
-        issues: backendIssues,
-        errorDetail: item.errorDetail,
-        currentVersion: item.currentVersion
-      };
-    }
-  }
-  syncUnhealthyPluginsMap(nextUnhealthy);
-}
+const textInputStyle: React.CSSProperties = {
+  width: '100%',
+  height: 32,
+  padding: '0 10px',
+  borderRadius: 6,
+  border: '1px solid var(--dsw-alias-border-l1, #cbd5e1)',
+  background: 'var(--dsw-alias-bg-elevated, #ffffff)',
+  color: 'var(--dsw-alias-label-primary, #1e293b)',
+  fontSize: '13px',
+  boxSizing: 'border-box'
+};
 
-interface RescueCenterPanelProps {
-  t: Translator;
-  focusPackage?: string;
-  autoBatch?: boolean;
-  compact?: boolean;
-}
-
-const RescueCenterPanel: React.FC<RescueCenterPanelProps> = ({ t, focusPackage, autoBatch, compact }) => {
-  const [loading, setLoading] = useState(true);
-  const [report, setReport] = useState<DiagnoseResult | null>(null);
-  const [diagnoseError, setDiagnoseError] = useState('');
-  const [busyPkg, setBusyPkg] = useState<string | null>(null);
-  const [busyAction, setBusyAction] = useState<RescueAction | null>(null);
-  const [confirmUninstallPkg, setConfirmUninstallPkg] = useState<string | null>(null);
-  const [actionFeedback, setActionFeedback] = useState<Record<string, { ok: boolean; text: string }>>({});
-  const [batchState, setBatchState] = useState<{
-    running: boolean;
-    done: number;
-    total: number;
-    currentPkg: string;
-    okCount: number;
-    failCount: number;
-    finished: boolean;
-  } | null>(null);
-
-  const mountedRef = useRef(true);
-  const busyRef = useRef(false);
-  const didAutoBatchRef = useRef(false);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
-  const runDiagnose = useCallback(async (forceCheckUpdates = false): Promise<DiagnoseResult | null> => {
-    setLoading(true);
-    setDiagnoseError('');
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), DIAGNOSE_TIMEOUT_MS);
-    try {
-      const crashesObj: Record<string, string> = {};
-      for (const [k, v] of crashedPlugins.entries()) crashesObj[k] = v;
-      const response = await fetch(DIAGNOSE_PATH, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ forceCheckUpdates, clientCrashes: crashesObj }),
-        signal: controller.signal
-      });
-      const payload = (await response.json().catch(() => null)) as DiagnoseResult | null;
-      if (!mountedRef.current) return null;
-      if (!payload || typeof payload !== 'object' || payload.ok === false) {
-        setDiagnoseError(errorText(t, payload?.errorCode, payload?.error));
-        return null;
-      }
-      setReport(payload);
-      syncDiagnosticsStores(payload);
-      return payload;
-    } catch (error: any) {
-      if (!mountedRef.current) return null;
-      setDiagnoseError(error?.name === 'AbortError' ? t('check.timeout') : t('check.network'));
-      return null;
-    } finally {
-      window.clearTimeout(timer);
-      if (mountedRef.current) setLoading(false);
-    }
-  }, [t]);
-
-  const executeSingleRescue = useCallback(
-    async (pkg: PluginHealthReport, action: RescueAction): Promise<boolean> => {
-      const controller = new AbortController();
-      const timer = window.setTimeout(() => controller.abort(), UPDATE_TIMEOUT_MS);
-      try {
-        const response = await fetch(RESCUE_PATH, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            packageName: pkg.packageName,
-            action,
-            targetVersion: action === 'update' ? pkg.latestVersion : undefined,
-            source: pkg.source
-          }),
-          signal: controller.signal
-        });
-        const payload = (await response.json().catch(() => null)) as RescueResult | null;
-        if (!mountedRef.current) return false;
-        if (!payload || typeof payload !== 'object' || payload.ok === false) {
-          const baseError = errorText(t, payload?.errorCode, payload?.error);
-          const fullError =
-            payload?.rollback === 'failed' && payload?.errorCode !== ERROR_CODES.rollbackFailed
-              ? `${baseError} (${t('error.rollbackFailed')})`
-              : baseError;
-          setActionFeedback(prev => ({
-            ...prev,
-            [pkg.packageName]: { ok: false, text: fullError }
-          }));
-          return false;
-        }
-
-        const finalVersion = payload.targetVersion || pkg.latestVersion || pkg.currentVersion;
-        if (action === 'uninstall') {
-          clearPluginUpdatable(pkg.packageName);
-          clearPluginHealthState(pkg.packageName);
-          setActionFeedback(prev => ({
-            ...prev,
-            [pkg.packageName]: { ok: true, text: t('rescue.result.uninstalled', { packageName: pkg.packageName }) }
-          }));
-        } else {
-          clearPluginUpdatable(pkg.packageName, finalVersion);
-          clearPluginHealthState(pkg.packageName);
-          const key =
-            action === 'reinstall'
-              ? 'rescue.result.reinstalled'
-              : pkg.packageName === PLUGIN_NAME
-                ? 'update.selfUpdate'
-                : 'rescue.result.updated';
-          setActionFeedback(prev => ({
-            ...prev,
-            [pkg.packageName]: { ok: true, text: t(key, { version: finalVersion }) }
-          }));
-        }
-        return true;
-      } finally {
-        window.clearTimeout(timer);
-      }
-    },
-    [t]
-  );
-
-  const handleRescueAction = async (pkg: PluginHealthReport, action: RescueAction) => {
-    if (busyRef.current) return;
-    busyRef.current = true;
-    setConfirmUninstallPkg(null);
-    setBusyPkg(pkg.packageName);
-    setBusyAction(action);
-    try {
-      const ok = await executeSingleRescue(pkg, action);
-      if (ok && mountedRef.current) {
-        runBatchCheck(true);
-        await runDiagnose(false);
-      }
-    } catch {
-      if (mountedRef.current) {
-        setActionFeedback(prev => ({
-          ...prev,
-          [pkg.packageName]: { ok: false, text: t('update.failed') }
-        }));
-      }
-    } finally {
-      busyRef.current = false;
-      if (mountedRef.current) {
-        setBusyPkg(null);
-        setBusyAction(null);
-      }
-    }
-  };
-
-  const handleBatchUpdate = useCallback(
-    async (plugins: PluginHealthReport[]) => {
-      const targets = plugins
-        .filter(p => p.hasUpdate && p.latestVersion)
-        .sort((a, b) => (a.packageName === PLUGIN_NAME ? 1 : b.packageName === PLUGIN_NAME ? -1 : 0));
-      if (targets.length === 0 || busyRef.current) return;
-
-      busyRef.current = true;
-      let okCount = 0;
-      let failCount = 0;
-      try {
-        setBatchState({
-          running: true,
-          done: 0,
-          total: targets.length,
-          currentPkg: targets[0].packageName,
-          okCount: 0,
-          failCount: 0,
-          finished: false
-        });
-
-        for (let i = 0; i < targets.length; i++) {
-          const item = targets[i];
-          if (!mountedRef.current) break;
-          setBatchState({
-            running: true,
-            done: i,
-            total: targets.length,
-            currentPkg: item.packageName,
-            okCount,
-            failCount,
-            finished: false
-          });
-          try {
-            const ok = await executeSingleRescue(item, 'update');
-            if (ok) okCount += 1;
-            else failCount += 1;
-          } catch {
-            failCount += 1;
-            if (mountedRef.current) {
-              setActionFeedback(prev => ({
-                ...prev,
-                [item.packageName]: { ok: false, text: t('update.failed') }
-              }));
-            }
-          }
-        }
-
-        if (!mountedRef.current) return;
-        setBatchState({
-          running: false,
-          done: targets.length,
-          total: targets.length,
-          currentPkg: '',
-          okCount,
-          failCount,
-          finished: true
-        });
-        runBatchCheck(true);
-        await runDiagnose(false);
-      } finally {
-        busyRef.current = false;
-      }
-    },
-    [executeSingleRescue, runDiagnose, t]
-  );
-
-  useEffect(() => {
-    void runDiagnose(false).then(result => {
-      if (autoBatch && !didAutoBatchRef.current && result?.plugins?.length) {
-        didAutoBatchRef.current = true;
-        void handleBatchUpdate(result.plugins);
-      }
-    });
-  }, [autoBatch, handleBatchUpdate, runDiagnose]);
-
-  const plugins = report?.plugins || [];
-  const updatableCount = plugins.filter(p => p.hasUpdate && p.latestVersion).length;
-  const unhealthyCount = plugins.filter(p => !p.healthy).length;
-  const hostVersionText = report?.hostVersion
-    ? t('rescue.center.hostVersion', { version: report.hostVersion })
-    : t('rescue.center.hostVersionUnknown');
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-        <div style={{ fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>{hostVersionText}</div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-          <SafeButton
-            variant="outline"
-            size="sm"
-            disabled={loading || Boolean(busyPkg) || Boolean(batchState?.running)}
-            onClick={() => void runDiagnose(true)}
-          >
-            {loading ? t('rescue.center.diagnosing') : t('rescue.center.diagnoseBtn')}
-          </SafeButton>
-          {updatableCount > 0 && (
-            <SafeButton
-              variant="primary"
-              size="sm"
-              disabled={loading || Boolean(busyPkg) || Boolean(batchState?.running)}
-              onClick={() => void handleBatchUpdate(plugins)}
-            >
-              {t('rescue.center.batchUpdateBtn', { count: updatableCount })}
-            </SafeButton>
-          )}
-        </div>
-      </div>
-
-      {batchState && (
-        <div
-          style={{
-            padding: '8px 10px',
-            borderRadius: 8,
-            fontSize: 12,
-            background: batchState.finished ? 'rgba(22, 163, 74, 0.08)' : 'rgba(37, 99, 235, 0.08)',
-            border: batchState.finished ? '1px solid rgba(22, 163, 74, 0.25)' : '1px solid rgba(37, 99, 235, 0.25)',
-            color: batchState.finished ? '#15803d' : 'var(--dsw-alias-label-primary, #1e293b)'
-          }}
-        >
-          {batchState.running
-            ? t('rescue.center.batchUpdating', {
-                done: batchState.done,
-                total: batchState.total,
-                packageName: batchState.currentPkg
-              })
-            : t('rescue.center.batchDone', { ok: batchState.okCount, fail: batchState.failCount })}
-        </div>
-      )}
-
-      {diagnoseError && (
-        <div style={{ fontSize: 12, color: '#dc2626', padding: '6px 10px', borderRadius: 6, background: 'rgba(239, 68, 68, 0.08)' }}>
-          {diagnoseError}
-        </div>
-      )}
-
-      {!loading && !diagnoseError && plugins.length > 0 && unhealthyCount === 0 && (
-        <div style={{ fontSize: 12, color: '#15803d' }}>
-          {t('rescue.center.allHealthy', { count: plugins.length })}
-        </div>
-      )}
-
-      <div
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 8,
-          maxHeight: compact ? 320 : 420,
-          overflowY: 'auto',
-          paddingRight: 2
-        }}
-      >
-        {plugins.map(item => {
-          const isFocused = Boolean(focusPackage && item.packageName === focusPackage);
-          const isBusy = busyPkg === item.packageName;
-          const feedback = actionFeedback[item.packageName];
-          const isConfirmingUninstall = confirmUninstallPkg === item.packageName;
-          const isSelf = item.packageName === PLUGIN_NAME;
-
-          return (
-            <div
-              key={item.packageName}
-              ref={el => {
-                if (isFocused && el) {
-                  try {
-                    el.scrollIntoView({ block: 'nearest' });
-                  } catch {}
-                }
-              }}
-              style={{
-                padding: '10px 12px',
-                borderRadius: 8,
-                border: isFocused
-                  ? '1.5px solid #f59e0b'
-                  : !item.healthy
-                    ? '1px solid rgba(239, 68, 68, 0.4)'
-                    : '1px solid var(--dsw-alias-border-l2, #e2e8f0)',
-                background: !item.healthy
-                  ? 'rgba(239, 68, 68, 0.03)'
-                  : 'var(--dsw-alias-bg-subtle, #f8fafc)'
-              }}
-            >
-              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
-                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }}>
-                  <span style={{ fontWeight: 600, fontSize: 13 }}>{item.packageName}</span>
-                  <span style={{ fontSize: 11, fontFamily: 'monospace', color: 'var(--dsw-alias-label-secondary, #64748b)' }}>
-                    {t('rescue.center.currentVersion', { version: item.currentVersion })}
-                  </span>
-                  {item.hasUpdate && item.latestVersion && (
-                    <SafeTag tone="info">{t('rescue.center.latestVersion', { version: item.latestVersion })}</SafeTag>
-                  )}
-                  {item.healthy ? (
-                    <SafeTag tone="success">{t('rescue.center.healthyTag')}</SafeTag>
-                  ) : (
-                    item.issues.map(issue => (
-                      <SafeTag key={issue} tone="warning">
-                        {t(ISSUE_LABEL_KEY[issue] || 'error.unknown')}
-                      </SafeTag>
-                    ))
-                  )}
-                </div>
-              </div>
-
-              {item.errorDetail && (
-                <div
-                  style={{
-                    marginTop: 6,
-                    fontSize: 11,
-                    color: '#b91c1c',
-                    fontFamily: 'monospace',
-                    wordBreak: 'break-word',
-                    background: 'rgba(239, 68, 68, 0.06)',
-                    padding: '4px 8px',
-                    borderRadius: 6
-                  }}
-                >
-                  {item.errorDetail}
-                </div>
-              )}
-
-              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 8 }}>
-                {item.hasUpdate && item.latestVersion && (
-                  <SafeButton
-                    variant="primary"
-                    size="sm"
-                    disabled={Boolean(busyPkg) || Boolean(batchState?.running)}
-                    onClick={() => void handleRescueAction(item, 'update')}
-                  >
-                    {isBusy && busyAction === 'update'
-                      ? t('rescue.status.updating')
-                      : t('rescue.action.updateFix', { version: item.latestVersion })}
-                  </SafeButton>
-                )}
-                <SafeButton
-                  variant={!item.healthy && !item.hasUpdate ? 'primary' : 'outline'}
-                  size="sm"
-                  disabled={Boolean(busyPkg) || Boolean(batchState?.running)}
-                  onClick={() => void handleRescueAction(item, 'reinstall')}
-                >
-                  {isBusy && busyAction === 'reinstall' ? t('rescue.status.reinstalling') : t('rescue.action.reinstall')}
-                </SafeButton>
-                {!isSelf && !isConfirmingUninstall && (
-                  <SafeButton
-                    variant="outline"
-                    size="sm"
-                    style={{ color: '#dc2626', borderColor: 'rgba(239, 68, 68, 0.4)' }}
-                    disabled={Boolean(busyPkg) || Boolean(batchState?.running)}
-                    onClick={() => setConfirmUninstallPkg(item.packageName)}
-                  >
-                    {isBusy && busyAction === 'uninstall' ? t('rescue.status.uninstalling') : t('rescue.action.uninstall')}
-                  </SafeButton>
-                )}
-              </div>
-
-              {isConfirmingUninstall && (
-                <div
-                  style={{
-                    marginTop: 8,
-                    padding: '6px 8px',
-                    borderRadius: 6,
-                    background: 'rgba(239, 68, 68, 0.08)',
-                    display: 'flex',
-                    flexWrap: 'wrap',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    gap: 8,
-                    fontSize: 12
-                  }}
-                >
-                  <span style={{ color: '#b91c1c' }}>
-                    {t('rescue.action.confirmUninstall', { packageName: item.packageName })}
-                  </span>
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    <SafeButton
-                      variant="danger"
-                      size="sm"
-                      disabled={Boolean(busyPkg) || Boolean(batchState?.running)}
-                      onClick={() => void handleRescueAction(item, 'uninstall')}
-                    >
-                      {t('rescue.action.uninstall')}
-                    </SafeButton>
-                    <SafeButton variant="outline" size="sm" onClick={() => setConfirmUninstallPkg(null)}>
-                      {t('confirm.cancel')}
-                    </SafeButton>
-                  </div>
-                </div>
-              )}
-
-              {feedback && (
-                <div style={{ marginTop: 6, fontSize: 12, color: feedback.ok ? '#15803d' : '#b91c1c' }}>
-                  {feedback.text}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
+const switchRowStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: 16,
+  paddingTop: 12,
+  marginTop: 12,
+  borderTop: '1px solid var(--dsw-alias-border-l2, #e2e8f0)'
 };
 
 interface RegistrySettingsCardProps {
   form?: any;
-  t: Translator;
-  locale?: LocaleServiceLike;
+  localeBridge: DynamicLocaleBridge;
 }
 
 const BUILTIN_REGISTRIES = [
@@ -1559,15 +1278,19 @@ const BUILTIN_REGISTRIES = [
   { value: 'npmmirror', url: DOMESTIC_REGISTRY, labelKey: 'settings.npmmirror', hintKey: 'settings.npmmirrorHint' }
 ] as const;
 
-export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form, t, locale }) => {
-  useLocaleRevision(locale);
+export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form, localeBridge }) => {
+  useLocaleRevision(localeBridge);
+  const t = localeBridge.t;
   const { settings, writable, updateField } = useConfigFormState(form);
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
   const [errorKey, setErrorKey] = useState('');
   const [notice, setNotice] = useState<{ key: string; params?: TranslateParams } | null>(null);
+  const [pendingDangerField, setPendingDangerField] = useState<'allowFreshRelease' | 'allowUnreviewed' | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
+  const customNameId = useId();
+  const customUrlId = useId();
 
   useEffect(() => {
     return () => {
@@ -1640,145 +1363,343 @@ export const RegistrySettingsCard: React.FC<RegistrySettingsCardProps> = ({ form
     showNotice('settings.notice.customRemoved');
   };
 
+  const handleDangerToggle = (field: 'allowFreshRelease' | 'allowUnreviewed') => async (next: boolean) => {
+    if (!writable) return;
+    if (next) {
+      setPendingDangerField(field);
+      return;
+    }
+    if (await updateField(field, false)) {
+      updatablePlugins.clear();
+      persistUpdatablePlugins();
+      notifyUpdatableChanged();
+      runBatchCheck(true);
+    }
+  };
+
+  const confirmDangerEnable = async () => {
+    const field = pendingDangerField;
+    setPendingDangerField(null);
+    if (!field || !writable) return;
+    if (await updateField(field, true)) {
+      runBatchCheck(true);
+    }
+  };
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-      <div style={cardStyle}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-          <span style={{ fontSize: 15, fontWeight: 600 }}>{t('settings.title')}</span>
-          {notice && <span style={{ fontSize: 11, color: '#16a34a' }}>{t(notice.key, notice.params)}</span>}
-        </div>
-        <div style={{ ...hintStyle, marginBottom: 10 }}>{t('settings.intro')}</div>
-
-        {BUILTIN_REGISTRIES.map(item => {
-          const active = isCurrent(item.value);
-          return (
-            <div key={item.value} style={{ ...optionStyle(active), padding: 0, alignItems: 'center', cursor: 'default' }}>
-              <label
-                style={{
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  flex: 1,
-                  padding: '10px 12px',
-                  cursor: writable ? 'pointer' : 'default'
-                }}
-              >
-                <input
-                  type="radio"
-                  checked={active}
-                  onChange={() => void select(item.value)}
-                  disabled={!writable}
-                  style={{ marginRight: 10, marginTop: 3 }}
-                />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600 }}>
-                    {t(item.labelKey)} <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{item.url}</span>
-                  </div>
-                  <div style={hintStyle}>{t(item.hintKey)}</div>
-                </div>
-              </label>
-            </div>
-          );
-        })}
-
-        {settings.customRegistries.map(item => {
-          const active = isCurrent(item.url);
-          return (
-            <div key={item.url} style={{ ...optionStyle(active), padding: 0, alignItems: 'center', cursor: 'default' }}>
-              <label
-                style={{
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  flex: 1,
-                  padding: '10px 12px',
-                  cursor: writable ? 'pointer' : 'default'
-                }}
-              >
-                <input
-                  type="radio"
-                  checked={active}
-                  onChange={() => void select(item.url)}
-                  disabled={!writable}
-                  style={{ marginRight: 10, marginTop: 3 }}
-                />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600 }}>
-                    {item.name || t('settings.customFallbackName')}{' '}
-                    <span style={{ fontFamily: 'monospace', fontWeight: 400 }}>{item.url}</span>
-                  </div>
-                  <div style={hintStyle}>{t('settings.customHint')}</div>
-                </div>
-              </label>
-              {writable && (
-                <button
-                  type="button"
-                  style={{ ...smallButtonStyle, color: '#dc2626', borderColor: '#fca5a5', alignSelf: 'flex-start', marginTop: 10, marginRight: 12 }}
-                  onClick={() => void removeCustom(item.url)}
-                >
-                  {t('settings.delete')}
-                </button>
-              )}
-            </div>
-          );
-        })}
-
-        {!adding && (
-          <button type="button" style={smallButtonStyle} onClick={() => setAdding(true)} disabled={!writable}>
-            {t('settings.addCustom')}
-          </button>
+    <div style={cardStyle}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+        <span style={{ fontSize: 15, fontWeight: 600 }}>{t('settings.title')}</span>
+        {notice && (
+          <span role="status" style={{ fontSize: 12, color: '#15803d' }}>
+            {t(notice.key, notice.params)}
+          </span>
         )}
-        {adding && (
-          <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <input value={name} onChange={event => setName(event.target.value)} placeholder={t('settings.customNamePlaceholder')} style={{ height: 32, padding: '0 10px', borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1, #cbd5e1)' }} />
-            <input value={url} onChange={event => setUrl(event.target.value)} placeholder={t('settings.customUrlPlaceholder')} style={{ height: 32, padding: '0 10px', borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1, #cbd5e1)' }} />
-            {errorKey && <div style={{ color: '#b91c1c', fontSize: 12 }}>{t(errorKey)}</div>}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button type="button" style={smallButtonStyle} onClick={() => void addCustom()} disabled={!writable}>{t('settings.saveUse')}</button>
-              <button type="button" style={smallButtonStyle} onClick={() => { setAdding(false); setErrorKey(''); }}>{t('settings.cancel')}</button>
-            </div>
+      </div>
+      <div style={{ ...hintStyle, marginBottom: 10 }}>{t('settings.intro')}</div>
+
+      {BUILTIN_REGISTRIES.map(item => {
+        const active = isCurrent(item.value);
+        return (
+          <div key={item.value} style={{ ...optionStyle(active), padding: 0, alignItems: 'center', cursor: 'default' }}>
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                flex: 1,
+                padding: '10px 12px',
+                cursor: writable ? 'pointer' : 'default'
+              }}
+            >
+              <input
+                type="radio"
+                checked={active}
+                onChange={() => void select(item.value)}
+                disabled={!writable}
+                style={{ marginRight: 10, marginTop: 3 }}
+              />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 600 }}>
+                  {t(item.labelKey)}{' '}
+                  <span style={{ fontFamily: 'monospace', fontWeight: 400, overflowWrap: 'anywhere' }}>{item.url}</span>
+                </div>
+                <div style={hintStyle}>{t(item.hintKey)}</div>
+              </div>
+            </label>
           </div>
-        )}
+        );
+      })}
 
-        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 14, fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)' }}>
-          <input
-            type="checkbox"
-            checked={settings.fallbackToOfficial}
-            disabled={!writable}
-            onChange={() => void updateField('fallbackToOfficial', !settings.fallbackToOfficial)}
-            style={{ marginTop: 2 }}
-          />
-          {t('settings.fallback')}
-        </label>
+      {settings.customRegistries.map(item => {
+        const active = isCurrent(item.url);
+        return (
+          <div key={item.url} style={{ ...optionStyle(active), padding: 0, alignItems: 'center', cursor: 'default' }}>
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                flex: 1,
+                minWidth: 0,
+                padding: '10px 12px',
+                cursor: writable ? 'pointer' : 'default'
+              }}
+            >
+              <input
+                type="radio"
+                checked={active}
+                onChange={() => void select(item.url)}
+                disabled={!writable}
+                style={{ marginRight: 10, marginTop: 3 }}
+              />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 600 }}>
+                  {item.name || t('settings.customFallbackName')}{' '}
+                  <span style={{ fontFamily: 'monospace', fontWeight: 400, overflowWrap: 'anywhere' }}>{item.url}</span>
+                </div>
+                <div style={hintStyle}>{t('settings.customHint')}</div>
+              </div>
+            </label>
+            {writable && (
+              <button
+                type="button"
+                style={{
+                  ...smallButtonStyle,
+                  color: 'var(--dsw-alias-danger, #dc2626)',
+                  borderColor: 'rgba(220, 38, 38, 0.35)',
+                  alignSelf: 'flex-start',
+                  marginTop: 10,
+                  marginRight: 12
+                }}
+                onClick={() => void removeCustom(item.url)}
+              >
+                {t('settings.delete')}
+              </button>
+            )}
+          </div>
+        );
+      })}
 
-        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 12, fontSize: 12, color: 'var(--dsw-alias-label-primary, #1e293b)', cursor: writable ? 'pointer' : 'default' }}>
-          <input
-            type="checkbox"
-            checked={settings.alwaysShowDetailButton}
-            disabled={!writable}
-            onChange={() => void updateField('alwaysShowDetailButton', !settings.alwaysShowDetailButton)}
-            style={{ marginTop: 3 }}
-          />
+      {!adding && (
+        <button type="button" style={smallButtonStyle} onClick={() => setAdding(true)} disabled={!writable}>
+          {t('settings.addCustom')}
+        </button>
+      )}
+      {adding && (
+        <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
           <div>
-            <div style={{ fontWeight: 500 }}>{t('settings.alwaysShowDetail')}</div>
-            <div style={hintStyle}>{t('settings.alwaysShowDetailHint')}</div>
+            <label htmlFor={customNameId} style={inputLabelStyle}>
+              {t('settings.customNameLabel')}
+            </label>
+            <input
+              id={customNameId}
+              value={name}
+              onChange={event => setName(event.target.value)}
+              placeholder={t('settings.customNamePlaceholder')}
+              style={textInputStyle}
+            />
           </div>
-        </label>
+          <div>
+            <label htmlFor={customUrlId} style={inputLabelStyle}>
+              {t('settings.customUrlLabel')}
+            </label>
+            <input
+              id={customUrlId}
+              type="url"
+              value={url}
+              onChange={event => setUrl(event.target.value)}
+              placeholder={t('settings.customUrlPlaceholder')}
+              style={textInputStyle}
+            />
+          </div>
+          {errorKey && (
+            <div role="alert" style={{ color: 'var(--dsw-alias-danger, #b91c1c)', fontSize: 12 }}>
+              {t(errorKey)}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <SafeButton variant="primary" size="sm" onClick={() => void addCustom()} disabled={!writable}>
+              {t('settings.saveUse')}
+            </SafeButton>
+            <SafeButton
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setAdding(false);
+                setErrorKey('');
+              }}
+            >
+              {t('settings.cancel')}
+            </SafeButton>
+          </div>
+        </div>
+      )}
+
+      <div style={{ ...switchRowStyle, marginTop: 16, paddingTop: 14 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 500, fontSize: 13, color: 'var(--dsw-alias-label-primary, #1e293b)' }}>
+            {t('settings.fallback')}
+          </div>
+          <div style={hintStyle}>{t('settings.fallbackHint')}</div>
+        </div>
+        <SafeSwitch
+          checked={settings.fallbackToOfficial}
+          disabled={!writable}
+          label={t('settings.fallback')}
+          onChange={next => void updateField('fallbackToOfficial', next)}
+        />
       </div>
 
-      <div style={cardStyle}>
-        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
-          <span style={{ fontSize: 15, fontWeight: 600 }}>{t('rescue.center.title')}</span>
-          <SafeButton variant="outline" size="sm" onClick={() => openRescueModal()}>
-            {t('rescue.center.openRescueModal')}
-          </SafeButton>
+      <div style={switchRowStyle}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 500, fontSize: 13, color: 'var(--dsw-alias-label-primary, #1e293b)' }}>
+            {t('settings.alwaysShowDetail')}
+          </div>
+          <div style={hintStyle}>{t('settings.alwaysShowDetailHint')}</div>
         </div>
-        <div style={{ ...hintStyle, marginBottom: 12 }}>{t('rescue.center.intro')}</div>
-        <RescueCenterPanel t={t} compact />
+        <SafeSwitch
+          checked={settings.alwaysShowDetailButton}
+          disabled={!writable}
+          label={t('settings.alwaysShowDetail')}
+          onChange={next => void updateField('alwaysShowDetailButton', next)}
+        />
       </div>
+
+      <div style={{ marginTop: 16, paddingTop: 14, borderTop: '1px solid var(--dsw-alias-border-l2, #e2e8f0)' }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #1e293b)' }}>
+          {t('settings.securitySectionTitle')}
+        </div>
+      </div>
+
+      <div style={{ ...switchRowStyle, borderTop: 'none', marginTop: 8, paddingTop: 4 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: 8,
+              fontWeight: 500,
+              fontSize: 13,
+              color: 'var(--dsw-alias-label-primary, #1e293b)'
+            }}
+          >
+            <span>{t('settings.allowFreshRelease')}</span>
+            {settings.allowFreshRelease && <SafeTag tone="danger">{t('settings.riskEnabledTag')}</SafeTag>}
+          </div>
+          <div style={hintStyle}>{t('settings.allowFreshReleaseHint')}</div>
+        </div>
+        <SafeSwitch
+          checked={settings.allowFreshRelease}
+          disabled={!writable}
+          label={t('settings.allowFreshRelease')}
+          onChange={next => void handleDangerToggle('allowFreshRelease')(next)}
+        />
+      </div>
+
+      <div style={switchRowStyle}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: 8,
+              fontWeight: 500,
+              fontSize: 13,
+              color: 'var(--dsw-alias-label-primary, #1e293b)'
+            }}
+          >
+            <span>{t('settings.allowUnreviewed')}</span>
+            {settings.allowUnreviewed && <SafeTag tone="danger">{t('settings.riskEnabledTag')}</SafeTag>}
+          </div>
+          <div style={hintStyle}>{t('settings.allowUnreviewedHint')}</div>
+        </div>
+        <SafeSwitch
+          checked={settings.allowUnreviewed}
+          disabled={!writable}
+          label={t('settings.allowUnreviewed')}
+          onChange={next => void handleDangerToggle('allowUnreviewed')(next)}
+        />
+      </div>
+
+      <SafeModal
+        open={pendingDangerField !== null}
+        onClose={() => setPendingDangerField(null)}
+        title={pendingDangerField === 'allowFreshRelease' ? t('danger.freshRelease.title') : t('danger.unreviewed.title')}
+        closeLabel={t('danger.close')}
+        description={
+          pendingDangerField === 'allowFreshRelease' ? t('danger.freshRelease.body') : t('danger.unreviewed.body')
+        }
+        footer={
+          <>
+            <SafeButton variant="outline" onClick={() => setPendingDangerField(null)}>
+              {t('danger.cancel')}
+            </SafeButton>
+            <SafeButton variant="danger" onClick={() => void confirmDangerEnable()}>
+              {t('danger.confirmEnable')}
+            </SafeButton>
+          </>
+        }
+      />
     </div>
   );
 };
 
-// --- Updater action button ------------------------------------------------------------
+// --- Detail page conflict badge (`plugins.detail.badge`) ------------------------------
+
+interface DetailConflictBadgeProps extends SlotActionProps {
+  localeBridge: DynamicLocaleBridge;
+}
+
+const DetailConflictBadge: React.FC<DetailConflictBadgeProps> = ({ subject, localeBridge }) => {
+  useLocaleRevision(localeBridge);
+  const t = localeBridge.t;
+  useConflictsSnapshot();
+
+  const pkg = subject?.pkg;
+  const packageName = typeof pkg?.name === 'string' ? pkg.name : '';
+  const conflict = packageName ? conflictedPlugins.get(packageName) : undefined;
+  const isEnabled = pkg?.enabled === true;
+  const currentVersion = pkg?.version;
+  const upgradedPastConflict = Boolean(
+    conflict &&
+      currentVersion &&
+      parseSemver(currentVersion) &&
+      parseSemver(conflict.pluginVersion) &&
+      compareSemver(currentVersion, conflict.pluginVersion) > 0
+  );
+
+  useEffect(() => {
+    if (!packageName || !conflict) return;
+    if (upgradedPastConflict) {
+      clearPluginConflict(packageName);
+      return;
+    }
+    if (isEnabled) {
+      clearPluginConflict(packageName);
+      runBatchCheck(false, true);
+    }
+  }, [conflict, isEnabled, packageName, upgradedPastConflict]);
+
+  if (
+    subject?.kind !== 'bundle' ||
+    !packageName ||
+    isOfficialPackage(pkg) ||
+    !conflict ||
+    isEnabled ||
+    upgradedPastConflict
+  ) {
+    return null;
+  }
+
+  return (
+    <SafeTag tone="danger" title={formatConflictTooltip(t, conflict)}>
+      {t('badge.conflictDisabled')}
+    </SafeTag>
+  );
+};
+
+// --- Detail page updater action button (`plugins.detail.actions`) ---------------------
 
 type Status = 'checking' | 'has_update' | 'up_to_date' | 'updating' | 'success' | 'error';
 type MessageState =
@@ -1786,8 +1707,7 @@ type MessageState =
   | { kind: 'error'; errorCode?: string; fallback?: string; rollbackFailed?: boolean };
 
 interface UpdaterActionButtonProps extends SlotActionProps {
-  t: Translator;
-  locale?: LocaleServiceLike;
+  localeBridge: DynamicLocaleBridge;
 }
 
 function isGithubPackage(pkg: SlotActionProps['subject']['pkg'], checkResult?: CheckUpdateResult | null): boolean {
@@ -1796,8 +1716,9 @@ function isGithubPackage(pkg: SlotActionProps['subject']['pkg'], checkResult?: C
   return /github:|github\.com/i.test(source);
 }
 
-export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subject, t, locale }) => {
-  useLocaleRevision(locale);
+export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subject, localeBridge }) => {
+  useLocaleRevision(localeBridge);
+  const t = localeBridge.t;
   const currentUiPrefs = useUiPrefs();
   const pkg = subject?.pkg;
   const packageName = typeof pkg?.name === 'string' ? pkg.name : '';
@@ -1807,7 +1728,6 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
   const [status, setStatus] = useState<Status>('checking');
   const [checkResult, setCheckResult] = useState<CheckUpdateResult | null>(null);
   const [message, setMessage] = useState<MessageState | null>(null);
-  const [confirmOpen, setConfirmOpen] = useState(false);
   const mountedRef = useRef(true);
   const tokenRef = useRef(0);
   const checkAbortRef = useRef<AbortController | null>(null);
@@ -1834,7 +1754,6 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     successVersionRef.current = null;
     setCheckResult(null);
     setMessage(null);
-    setConfirmOpen(false);
   }, [packageName]);
 
   useEffect(() => {
@@ -1842,6 +1761,15 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     const cachedVer = updatablePlugins.get(packageName);
     if (cachedVer && versionGte(clientVersion, cachedVer)) {
       clearPluginUpdatable(packageName, clientVersion);
+    }
+    const cachedConflict = conflictedPlugins.get(packageName);
+    if (
+      cachedConflict &&
+      parseSemver(clientVersion) &&
+      parseSemver(cachedConflict.pluginVersion) &&
+      compareSemver(clientVersion, cachedConflict.pluginVersion) > 0
+    ) {
+      clearPluginConflict(packageName);
     }
   }, [packageName, clientVersion]);
 
@@ -1875,18 +1803,17 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
 
     try {
       const reqBody: CheckUpdateParams = { packageName, currentVersion: clientVersion };
-      const response = await fetch(CHECK_PATH, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(reqBody),
-        signal: controller.signal
-      });
-      const payload = (await response.json().catch(() => null)) as CheckUpdateResult | null;
+      const { status: httpStatus, payload } = await postUpdaterRequest<CheckUpdateResult>(
+        CHECK_PATH,
+        reqBody,
+        controller.signal
+      );
       if (token !== tokenRef.current || !mountedRef.current) return null;
-      if (!payload || typeof payload !== 'object') throw new Error(`HTTP ${response.status}`);
+      if (!payload || typeof payload !== 'object') throw new Error(`HTTP ${httpStatus}`);
       if (payload.ok === false) {
         if (payload.errorCode === ERROR_CODES.notInstalled || payload.errorCode === ERROR_CODES.officialPlugin) {
           clearPluginUpdatable(packageName);
+          clearPluginConflict(packageName);
         } else if (payload.errorCode === ERROR_CODES.offline || payload.errorCode === ERROR_CODES.timeout) {
           const fallback = tryFallbackCachedUpdate();
           if (fallback) return fallback;
@@ -1898,8 +1825,15 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       }
       syncUiPrefs({
         registryUrl: payload.registry,
-        alwaysShowDetailButton: payload.alwaysShowDetailButton
+        alwaysShowDetailButton: payload.alwaysShowDetailButton,
+        allowFreshRelease: payload.allowFreshRelease,
+        allowUnreviewed: payload.allowUnreviewed
       });
+      if (payload.conflict) {
+        markPluginConflicted(packageName, payload.conflict);
+      } else {
+        clearPluginConflict(packageName);
+      }
       setCheckResult(payload);
       if (payload.hasUpdate && payload.latestVersion) {
         markPluginUpdatable(packageName, payload.latestVersion);
@@ -1933,9 +1867,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     if (!checkResult?.hasUpdate || status === 'updating') return;
     const targetPkg = packageName;
     const targetVersion = checkResult.latestVersion;
-    const source = checkResult.source;
     const updateToken = ++tokenRef.current;
-    setConfirmOpen(false);
     setStatus('updating');
     setMessage(null);
 
@@ -1943,15 +1875,13 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     updateAbortRef.current = controller;
     const timer = window.setTimeout(() => controller.abort(), UPDATE_TIMEOUT_MS);
     try {
-      const reqBody: DoUpdateParams = { packageName: targetPkg, targetVersion, source };
-      const response = await fetch(UPDATE_PATH, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(reqBody),
-        signal: controller.signal
-      });
-      const payload = (await response.json().catch(() => null)) as DoUpdateResult | null;
-      if (!payload || typeof payload !== 'object') throw new Error(`HTTP ${response.status}`);
+      const reqBody: DoUpdateParams = { packageName: targetPkg, targetVersion };
+      const { status: httpStatus, payload } = await postUpdaterRequest<DoUpdateResult>(
+        UPDATE_PATH,
+        reqBody,
+        controller.signal
+      );
+      if (!payload || typeof payload !== 'object') throw new Error(`HTTP ${httpStatus}`);
       if (payload.ok === false) {
         if (updateToken !== tokenRef.current || !mountedRef.current) return;
         setStatus('error');
@@ -1965,6 +1895,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       }
       const version = payload.targetVersion || targetVersion || clientVersion;
       clearPluginUpdatable(targetPkg, version);
+      clearPluginConflict(targetPkg);
       if (updateToken !== tokenRef.current || !mountedRef.current) return;
       successVersionRef.current = version;
       setStatus('success');
@@ -1975,7 +1906,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       });
     } catch {
       if (updateToken !== tokenRef.current || !mountedRef.current) return;
-      await new Promise(resolve => window.setTimeout(resolve, 1500));
+      await new Promise(resolvePromise => window.setTimeout(resolvePromise, 1500));
       if (updateToken !== tokenRef.current || !mountedRef.current) return;
       const checked = await fetchCheck();
       if (!mountedRef.current || activePackageRef.current !== targetPkg) return;
@@ -1983,6 +1914,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
         const version = checked.currentVersion || targetVersion || clientVersion;
         successVersionRef.current = version;
         clearPluginUpdatable(targetPkg, version);
+        clearPluginConflict(targetPkg);
         setStatus('success');
         setMessage({
           kind: 'key',
@@ -2005,15 +1937,17 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     normalizeRegistryUrl(checkResult?.registry || currentUiPrefs.registryUrl) ?? OFFICIAL_REGISTRY;
   const usingNonOfficialRegistry = effectiveRegistry !== OFFICIAL_REGISTRY;
   const effectiveAlwaysShow = checkResult?.alwaysShowDetailButton ?? currentUiPrefs.alwaysShowDetailButton;
+  const isGitOrigin = isGithub || (typeof pkg?.update === 'string' && pkg.update !== 'registry');
+  const isFreshRelease = checkResult?.isFreshRelease === true;
+  const nativeUnavailable = isGitOrigin || usingNonOfficialRegistry || isFreshRelease;
 
-  // Plan A layering: yield standard official npm detail pages to DSH native unless the user
-  // configured a mirror/custom registry or explicitly turned on the Always Show toggle.
-  if (!isGithub && !usingNonOfficialRegistry && !effectiveAlwaysShow) {
+  // Yield to DSH native VersionSection unless DSH native does not cover this update or Always Show is enabled.
+  if (!nativeUnavailable && !effectiveAlwaysShow) {
     return null;
   }
 
   // When npm secondary action is enabled, keep the header clean unless an update/action is active.
-  if (!isGithub && (status === 'checking' || status === 'up_to_date')) {
+  if (!isGitOrigin && (status === 'checking' || status === 'up_to_date')) {
     return null;
   }
 
@@ -2044,7 +1978,7 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
 
   const onButtonClick = () => {
     if (status === 'has_update') {
-      setConfirmOpen(true);
+      void runUpdate();
       return;
     }
     if (status === 'checking' || status === 'updating') return;
@@ -2052,11 +1986,11 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
     void fetchCheck();
   };
 
-  const showMessage = Boolean(messageText) && (isGithub || status !== 'success');
+  const showMessage = Boolean(messageText) && (isGitOrigin || status !== 'success');
 
   return (
     <div style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
-      {isGithub ? (
+      {isGitOrigin ? (
         <SafeButton
           variant={status === 'has_update' ? 'primary' : 'outline'}
           size="sm"
@@ -2071,10 +2005,10 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
             <SafeButton
               variant="outline"
               size="sm"
-              onClick={() => setConfirmOpen(true)}
-              title={t('action.fastUpdateTip')}
+              onClick={() => void runUpdate()}
+              title={isFreshRelease ? t('action.fastUpdateTip') : undefined}
             >
-              {t('action.fastUpdate', { version: latestVersion })}
+              {t(isFreshRelease ? 'action.fastUpdate' : 'action.fallbackUpdate', { version: latestVersion })}
             </SafeButton>
           )}
           {status === 'updating' && (
@@ -2093,33 +2027,15 @@ export const UpdaterActionButton: React.FC<UpdaterActionButtonProps> = ({ subjec
       {showMessage && (
         <div style={{ fontSize: 12, color: status === 'error' ? '#b91c1c' : '#15803d', maxWidth: 360 }}>{messageText}</div>
       )}
-
-      <SafeModal
-        open={confirmOpen}
-        onClose={() => setConfirmOpen(false)}
-        title={t('confirm.title')}
-        closeLabel={t('confirm.close')}
-        description={t('confirm.body', { packageName, version: latestVersion })}
-        footer={
-          <>
-            <SafeButton variant="outline" onClick={() => setConfirmOpen(false)}>
-              {t('confirm.cancel')}
-            </SafeButton>
-            <SafeButton variant="primary" onClick={() => void runUpdate()}>
-              {t('confirm.ok')}
-            </SafeButton>
-          </>
-        }
-      />
     </div>
   );
 };
 
-// --- Proactive & persistent update reminders (Sidebar count, row badges & rescue UI) --
+// --- Sidebar & installed list orthogonal badges (Red = Conflict, Blue = Update) -------
 
 const SIDEBAR_BADGE_ATTR = 'data-dsh-updater-sidebar-badge';
 const ROW_BADGE_ATTR = 'data-dsh-updater-row-badge';
-const ROW_ISSUE_ATTR = 'data-dsh-updater-row-issue';
+const ROW_CONFLICT_ATTR = 'data-dsh-updater-row-conflict';
 const NATIVE_UPDATE_LABELS = new Set(['可更新', 'Update available']);
 
 function hasNativeUpdateTag(card: HTMLElement, t: Translator): boolean {
@@ -2128,9 +2044,9 @@ function hasNativeUpdateTag(card: HTMLElement, t: Translator): boolean {
   for (const el of Array.from(candidates)) {
     if (
       el.hasAttribute(ROW_BADGE_ATTR) ||
-      el.hasAttribute(ROW_ISSUE_ATTR) ||
-      el.closest(`[${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}]`) ||
-      el.querySelector(`[${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}]`)
+      el.hasAttribute(ROW_CONFLICT_ATTR) ||
+      el.closest(`[${ROW_BADGE_ATTR}], [${ROW_CONFLICT_ATTR}]`) ||
+      el.querySelector(`[${ROW_BADGE_ATTR}], [${ROW_CONFLICT_ATTR}]`)
     ) {
       continue;
     }
@@ -2146,16 +2062,44 @@ function hasNativeUpdateTag(card: HTMLElement, t: Translator): boolean {
   return false;
 }
 
-function mountRowBadgeHost(card: HTMLLIElement, pkgName: string, attrName: string = ROW_BADGE_ATTR): HTMLElement {
+function hasNativeProblemTag(card: HTMLElement): boolean {
+  if (card.getAttribute('data-plugin-status') === 'problem') return true;
+  const dangerTags = card.querySelectorAll<HTMLElement>('[data-tone="danger"]');
+  for (const el of Array.from(dangerTags)) {
+    if (
+      el.hasAttribute(ROW_CONFLICT_ATTR) ||
+      el.hasAttribute(ROW_BADGE_ATTR) ||
+      el.closest(`[${ROW_CONFLICT_ATTR}], [${ROW_BADGE_ATTR}]`)
+    ) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function mountRowBadgeHost(
+  card: HTMLLIElement,
+  pkgName: string,
+  attrName: string,
+  beforeSibling?: HTMLElement | null
+): HTMLElement {
   const host = document.createElement('span');
   host.setAttribute(attrName, pkgName);
   host.style.cssText = 'display: inline-flex; align-items: center; flex: none; cursor: pointer;';
-  // DSH PackageCard renders native status tags (Beta / Update available) inside the titleRow beside cardTitle.
+
+  if (beforeSibling?.parentElement) {
+    beforeSibling.parentElement.insertBefore(host, beforeSibling);
+    return host;
+  }
+
+  // DSH PackageCard renders native status tags inside the titleRow beside cardTitle.
   const titleBtn = card.querySelector<HTMLElement>('button:not([role="switch"])');
   if (titleBtn?.parentElement && titleBtn.parentElement !== card) {
     titleBtn.parentElement.appendChild(host);
     return host;
   }
+
   // Fallback: place before the outer toggle wrapper inside cardEnd, never inside .bundleToggle span itself.
   const switchEl = card.querySelector<HTMLElement>('[role="switch"]');
   const toggleWrapper = switchEl?.closest('span');
@@ -2177,8 +2121,8 @@ function isOwnBadgeMutation(mutation: MutationRecord): boolean {
     targetEl &&
     (targetEl.hasAttribute(SIDEBAR_BADGE_ATTR) ||
       targetEl.hasAttribute(ROW_BADGE_ATTR) ||
-      targetEl.hasAttribute(ROW_ISSUE_ATTR) ||
-      targetEl.closest(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}]`))
+      targetEl.hasAttribute(ROW_CONFLICT_ATTR) ||
+      targetEl.closest(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}], [${ROW_CONFLICT_ATTR}]`))
   ) {
     return true;
   }
@@ -2191,7 +2135,7 @@ function isOwnBadgeMutation(mutation: MutationRecord): boolean {
           node instanceof Element &&
           (node.hasAttribute(SIDEBAR_BADGE_ATTR) ||
             node.hasAttribute(ROW_BADGE_ATTR) ||
-            node.hasAttribute(ROW_ISSUE_ATTR))
+            node.hasAttribute(ROW_CONFLICT_ATTR))
       )
     ) {
       return true;
@@ -2278,26 +2222,66 @@ const srOnlyStyle: React.CSSProperties = {
   border: 0
 };
 
+function renderSidebarBadgeVisual(conflictCount: number, updatableCount: number, wide: boolean): React.ReactNode {
+  if (wide) {
+    return (
+      <span aria-hidden="true" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+        {conflictCount > 0 && <SafeTag tone="danger">{String(conflictCount)}</SafeTag>}
+        {updatableCount > 0 && <SafeTag tone="info">{String(updatableCount)}</SafeTag>}
+      </span>
+    );
+  }
+
+  return (
+    <span aria-hidden="true" style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
+      {conflictCount > 0 ? (
+        <>
+          <SafeTag tone="danger">{String(conflictCount)}</SafeTag>
+          {updatableCount > 0 && (
+            <span
+              style={{
+                position: 'absolute',
+                top: -2,
+                right: -2,
+                width: 6,
+                height: 6,
+                borderRadius: 999,
+                background: 'var(--dsw-alias-primary, #2563eb)',
+                boxShadow: '0 0 0 1.5px var(--dsw-alias-bg-elevated, #ffffff)'
+              }}
+            />
+          )}
+        </>
+      ) : (
+        <SafeTag tone="info">{String(updatableCount)}</SafeTag>
+      )}
+    </span>
+  );
+}
+
 interface SidebarPluginsTrailingProps {
   wide?: boolean;
   active?: boolean;
-  t: Translator;
-  locale?: LocaleServiceLike;
+  localeBridge: DynamicLocaleBridge;
 }
 
-const SidebarPluginsTrailingBadge: React.FC<SidebarPluginsTrailingProps> = ({ wide = true, t, locale }) => {
-  useLocaleRevision(locale);
+const SidebarPluginsTrailingBadge: React.FC<SidebarPluginsTrailingProps> = ({ wide = true, localeBridge }) => {
+  useLocaleRevision(localeBridge);
+  const t = localeBridge.t;
   const updatableEntries = useUpdatableSnapshot();
-  const count = updatableEntries.length;
-  if (count <= 0) return null;
+  const conflictEntries = useConflictsSnapshot();
+  const updatableCount = updatableEntries.length;
+  const conflictCount = conflictEntries.length;
 
-  const tip = t('badge.sidebarTip', { count });
+  if (conflictCount <= 0 && updatableCount <= 0) return null;
+
+  const tip = buildSidebarTip(t, conflictCount, updatableCount);
   return (
     <span
       title={wide ? tip : undefined}
       style={
         wide
-          ? { display: 'inline-flex', alignItems: 'center' }
+          ? { display: 'inline-flex', alignItems: 'center', gap: 4 }
           : {
               display: 'inline-flex',
               alignItems: 'center',
@@ -2308,46 +2292,46 @@ const SidebarPluginsTrailingBadge: React.FC<SidebarPluginsTrailingProps> = ({ wi
       }
     >
       <span style={srOnlyStyle}>{tip}</span>
-      <span aria-hidden="true" style={{ display: 'inline-flex', alignItems: 'center' }}>
-        <SafeTag tone="info">{String(count)}</SafeTag>
-      </span>
+      {renderSidebarBadgeVisual(conflictCount, updatableCount, wide)}
     </span>
   );
 };
 
 interface UpdateRemindersOverlayProps {
   slots: any;
-  t: Translator;
-  locale?: LocaleServiceLike;
+  localeBridge: DynamicLocaleBridge;
 }
 
-interface RowMountTarget {
+interface RowUpdateMountTarget {
   packageName: string;
   latestVersion: string;
   host: HTMLElement;
   card: HTMLLIElement;
 }
 
-interface IssueRowMountTarget {
+interface RowConflictMountTarget {
   packageName: string;
-  hasUpdate: boolean;
-  latestVersion?: string;
-  detail?: string;
+  conflict: PluginConflictInfo;
   host: HTMLElement;
+  card: HTMLLIElement;
 }
 
-const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, t, locale }) => {
-  useLocaleRevision(locale);
+const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, localeBridge }) => {
+  useLocaleRevision(localeBridge);
+  const t = localeBridge.t;
   const updatableEntries = useUpdatableSnapshot();
-  const rescue = useRescueSnapshot();
+  const conflictEntries = useConflictsSnapshot();
   const nativeSidebarTrailing = useNativeSidebarTrailingActive();
 
   const [sidebarHost, setSidebarHost] = useState<HTMLElement | null>(null);
-  const [rowTargets, setRowTargets] = useState<RowMountTarget[]>([]);
-  const [issueTargets, setIssueTargets] = useState<IssueRowMountTarget[]>([]);
+  const [sidebarWide, setSidebarWide] = useState<boolean>(true);
+  const [rowTargets, setRowTargets] = useState<RowUpdateMountTarget[]>([]);
+  const [conflictTargets, setConflictTargets] = useState<RowConflictMountTarget[]>([]);
+
   const lastNativeDoneRef = useRef(false);
   const sidebarBtnRef = useRef<HTMLElement | null>(null);
   const lastSidebarCssRef = useRef<string>('');
+  const reconciledSwitchOnRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -2356,24 +2340,18 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
     return () => window.clearTimeout(timer);
   }, []);
 
-  // Global client crash sniffer & plugin card click attribution.
+  // Lightweight runtime error sniffer: auto-disables third-party plugins whose client bundle crashes.
   useEffect(() => {
-    const onCaptureClick = (event: MouseEvent) => {
-      const target = event.target as Element | null;
-      if (!target) return;
-      if (target.closest(`[${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}], [role="switch"]`)) return;
-      const card = target.closest('li[data-plugin-package]');
-      const pkgName = card?.getAttribute('data-plugin-package')?.trim();
-      if (pkgName && pkgName !== PLUGIN_NAME && !isOfficialPackageName(pkgName)) {
-        knownThirdPartyPackages.add(pkgName);
-        lastClickedPlugin = { name: pkgName, timestamp: Date.now() };
-      }
-    };
-
     const onWindowError = (event: ErrorEvent) => {
       const msg = String(event?.message || event?.error?.message || '');
       const stack = `${event?.filename || ''}\n${event?.error?.stack || ''}`;
-      attributePluginCrash(msg, stack);
+      if (stack.includes(`/${PLUGIN_NAME}/`) || stack.includes(`\\${PLUGIN_NAME}\\`) || msg.includes(`"${PLUGIN_NAME}"`)) {
+        return;
+      }
+      const pkg = extractPackageFromStackText(`${stack}\n${msg}`);
+      if (pkg) {
+        reportRuntimeConflictToBackend(pkg, msg || 'Uncaught client runtime error');
+      }
     };
 
     const onUnhandledRejection = (event: PromiseRejectionEvent) => {
@@ -2385,14 +2363,18 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
             ? reason.message
             : String(reason || '');
       const stack = typeof reason?.stack === 'string' ? reason.stack : '';
-      attributePluginCrash(msg, stack);
+      if (stack.includes(`/${PLUGIN_NAME}/`) || stack.includes(`\\${PLUGIN_NAME}\\`) || msg.includes(`"${PLUGIN_NAME}"`)) {
+        return;
+      }
+      const pkg = extractPackageFromStackText(`${stack}\n${msg}`);
+      if (pkg) {
+        reportRuntimeConflictToBackend(pkg, msg || 'Unhandled promise rejection');
+      }
     };
 
-    document.addEventListener('click', onCaptureClick, true);
     window.addEventListener('error', onWindowError);
     window.addEventListener('unhandledrejection', onUnhandledRejection);
     return () => {
-      document.removeEventListener('click', onCaptureClick, true);
       window.removeEventListener('error', onWindowError);
       window.removeEventListener('unhandledrejection', onUnhandledRejection);
     };
@@ -2400,7 +2382,9 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
   const syncDomTargets = useCallback(() => {
     try {
-      // 1. Sync legacy Sidebar "Plugins" count badge host (fallback for DSH < 0.2.3-alpha.1 without sidebar.panellist.trailing)
+      const hasAnyBadge = updatablePlugins.size > 0 || conflictedPlugins.size > 0;
+
+      // 1. Legacy Sidebar "Plugins" count badge host (fallback for DSH < 0.2.3-alpha.1 without sidebar.panellist.trailing)
       if (nativeSidebarTrailingDepth > 0) {
         if (sidebarBtnRef.current) {
           sidebarBtnRef.current.querySelector(`span[${SIDEBAR_BADGE_ATTR}="true"]`)?.remove();
@@ -2427,24 +2411,24 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
             lastSidebarCssRef.current = '';
           }
           let nextCssText = 'display: none;';
-          if (updatablePlugins.size > 0) {
+          const isCollapsed = pluginsBtn.clientWidth > 0 && pluginsBtn.clientWidth <= 48;
+          setSidebarWide(!isCollapsed);
+          if (hasAnyBadge) {
             if (
               (!pluginsBtn.style.position || pluginsBtn.style.position === 'static') &&
               window.getComputedStyle(pluginsBtn).position === 'static'
             ) {
               pluginsBtn.style.position = 'relative';
             }
-            const isCollapsed = pluginsBtn.clientWidth > 0 && pluginsBtn.clientWidth <= 48;
             if (isCollapsed) {
               nextCssText =
-                'position: absolute; top: 2px; right: 2px; display: inline-flex; align-items: center; pointer-events: none; transform: scale(0.8); transform-origin: top right;';
+                'position: absolute; top: 2px; right: 2px; display: inline-flex; align-items: center; pointer-events: none; transform: scale(0.8); transformOrigin: top right;';
             } else {
               const panelEntry = pluginsBtn.closest('nav > div') || pluginsBtn.parentElement;
               const hasUnpinBtn = Boolean(
                 panelEntry && Array.from(panelEntry.querySelectorAll('button')).some(btn => btn !== pluginsBtn)
               );
-              nextCssText =
-                `position: absolute; top: 50%; right: ${hasUnpinBtn ? '32px' : '10px'}; transform: translateY(-50%); display: inline-flex; align-items: center; pointer-events: none;`;
+              nextCssText = `position: absolute; top: 50%; right: ${hasUnpinBtn ? '32px' : '10px'}; transform: translateY(-50%); display: inline-flex; align-items: center; pointer-events: none;`;
             }
           }
           if (lastSidebarCssRef.current !== nextCssText) {
@@ -2458,71 +2442,66 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         }
       }
 
-      // 2. Detect blank or error-boundary detail page shortly after clicking a third-party plugin card
-      const detailEl = document.querySelector<HTMLElement>('[data-plugin-detail]');
-      if (detailEl && lastClickedPlugin) {
-        const elapsed = Date.now() - lastClickedPlugin.timestamp;
-        if (elapsed <= 5000) {
-          const text = (detailEl.textContent || '').trim();
-          const hasExplicitErr = Boolean(detailEl.querySelector('[data-plugin-error], [data-error-boundary]'));
-          const isBlank = elapsed >= 1000 && text.length === 0;
-          const looksBroken = /Something went wrong|ChunkLoadError|Minified React error|组件加载失败|页面渲染失败|插件加载异常/i.test(text);
-          if (hasExplicitErr || isBlank || looksBroken) {
-            recordClientCrash(
-              lastClickedPlugin.name,
-              isBlank ? '打开插件详情页后页面空白' : text.slice(0, 200)
-            );
-          }
-        }
-      }
-
-      // 3. Sync Installed Plugins list row badges (issue badges & update badges)
+      // 2. Sync Installed Plugins list row badges (orthogonal red conflict badge + blue update badge)
       const cards = Array.from(document.querySelectorAll<HTMLLIElement>('li[data-plugin-package]'));
-      if (cards.length > 0 && !detailEl) {
-        for (const card of cards) {
-          const pkg = card.getAttribute('data-plugin-package');
-          if (pkg && pkg !== PLUGIN_NAME && !isOfficialPackageName(pkg)) {
-            knownThirdPartyPackages.add(pkg);
-          }
+      for (const card of cards) {
+        const pkg = card.getAttribute('data-plugin-package');
+        if (pkg && pkg !== PLUGIN_NAME && !isOfficialPackageName(pkg)) {
+          knownThirdPartyPackages.add(pkg);
         }
       }
 
-      const nextRowTargets: RowMountTarget[] = [];
-      const nextIssueTargets: IssueRowMountTarget[] = [];
+      const nextRowTargets: RowUpdateMountTarget[] = [];
+      const nextConflictTargets: RowConflictMountTarget[] = [];
+
       for (const card of cards) {
         const pkgName = card.getAttribute('data-plugin-package') || '';
         if (!pkgName) continue;
         const latestVersion = updatablePlugins.get(pkgName);
-        const unhealthySummary = unhealthyPlugins.get(pkgName);
-        const crashDetail = crashedPlugins.get(pkgName);
-        const hasIssue = Boolean(unhealthySummary || crashDetail);
+        const conflict = conflictedPlugins.get(pkgName);
+        const switchAttr = card.querySelector('[role="switch"]')?.getAttribute('aria-checked');
+        const isCardSwitchOn = switchAttr === 'true';
+
+        if (conflict && isCardSwitchOn) {
+          if (!reconciledSwitchOnRef.current.has(pkgName)) {
+            reconciledSwitchOnRef.current.add(pkgName);
+            window.setTimeout(() => runBatchCheck(false, true), 600);
+          }
+        } else {
+          reconciledSwitchOnRef.current.delete(pkgName);
+        }
 
         const escapedPkg =
           typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
             ? CSS.escape(pkgName)
             : pkgName.replace(/["\\]/g, '\\$&');
+        let conflictHost = card.querySelector<HTMLElement>(`span[${ROW_CONFLICT_ATTR}="${escapedPkg}"]`);
         let updateHost = card.querySelector<HTMLElement>(`span[${ROW_BADGE_ATTR}="${escapedPkg}"]`);
-        let issueHost = card.querySelector<HTMLElement>(`span[${ROW_ISSUE_ATTR}="${escapedPkg}"]`);
 
-        if (hasIssue) {
-          if (updateHost) updateHost.remove();
-          if (!issueHost) {
-            issueHost = mountRowBadgeHost(card, pkgName, ROW_ISSUE_ATTR);
+        const showConflict = Boolean(conflict && !isCardSwitchOn && !hasNativeProblemTag(card));
+        const showUpdate = Boolean(latestVersion && !hasNativeUpdateTag(card, t));
+
+        if (showConflict && conflict) {
+          const updateParent = updateHost?.parentElement;
+          if (!conflictHost) {
+            conflictHost = mountRowBadgeHost(card, pkgName, ROW_CONFLICT_ATTR, updateHost);
+          } else if (updateHost && updateParent && conflictHost.parentElement === updateParent) {
+            // Keep [Conflict] consistently placed before [Update available]
+            if (conflictHost.compareDocumentPosition(updateHost) & Node.DOCUMENT_POSITION_PRECEDING) {
+              updateParent.insertBefore(conflictHost, updateHost);
+            }
           }
-          nextIssueTargets.push({
+          nextConflictTargets.push({
             packageName: pkgName,
-            hasUpdate: Boolean(latestVersion),
-            latestVersion,
-            detail: crashDetail || unhealthySummary?.errorDetail,
-            host: issueHost
+            conflict,
+            host: conflictHost,
+            card
           });
-          continue;
+        } else if (conflictHost) {
+          conflictHost.remove();
         }
 
-        if (issueHost) issueHost.remove();
-
-        // Avoid duplicate tags if DSH native already displayed its own "可更新" (statusUpdateAvailable) Tag
-        if (latestVersion && !hasNativeUpdateTag(card, t)) {
+        if (showUpdate && latestVersion) {
           if (!updateHost) {
             updateHost = mountRowBadgeHost(card, pkgName, ROW_BADGE_ATTR);
           }
@@ -2536,6 +2515,21 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
           updateHost.remove();
         }
       }
+
+      setConflictTargets(prev => {
+        if (
+          prev.length === nextConflictTargets.length &&
+          prev.every(
+            (item, i) =>
+              item.packageName === nextConflictTargets[i].packageName &&
+              sameConflictInfo(item.conflict, nextConflictTargets[i].conflict) &&
+              item.host === nextConflictTargets[i].host
+          )
+        ) {
+          return prev;
+        }
+        return nextConflictTargets;
+      });
 
       setRowTargets(prev => {
         if (
@@ -2552,23 +2546,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
         return nextRowTargets;
       });
 
-      setIssueTargets(prev => {
-        if (
-          prev.length === nextIssueTargets.length &&
-          prev.every(
-            (item, i) =>
-              item.packageName === nextIssueTargets[i].packageName &&
-              item.hasUpdate === nextIssueTargets[i].hasUpdate &&
-              item.latestVersion === nextIssueTargets[i].latestVersion &&
-              item.host === nextIssueTargets[i].host
-          )
-        ) {
-          return prev;
-        }
-        return nextIssueTargets;
-      });
-
-      // 4. Reconcile badge cache when DSH's native UpdateDialog / InstallDialog settles on "done"
+      // 3. Reconcile badge cache when DSH's native UpdateDialog / InstallDialog settles on "done"
       const nativeDone = Boolean(document.querySelector('[data-plugin-update="done"], [data-install-phase="done"]'));
       if (nativeDone && !lastNativeDoneRef.current) {
         runBatchCheck(false, true);
@@ -2579,7 +2557,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
 
   useEffect(() => {
     syncDomTargets();
-  }, [syncDomTargets, updatableEntries, rescue, nativeSidebarTrailing]);
+  }, [syncDomTargets, updatableEntries, conflictEntries, nativeSidebarTrailing]);
 
   useEffect(() => {
     const btn = sidebarBtnRef.current;
@@ -2654,7 +2632,7 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['data-plugin-update', 'data-install-phase']
+      attributeFilter: ['data-plugin-update', 'data-install-phase', 'aria-checked', 'data-plugin-status']
     });
 
     const onResize = () => scheduleSync();
@@ -2672,29 +2650,43 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
   useEffect(() => {
     return () => {
       document
-        .querySelectorAll(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}], [${ROW_ISSUE_ATTR}]`)
+        .querySelectorAll(`[${SIDEBAR_BADGE_ATTR}], [${ROW_BADGE_ATTR}], [${ROW_CONFLICT_ATTR}]`)
         .forEach(el => el.remove());
     };
   }, []);
 
-  const count = updatableEntries.length;
-  const issueCount = new Set([...rescue.unhealthy.keys(), ...rescue.crashes.keys()]).size;
-  const currentSignature = computeRescueSignature();
-  const shouldShowBanner =
-    (issueCount > 0 || (rescue.hostUpgrade.upgraded && count > 0)) &&
-    currentSignature !== rescue.dismissedSignature &&
-    !rescue.modal.open;
+  const updatableCount = updatableEntries.length;
+  const conflictCount = conflictEntries.length;
+  const hasAnySidebarBadge = conflictCount > 0 || updatableCount > 0;
+  const sidebarTip = hasAnySidebarBadge ? buildSidebarTip(t, conflictCount, updatableCount) : '';
 
   return (
     <>
       {sidebarHost &&
-        count > 0 &&
+        hasAnySidebarBadge &&
         createPortal(
-          <span title={t('badge.sidebarTip', { count })} style={{ display: 'inline-flex', alignItems: 'center' }}>
-            <SafeTag tone="info">{String(count)}</SafeTag>
+          <span title={sidebarTip} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            {renderSidebarBadgeVisual(conflictCount, updatableCount, sidebarWide)}
           </span>,
           sidebarHost
         )}
+      {conflictTargets.map(({ packageName, conflict, host, card }) =>
+        createPortal(
+          <span
+            title={formatConflictTooltip(t, conflict)}
+            onClick={event => {
+              event.stopPropagation();
+              const openBtn = card.querySelector<HTMLElement>('button:not([role="switch"])');
+              openBtn?.click();
+            }}
+            style={{ display: 'inline-flex', alignItems: 'center' }}
+          >
+            <SafeTag tone="danger">{t('badge.conflictDisabled')}</SafeTag>
+          </span>,
+          host,
+          `conflict:${packageName}`
+        )
+      )}
       {rowTargets.map(({ packageName, latestVersion, host, card }) =>
         createPortal(
           <span
@@ -2709,108 +2701,37 @@ const UpdateRemindersOverlay: React.FC<UpdateRemindersOverlayProps> = ({ slots, 
             <SafeTag tone="info">{t('badge.updateAvailable')}</SafeTag>
           </span>,
           host,
-          packageName
+          `update:${packageName}`
         )
       )}
-      {issueTargets.map(({ packageName, hasUpdate, latestVersion, detail, host }) =>
-        createPortal(
-          <span
-            title={detail || (latestVersion ? `v${latestVersion}` : packageName)}
-            onClick={event => {
-              event.preventDefault();
-              event.stopPropagation();
-              openRescueModal(packageName);
-            }}
-            style={{ display: 'inline-flex', alignItems: 'center' }}
-          >
-            <SafeTag tone="warning">{hasUpdate ? t('badge.issueAndUpdate') : t('badge.issueDetected')}</SafeTag>
-          </span>,
-          host,
-          `issue:${packageName}`
-        )
-      )}
-
-      {shouldShowBanner && (
-        <div
-          style={{
-            position: 'fixed',
-            right: 20,
-            bottom: 20,
-            zIndex: 9500,
-            width: 360,
-            maxWidth: 'calc(100vw - 40px)',
-            padding: '12px 14px',
-            borderRadius: 12,
-            background: 'var(--dsw-alias-bg-elevated, #ffffff)',
-            color: 'var(--dsw-alias-label-primary, #1e293b)',
-            border: issueCount > 0 ? '1.5px solid #f59e0b' : '1.5px solid var(--dsw-alias-primary, #2563eb)',
-            boxShadow: '0 12px 32px rgba(15, 23, 42, 0.18)',
-            boxSizing: 'border-box'
-          }}
-        >
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
-            {issueCount > 0
-              ? t('rescue.banner.crashTitle', { count: issueCount })
-              : t('rescue.banner.hostUpgradedTitle', { version: rescue.hostUpgrade.current || '' })}
-          </div>
-          <div style={{ fontSize: 12, color: 'var(--dsw-alias-label-secondary, #64748b)', lineHeight: 1.5, marginBottom: 10 }}>
-            {t('rescue.banner.desc')}
-          </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            <SafeButton variant="primary" size="sm" onClick={() => openRescueModal()}>
-              {t('rescue.banner.openCenter')}
-            </SafeButton>
-            {count > 0 && (
-              <SafeButton variant="outline" size="sm" onClick={() => openRescueModal(undefined, true)}>
-                {t('rescue.banner.batchUpdate', { count })}
-              </SafeButton>
-            )}
-            <SafeButton variant="outline" size="sm" onClick={() => dismissCurrentRescueBanner()}>
-              {t('rescue.banner.dismiss')}
-            </SafeButton>
-          </div>
-        </div>
-      )}
-
-      <SafeModal
-        open={rescue.modal.open}
-        onClose={() => closeRescueModal()}
-        title={t('rescue.modal.title')}
-        closeLabel={t('confirm.close')}
-        description={t('rescue.modal.subtitle')}
-        footer={
-          <SafeButton variant="outline" onClick={() => closeRescueModal()}>
-            {t('confirm.close')}
-          </SafeButton>
-        }
-      >
-        <RescueCenterPanel
-          t={t}
-          focusPackage={rescue.modal.focusPackage}
-          autoBatch={rescue.modal.autoBatch}
-        />
-      </SafeModal>
     </>
   );
 };
 
-// --- Client entry ---------------------------------------------------------------------
+// --- Client entry (minimal Cordis inject for survivability across DSH upgrades) -------
 
 export function apply(ctx: any, config?: any) {
-  const locale = getLocaleService(ctx);
-  const t = createTranslator(locale);
-  registerLocaleDictionaries(ctx, locale);
+  const localeBridge = createDynamicLocaleBridge(ctx);
+  if (!getLocaleService(ctx) && typeof ctx?.inject === 'function') {
+    try {
+      ctx.inject(['locale'], (subCtx: any) => {
+        localeBridge.attach(subCtx, getLocaleService(subCtx));
+      });
+    } catch {}
+  }
+
   bindSyncedConfig(ctx, config);
+
+  const slots = ctx.slots ?? ctx.get?.('slots');
+  if (!slots?.inject || !slots?.register) return;
 
   let formInstance: any;
   const getForm = () => {
     if (formInstance) return formInstance;
-    if (ctx.configForms?.get) formInstance = ctx.configForms.get(PLUGIN_NAME);
+    const cf = ctx.configForms ?? ctx.get?.('configForms');
+    if (cf?.get) formInstance = cf.get(PLUGIN_NAME);
     return formInstance;
   };
-
-  const slots = ctx.slots;
-  if (!slots?.inject || !slots?.register) return;
 
   try {
     slots.inject('sidebar.panellist.trailing', () => {
@@ -2822,11 +2743,11 @@ export function apply(ctx: any, config?: any) {
             id: 'plugins',
             priority: 10
           },
-          (props: SidebarPluginsTrailingProps) =>
+          (props: Omit<SidebarPluginsTrailingProps, 'localeBridge'>) =>
             React.createElement(
               SafeErrorBoundary,
               { fallback: null },
-              React.createElement(SidebarPluginsTrailingBadge, { ...props, t, locale })
+              React.createElement(SidebarPluginsTrailingBadge, { ...props, localeBridge })
             )
         );
       } catch {
@@ -2857,10 +2778,28 @@ export function apply(ctx: any, config?: any) {
         React.createElement(
           SafeErrorBoundary,
           { fallback: null },
-          React.createElement(UpdateRemindersOverlay, { ...props, slots, t, locale })
+          React.createElement(UpdateRemindersOverlay, { ...props, slots, localeBridge })
         )
     )
   );
+
+  try {
+    slots.inject('plugins.detail.badge', () =>
+      slots.register(
+        {
+          name: 'plugins.detail.badge',
+          id: `${PLUGIN_NAME}.conflict-badge`,
+          order: -5
+        },
+        (props: SlotActionProps) =>
+          React.createElement(
+            SafeErrorBoundary,
+            { fallback: null },
+            React.createElement(DetailConflictBadge, { ...props, localeBridge })
+          )
+      )
+    );
+  } catch {}
 
   slots.inject('plugins.detail.actions', () =>
     slots.register(
@@ -2873,7 +2812,7 @@ export function apply(ctx: any, config?: any) {
         React.createElement(
           SafeErrorBoundary,
           { fallback: null },
-          React.createElement(UpdaterActionButton, { ...props, t, locale })
+          React.createElement(UpdaterActionButton, { ...props, localeBridge })
         )
     )
   );
@@ -2889,25 +2828,38 @@ export function apply(ctx: any, config?: any) {
           React.createElement(
             SafeErrorBoundary,
             { fallback: null },
-            React.createElement(RegistrySettingsCard, { form: form || getForm(), t, locale })
+            React.createElement(RegistrySettingsCard, { form: form || getForm(), localeBridge })
           )
       )
     );
 
-  if (ctx.configForms?.whileServed) {
-    ctx.effect(
-      () =>
-        ctx.configForms.whileServed([PLUGIN_NAME], () => {
-          const form = ctx.configForms.get(PLUGIN_NAME);
-          formInstance = form;
-          return registerBundleConfig(form);
-        }),
-      'dsh-plugins-update: bundle settings card'
-    );
+  const bindConfigCard = (targetCtx: any, cf: any) => {
+    if (cf?.whileServed) {
+      targetCtx.effect(
+        () =>
+          cf.whileServed([PLUGIN_NAME], () => {
+            const form = cf.get(PLUGIN_NAME);
+            formInstance = form;
+            return registerBundleConfig(form);
+          }),
+        'dsh-plugins-update: bundle settings card'
+      );
+    } else {
+      registerBundleConfig(cf?.get?.(PLUGIN_NAME));
+    }
+  };
+
+  const immediateCf = ctx.configForms ?? ctx.get?.('configForms');
+  if (immediateCf) {
+    bindConfigCard(ctx, immediateCf);
+  } else if (typeof ctx.inject === 'function') {
+    ctx.inject(['configForms'], (subCtx: any) => {
+      bindConfigCard(subCtx, subCtx.configForms ?? subCtx.get?.('configForms'));
+    });
   } else {
     registerBundleConfig();
   }
 }
 
 export const name = PLUGIN_NAME;
-export const inject = ['slots', 'configForms', 'locale'];
+export const inject = ['slots'];

@@ -11,12 +11,14 @@ export const OFFICIAL_PACKAGE_PREFIX = '@deepseek-ai/';
 /** Locale namespace owned by this plugin's client dictionaries. */
 export const LOCALE_NAMESPACE = PLUGIN_NAME;
 
+/** Custom anti-CSRF header required on all updater HTTP API calls. */
+export const UPDATER_REQUEST_HEADER = 'x-dsh-updater';
+
 /** HTTP paths served by the backend half. */
 export const CHECK_PATH = '/api/dsh-plugins-update/check';
 export const CHECK_ALL_PATH = '/api/dsh-plugins-update/check-all';
 export const UPDATE_PATH = '/api/dsh-plugins-update/update';
-export const DIAGNOSE_PATH = '/api/dsh-plugins-update/diagnose';
-export const RESCUE_PATH = '/api/dsh-plugins-update/rescue';
+export const REPORT_CONFLICT_PATH = '/api/dsh-plugins-update/report-conflict';
 
 /** Machine-readable error codes. */
 export const ERROR_CODES = {
@@ -31,7 +33,9 @@ export const ERROR_CODES = {
   timeout: 'timeout',
   verificationFailed: 'verification-failed',
   rollbackFailed: 'rollback-failed',
-  selfUninstallBlocked: 'self-uninstall-blocked',
+  freshReleaseBlocked: 'fresh-release-blocked',
+  unreviewedBlocked: 'unreviewed-blocked',
+  forbidden: 'forbidden',
   unknown: 'unknown'
 } as const;
 
@@ -50,12 +54,19 @@ export interface PluginSettings {
   customRegistries: CustomRegistry[];
   fallbackToOfficial: boolean;
   alwaysShowDetailButton: boolean;
+  allowFreshRelease: boolean;
+  allowUnreviewed: boolean;
+}
+
+export interface PluginConflictInfo {
+  pluginVersion: string;
+  hostVersion?: string;
+  reason?: string;
 }
 
 export interface CheckUpdateParams {
   packageName: string;
   currentVersion?: string;
-  source?: string;
 }
 
 export interface CheckUpdateResult {
@@ -66,73 +77,29 @@ export interface CheckUpdateResult {
   hasUpdate: boolean;
   source?: string;
   isGithub?: boolean;
+  isFreshRelease?: boolean;
+  isUnreviewed?: boolean;
   registry?: string;
   alwaysShowDetailButton?: boolean;
+  allowFreshRelease?: boolean;
+  allowUnreviewed?: boolean;
+  conflict?: PluginConflictInfo;
   error?: string;
   errorCode?: ErrorCode | string;
 }
 
-export type PluginHealthIssueKind =
-  | 'bundle-unavailable'
-  | 'bundle-error'
-  | 'entry-missing'
-  | 'unregistered-bundle'
-  | 'client-crash';
-
-export interface PluginHealthSummary {
-  issues: PluginHealthIssueKind[];
-  errorDetail?: string;
-  currentVersion: string;
-}
-
-export interface PluginHealthReport {
+export interface ReportConflictParams {
   packageName: string;
-  currentVersion: string;
-  latestVersion?: string;
-  hasUpdate: boolean;
-  source?: string;
-  isGithub?: boolean;
-  enabled?: boolean;
-  availability?: string;
-  healthy: boolean;
-  issues: PluginHealthIssueKind[];
-  errorDetail?: string;
+  reason?: string;
 }
 
-export interface DiagnoseParams {
-  forceCheckUpdates?: boolean;
-  clientCrashes?: Record<string, string>;
-}
-
-export interface DiagnoseResult {
-  ok: boolean;
-  hostVersion?: string;
-  profileName?: string;
-  plugins: PluginHealthReport[];
-  registry?: string;
-  error?: string;
-  errorCode?: ErrorCode | string;
-}
-
-export type RescueAction = 'update' | 'reinstall' | 'uninstall';
-
-export interface RescueParams {
-  packageName: string;
-  action: RescueAction;
-  targetVersion?: string;
-  source?: string;
-}
-
-export interface RescueResult {
+export interface ReportConflictResult {
   ok: boolean;
   packageName: string;
-  action: RescueAction;
-  targetVersion?: string;
-  selfUpdate?: boolean;
-  rollback?: 'not-needed' | 'restored' | 'failed';
+  disabled?: boolean;
+  conflict?: PluginConflictInfo;
   error?: string;
   errorCode?: ErrorCode | string;
-  output?: string;
 }
 
 export interface CheckAllParams {
@@ -144,10 +111,12 @@ export interface CheckAllParams {
 export interface CheckAllResult {
   ok: boolean;
   updatable: Record<string, string>;
+  conflicts?: Record<string, PluginConflictInfo>;
   hostVersion?: string;
-  unhealthy?: Record<string, PluginHealthSummary>;
   registry?: string;
   alwaysShowDetailButton?: boolean;
+  allowFreshRelease?: boolean;
+  allowUnreviewed?: boolean;
   error?: string;
   errorCode?: ErrorCode | string;
 }
@@ -155,7 +124,6 @@ export interface CheckAllResult {
 export interface DoUpdateParams {
   packageName: string;
   targetVersion?: string;
-  source?: string;
 }
 
 export interface DoUpdateResult {
@@ -179,6 +147,7 @@ export interface SlotActionSubject {
     official?: boolean;
     enabled?: boolean;
     source?: string;
+    update?: 'registry' | 'git' | string;
     [key: string]: any;
   };
 }
@@ -192,7 +161,35 @@ export function isOfficialPackageName(packageName: string | undefined | null): b
   return typeof packageName === 'string' && packageName.startsWith(OFFICIAL_PACKAGE_PREFIX);
 }
 
-/** Normalize a registry URL the way pnpm compares them. */
+/** Reject loopback, link-local, unique-local, and cloud metadata hostnames to mitigate SSRF. */
+export function isDisallowedHost(hostname: string): boolean {
+  const host = String(hostname || '')
+    .trim()
+    .replace(/^\[|\]$/g, '')
+    .replace(/\.+$/, '')
+    .toLowerCase();
+  if (!host) return true;
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host === '0.0.0.0' ||
+    host === '::' ||
+    host === '::1' ||
+    host === '::ffff:0:0' ||
+    host === 'metadata.google.internal' ||
+    host === '100.100.100.200'
+  ) {
+    return true;
+  }
+  if (/^(?:::ffff:)?127\./i.test(host)) return true;
+  if (/^(?:::ffff:)?169\.254\./i.test(host)) return true;
+  if (/^::ffff:(?:7f[0-9a-f]{2}|a9fe):[0-9a-f]{1,4}$/i.test(host)) return true;
+  if (/^fe[89ab][0-9a-f]:/i.test(host)) return true;
+  if (/^f[cd][0-9a-f]{2}:/i.test(host)) return true;
+  return false;
+}
+
+/** Normalize an HTTPS registry URL without embedded credentials or loopback/metadata hosts. */
 export function normalizeRegistryUrl(url: string | undefined | null): string | null {
   if (typeof url !== 'string') return null;
   const trimmed = url.trim();
@@ -203,7 +200,9 @@ export function normalizeRegistryUrl(url: string | undefined | null): string | n
   } catch {
     return null;
   }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  if (parsed.protocol !== 'https:') return null;
+  if (parsed.username || parsed.password) return null;
+  if (isDisallowedHost(parsed.hostname)) return null;
   if (!parsed.pathname.endsWith('/')) parsed.pathname += '/';
   parsed.hash = '';
   parsed.search = '';

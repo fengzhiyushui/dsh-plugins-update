@@ -8,12 +8,13 @@ export declare const PLUGIN_NAME = "dsh-plugins-update";
 export declare const OFFICIAL_PACKAGE_PREFIX = "@deepseek-ai/";
 /** Locale namespace owned by this plugin's client dictionaries. */
 export declare const LOCALE_NAMESPACE = "dsh-plugins-update";
+/** Custom anti-CSRF header required on all updater HTTP API calls. */
+export declare const UPDATER_REQUEST_HEADER = "x-dsh-updater";
 /** HTTP paths served by the backend half. */
 export declare const CHECK_PATH = "/api/dsh-plugins-update/check";
 export declare const CHECK_ALL_PATH = "/api/dsh-plugins-update/check-all";
 export declare const UPDATE_PATH = "/api/dsh-plugins-update/update";
-export declare const DIAGNOSE_PATH = "/api/dsh-plugins-update/diagnose";
-export declare const RESCUE_PATH = "/api/dsh-plugins-update/rescue";
+export declare const REPORT_CONFLICT_PATH = "/api/dsh-plugins-update/report-conflict";
 /** Machine-readable error codes. */
 export declare const ERROR_CODES: {
     readonly invalidPackageName: "invalid-package-name";
@@ -27,7 +28,9 @@ export declare const ERROR_CODES: {
     readonly timeout: "timeout";
     readonly verificationFailed: "verification-failed";
     readonly rollbackFailed: "rollback-failed";
-    readonly selfUninstallBlocked: "self-uninstall-blocked";
+    readonly freshReleaseBlocked: "fresh-release-blocked";
+    readonly unreviewedBlocked: "unreviewed-blocked";
+    readonly forbidden: "forbidden";
     readonly unknown: "unknown";
 };
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
@@ -42,11 +45,17 @@ export interface PluginSettings {
     customRegistries: CustomRegistry[];
     fallbackToOfficial: boolean;
     alwaysShowDetailButton: boolean;
+    allowFreshRelease: boolean;
+    allowUnreviewed: boolean;
+}
+export interface PluginConflictInfo {
+    pluginVersion: string;
+    hostVersion?: string;
+    reason?: string;
 }
 export interface CheckUpdateParams {
     packageName: string;
     currentVersion?: string;
-    source?: string;
 }
 export interface CheckUpdateResult {
     ok: boolean;
@@ -56,60 +65,27 @@ export interface CheckUpdateResult {
     hasUpdate: boolean;
     source?: string;
     isGithub?: boolean;
+    isFreshRelease?: boolean;
+    isUnreviewed?: boolean;
     registry?: string;
     alwaysShowDetailButton?: boolean;
+    allowFreshRelease?: boolean;
+    allowUnreviewed?: boolean;
+    conflict?: PluginConflictInfo;
     error?: string;
     errorCode?: ErrorCode | string;
 }
-export type PluginHealthIssueKind = 'bundle-unavailable' | 'bundle-error' | 'entry-missing' | 'unregistered-bundle' | 'client-crash';
-export interface PluginHealthSummary {
-    issues: PluginHealthIssueKind[];
-    errorDetail?: string;
-    currentVersion: string;
-}
-export interface PluginHealthReport {
+export interface ReportConflictParams {
     packageName: string;
-    currentVersion: string;
-    latestVersion?: string;
-    hasUpdate: boolean;
-    source?: string;
-    isGithub?: boolean;
-    enabled?: boolean;
-    availability?: string;
-    healthy: boolean;
-    issues: PluginHealthIssueKind[];
-    errorDetail?: string;
+    reason?: string;
 }
-export interface DiagnoseParams {
-    forceCheckUpdates?: boolean;
-    clientCrashes?: Record<string, string>;
-}
-export interface DiagnoseResult {
-    ok: boolean;
-    hostVersion?: string;
-    profileName?: string;
-    plugins: PluginHealthReport[];
-    registry?: string;
-    error?: string;
-    errorCode?: ErrorCode | string;
-}
-export type RescueAction = 'update' | 'reinstall' | 'uninstall';
-export interface RescueParams {
-    packageName: string;
-    action: RescueAction;
-    targetVersion?: string;
-    source?: string;
-}
-export interface RescueResult {
+export interface ReportConflictResult {
     ok: boolean;
     packageName: string;
-    action: RescueAction;
-    targetVersion?: string;
-    selfUpdate?: boolean;
-    rollback?: 'not-needed' | 'restored' | 'failed';
+    disabled?: boolean;
+    conflict?: PluginConflictInfo;
     error?: string;
     errorCode?: ErrorCode | string;
-    output?: string;
 }
 export interface CheckAllParams {
     knownUpdates?: Record<string, string>;
@@ -119,17 +95,18 @@ export interface CheckAllParams {
 export interface CheckAllResult {
     ok: boolean;
     updatable: Record<string, string>;
+    conflicts?: Record<string, PluginConflictInfo>;
     hostVersion?: string;
-    unhealthy?: Record<string, PluginHealthSummary>;
     registry?: string;
     alwaysShowDetailButton?: boolean;
+    allowFreshRelease?: boolean;
+    allowUnreviewed?: boolean;
     error?: string;
     errorCode?: ErrorCode | string;
 }
 export interface DoUpdateParams {
     packageName: string;
     targetVersion?: string;
-    source?: string;
 }
 export interface DoUpdateResult {
     ok: boolean;
@@ -151,6 +128,7 @@ export interface SlotActionSubject {
         official?: boolean;
         enabled?: boolean;
         source?: string;
+        update?: 'registry' | 'git' | string;
         [key: string]: any;
     };
 }
@@ -159,7 +137,9 @@ export interface SlotActionProps {
 }
 /** Check whether a package name belongs to the official DSH scope. */
 export declare function isOfficialPackageName(packageName: string | undefined | null): boolean;
-/** Normalize a registry URL the way pnpm compares them. */
+/** Reject loopback, link-local, unique-local, and cloud metadata hostnames to mitigate SSRF. */
+export declare function isDisallowedHost(hostname: string): boolean;
+/** Normalize an HTTPS registry URL without embedded credentials or loopback/metadata hosts. */
 export declare function normalizeRegistryUrl(url: string | undefined | null): string | null;
 /** Resolve a stored registry choice ('npmjs' | 'npmmirror' | custom URL) to a normalized URL. */
 export declare function resolveRegistryUrl(registry: string | undefined | null): string;
